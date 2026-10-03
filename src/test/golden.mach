@@ -15,6 +15,7 @@ use std.types.size.usize;
 use pdf.document;
 use pdf.error;
 use pdf.output;
+use pdf.test.archive;
 use pdf.test.sample;
 
 #[embed("golden/table.pdf")]
@@ -22,6 +23,9 @@ val TABLE: [_]u8;
 
 #[embed("golden/stream.pdf")]
 val STREAM: [_]u8;
+
+#[embed("golden/archive.pdf")]
+val ARCHIVE: [_]u8;
 
 fun matches(xref_stream: bool, expected: *u8, len: usize) i32 {
     var a: allocator.Allocator;
@@ -50,4 +54,22 @@ test sample__table_matches_golden {
 
 test sample__stream_matches_golden {
     ret matches(true, ?STREAM[0], $length_of(STREAM));
+}
+
+test archive__matches_golden {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, ?a);
+    if (sel started.err) { ret 1; }
+    fin { document.dnit(?doc); }
+    var out: output.Output = output.init(?a);
+    fin { output.dnit(?out); }
+    val built: err[error.Error] = archive.build(?doc);
+    if (sel built.err) { ret 2; }
+    val saved: err[error.Error] = document.save(?doc, ?out);
+    if (sel saved.err)                                                                      { ret 3; }
+    if (output.offset(?out) != $length_of(ARCHIVE))                                         { ret 4; }
+    if (!memory.raw_equal(output.data(?out)::ptr, (?ARCHIVE[0])::ptr, $length_of(ARCHIVE))) { ret 5; }
+    ret 0;
 }
