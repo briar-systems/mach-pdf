@@ -1,12 +1,27 @@
-# font dictionaries (iso 32000-2 section 9.6)
+# font dictionaries (iso 32000-2 sections 9.6 to 9.10)
 
+use ttf: font;
+use std.allocator;
+use std.collections.map;
+use std.collections.vector;
+use std.crypto.hash.sha256;
+use std.memory;
+use std.text.utf8;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
+use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 
+use pdf.content;
 use pdf.document;
 use pdf.error;
 use pdf.object;
+use pdf.output;
 
 # add a dictionary for one of the standard 14 type 1 fonts, encoded as
 # WinAnsiEncoding
@@ -27,4 +42,513 @@ pub fun standard(doc: *document.Document, base: str) res[object.Ref, error.Error
         object.set_name(d.ok, "Encoding", "WinAnsiEncoding"));
     if (sel set.err) { ret res[object.Ref, error.Error].err{set.err}; }
     ret document.add(doc, object.Object.dict{d.ok});
+}
+
+# a truetype face embedded as a subset of the glyphs its text uses
+#
+# the face is a Type0 font over a CIDFontType2 descendant with Identity-H
+# encoding, so a two-byte code in a content stream is a cid. each distinct
+# code point the text holds takes the next cid from 1 in order of first use,
+# and cid 0 is .notdef. a cid stays the same once given, so content written
+# early keeps its meaning as later text adds cids. `embed` writes the subset
+# holding exactly the glyphs those cids reach, composite components included,
+# with the cid to glyph map, the widths, the descriptor and a ToUnicode cmap
+# that maps every cid back to its code point. two faces never share cids, and
+# one cid per code point keeps text extractable even where a font draws two
+# code points with one glyph.
+# ---
+# doc:      the document the font belongs to
+# face:     the parsed face, over a copy of the file in the document's arena
+# font:     the Type0 font, the reference page.use_font takes, defined by embed
+# codes:    the code point of cid i + 1
+# glyphs:   the face's glyph for cid i + 1
+# cids:     the cid of each code point given one
+# run:      scratch for the codes of one show
+# embedded: embed has written the font, so no new code point can join it
+pub rec TrueType {
+    doc:      *document.Document;
+    face:     ttf.Font;
+    font:     object.Ref;
+    codes:    vector.Vector[u32];
+    glyphs:   vector.Vector[u16];
+    cids:     map.Map[u32, u16];
+    run:      vector.Vector[u16];
+    embedded: bool;
+}
+
+val NONE:     u16   = 0xFFFF;
+val MAX_CIDS: usize = 0xFFFF;
+val TAG_LEN:  usize = 6;
+
+fun failure[T](cause: error.Error) res[T, error.Error] {
+    ret res[T, error.Error].err{cause};
+}
+
+fun refused[T](cause: allocator.Error) res[T, error.Error] {
+    ret res[T, error.Error].err{error.from_allocator(cause)};
+}
+
+fun fault(cause: error.Error) err[error.Error] {
+    ret err[error.Error].err{cause};
+}
+
+fun font_fault(cause: ttf.FontError) err[error.Error] {
+    ret err[error.Error].err{error.Error.font{cause}};
+}
+
+# start embedding a truetype face
+#
+# the file is copied into the document, so the caller's bytes are free once
+# this returns. the font's reference is allocated now and defined by embed,
+# so a document saved before embed reports it `unset`.
+# ---
+# doc:  the document
+# data: the truetype file
+# len:  its count of bytes
+# ret:  the face, `font` with mach-font's reason for a file it refuses or a
+#       face with no unicode cmap, or the allocator's refusal
+pub fun truetype(doc: *document.Document, data: *u8, len: usize) res[*TrueType, error.Error] {
+    val a:    *allocator.Allocator      = document.objects(doc);
+    val copy: res[*u8, allocator.Error] = allocator.allocate[u8](a, len);
+    if (sel copy.err) { ret refused[*TrueType](copy.err); }
+    memory.copy[u8](copy.ok, data, len);
+    val face: res[ttf.Font, ttf.FontError] = ttf.init(copy.ok, len);
+    if (sel face.err)         { ret failure[*TrueType](error.Error.font{face.err}); }
+    if (sel face.ok.cmap.err) { ret failure[*TrueType](error.Error.font{face.ok.cmap.err}); }
+    val made: res[*TrueType, allocator.Error] = allocator.zallocate[TrueType](a, 1);
+    if (sel made.err) { ret refused[*TrueType](made.err); }
+    val node: res[object.Ref, error.Error] = document.allocate(doc);
+    if (sel node.err) { ret failure[*TrueType](node.err); }
+    val t: *TrueType = made.ok;
+    t.doc      = doc;
+    t.face     = face.ok;
+    t.font     = node.ok;
+    t.codes    = vector.init[u32](a);
+    t.glyphs   = vector.init[u16](a);
+    t.cids     = map.init[u32, u16](a);
+    t.run      = vector.init[u16](a);
+    t.embedded = false;
+    ret res[*TrueType, error.Error].ok{t};
+}
+
+fun cid_of(t: *TrueType, code: u32) res[u16, error.Error] {
+    val held: opt[*u16] = map.get[u32, u16](?t.cids, ?code);
+    if (sel held.some)                         { ret res[u16, error.Error].ok{@held.some}; }
+    if (t.embedded || t.codes.len >= MAX_CIDS) { ret failure[u16](error.Error.invalid{}); }
+    val glyph: res[u16, ttf.FontError] = ttf.glyph_index(?t.face, code);
+    if (sel glyph.err) { ret failure[u16](error.Error.font{glyph.err}); }
+    if (glyph.ok == 0) { ret failure[u16](error.Error.glyph{code}); }
+    val pushed_code: res[usize, allocator.Error] = vector.push[u32](?t.codes, code);
+    if (sel pushed_code.err) { ret refused[u16](pushed_code.err); }
+    val pushed_glyph: res[usize, allocator.Error] = vector.push[u16](?t.glyphs, glyph.ok);
+    if (sel pushed_glyph.err) { ret refused[u16](pushed_glyph.err); }
+    val cid:      u16                        = t.codes.len::u16;
+    val inserted: res[bool, allocator.Error] = map.insert[u32, u16](?t.cids, code, cid);
+    if (sel inserted.err) { ret refused[u16](inserted.err); }
+    ret res[u16, error.Error].ok{cid};
+}
+
+# append the codes of utf-8 text to codes, giving each new code point a cid
+# ---
+# t:     the face
+# text:  the utf-8 bytes
+# len:   their count
+# codes: receives one code per code point
+# ret:   ok, `glyph` naming the first code point the face has no glyph for,
+#        `invalid` for text that is not utf-8 or a new code point after embed,
+#        `font` for a cmap mach-font cannot read, or the allocator's refusal
+pub fun encode(t: *TrueType, text: *u8, len: usize, codes: *vector.Vector[u16]) err[error.Error] {
+    var at: usize = 0;
+    for (at < len) {
+        var code: utf8.Codepoint = 0;
+        val used: usize          = utf8.decode(?text[at], len - at, ?code);
+        if (used == 0) { ret fault(error.Error.invalid{}); }
+        at = at + used;
+        val cid: res[u16, error.Error] = cid_of(t, code);
+        if (sel cid.err) { ret fault(cid.err); }
+        val pushed: res[usize, allocator.Error] = vector.push[u16](codes, cid.ok);
+        if (sel pushed.err) { ret fault(error.from_allocator(pushed.err)); }
+    }
+    ret err[error.Error].ok{};
+}
+
+# show len bytes of utf-8 text in a face, Tj
+#
+# the face must be the current font, selected by content.font under the name
+# page.use_font gave it. nothing is written when the text cannot be encoded.
+# ---
+# b:    the builder
+# t:    the face
+# text: the utf-8 bytes
+# len:  their count
+# ret:  ok, or why the text could not be encoded, as encode reports it
+pub fun show_utf8(b: *content.Builder, t: *TrueType, text: *u8, len: usize) err[error.Error] {
+    vector.clear[u16](?t.run);
+    val encoded: err[error.Error] = encode(t, text, len, ?t.run);
+    if (sel encoded.err) { ret encoded; }
+    content.show_glyphs(b, t.run.data, nil, t.run.len);
+    ret err[error.Error].ok{};
+}
+
+# show utf-8 text in a face, Tj
+#
+# as show_utf8, with a failure the builder's, reported by finish.
+# ---
+# b:    the builder
+# t:    the face
+# text: the text
+pub fun show(b: *content.Builder, t: *TrueType, text: str) {
+    val shown: err[error.Error] = show_utf8(b, t, text, str_len(text));
+    if (sel shown.err) { content.fail(b, shown.err); }
+}
+
+# the face's ascent and descent in font units, from hhea or else head's box
+fun vertical(t: *TrueType, ascent: *i64, descent: *i64) {
+    @ascent  = t.face.head.y_max::i64;
+    @descent = t.face.head.y_min::i64;
+    if (sel t.face.hhea.some) {
+        @ascent  = t.face.hhea.some.ascent::i64;
+        @descent = t.face.hhea.some.descent::i64;
+    }
+}
+
+# the face's height above the baseline, as a fraction of the font size
+# ---
+# t:   the face
+# ret: the ascent
+pub fun ascent(t: *TrueType) f64 {
+    var up:   i64 = 0;
+    var down: i64 = 0;
+    vertical(t, ?up, ?down);
+    ret up::f64 / t.face.head.units_per_em::f64;
+}
+
+# the face's depth below the baseline, as a negative fraction of the font size
+# ---
+# t:   the face
+# ret: the descent
+pub fun descent(t: *TrueType) f64 {
+    var up:   i64 = 0;
+    var down: i64 = 0;
+    vertical(t, ?up, ?down);
+    ret down::f64 / t.face.head.units_per_em::f64;
+}
+
+# a length in font units as thousandths of an em, rounded half away from zero
+fun scaled(t: *TrueType, value: i64) i64 {
+    val upem: i64 = t.face.head.units_per_em::i64;
+    if (value < 0) { ret -((-value * 1000 + upem / 2) / upem); }
+    ret (value * 1000 + upem / 2) / upem;
+}
+
+fun hex4(out: *output.Output, value: u32) {
+    val digits: *u8 = "0123456789ABCDEF";
+    output.byte(out, digits[((value >> 12) & 0xf)::usize]);
+    output.byte(out, digits[((value >> 8) & 0xf)::usize]);
+    output.byte(out, digits[((value >> 4) & 0xf)::usize]);
+    output.byte(out, digits[(value & 0xf)::usize]);
+}
+
+# the code point as utf-16be hex digits, a surrogate pair past the bmp
+fun utf16(out: *output.Output, code: u32) {
+    if (code < 0x10000) {
+        hex4(out, code);
+        ret;
+    }
+    val rest: u32 = code - 0x10000;
+    hex4(out, 0xD800 + (rest >> 10));
+    hex4(out, 0xDC00 + (rest & 0x3FF));
+}
+
+val BFCHAR_GROUP: usize = 100;
+
+# the ToUnicode cmap mapping cid i + 1 to codes[i]
+fun to_unicode(t: *TrueType, s: *object.Stream) err[error.Error] {
+    var out: output.Output = output.Output{bytes: s.data, failed: false, cause: error.Error.exhausted{}};
+    output.text(?out, "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n");
+    output.text(?out, "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n");
+    output.text(?out, "/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n");
+    output.text(?out, "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n");
+    var i: usize = 0;
+    for (i < t.codes.len) {
+        var group: usize = t.codes.len - i;
+        if (group > BFCHAR_GROUP) { group = BFCHAR_GROUP; }
+        output.integer(?out, group::i64);
+        output.text(?out, " beginbfchar\n");
+        val end: usize = i + group;
+        for (i < end) {
+            output.byte(?out, '<');
+            hex4(?out, (i + 1)::u32);
+            output.text(?out, "> <");
+            utf16(?out, t.codes.data[i]);
+            output.text(?out, ">\n");
+            i = i + 1;
+        }
+        output.text(?out, "endbfchar\n");
+    }
+    output.text(?out, "endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+    s.data = out.bytes;
+    ret output.status(?out);
+}
+
+# the subset tag, six capitals drawn from a digest of what the font holds
+fun tag(program: *u8, size: usize, map_data: *object.Stream, unicode: *object.Stream, into: *u8) {
+    var state: sha256.State = sha256.init();
+    sha256.update(?state, program, size);
+    sha256.update(?state, map_data.data.data, map_data.data.len);
+    sha256.update(?state, unicode.data.data, unicode.data.len);
+    var digest: [32]u8;
+    sha256.final(?state, ?digest[0]);
+    var i: usize = 0;
+    for (i < TAG_LEN) {
+        into[i] = 'A' + digest[i] % 26;
+        i       = i + 1;
+    }
+}
+
+fun integers(a: *allocator.Allocator, values: *i64, count: usize) res[object.Object, error.Error] {
+    val list: res[*object.Array, error.Error] = object.array(a);
+    if (sel list.err) { ret failure[object.Object](list.err); }
+    var i: usize = 0;
+    for (i < count) {
+        val pushed: err[error.Error] = object.push(list.ok, object.integer(values[i]));
+        if (sel pushed.err) { ret failure[object.Object](pushed.err); }
+        i = i + 1;
+    }
+    ret res[object.Object, error.Error].ok{object.Object.array{list.ok}};
+}
+
+# the descriptor's /Flags: fixed pitch, symbolic, and italic
+fun flags(fixed: bool, italic: bool) i64 {
+    # symbolic, since a cid font's glyphs are reached outside the standard latin encoding
+    var value: i64 = 4;
+    if (fixed)  { value = value | 1; }
+    if (italic) { value = value | 64; }
+    ret value;
+}
+
+# the FontDescriptor, naming the embedded program
+fun descriptor(t: *TrueType, name: object.Object, program: object.Ref) res[object.Ref, error.Error] {
+    val a:    *allocator.Allocator              = document.objects(t.doc);
+    val post: res[opt[ttf.Post], ttf.FontError] = ttf.post_info(?t.face);
+    if (sel post.err) { ret failure[object.Ref](error.Error.font{post.err}); }
+    val os2: res[opt[ttf.Os2], ttf.FontError] = ttf.os2_info(?t.face);
+    if (sel os2.err) { ret failure[object.Ref](error.Error.font{os2.err}); }
+
+    var angle: f64  = 0.0;
+    var fixed: bool = false;
+    if (sel post.ok.some) {
+        angle = post.ok.some.italic_angle::f64 / 65536.0;
+        fixed = post.ok.some.is_fixed_pitch;
+    }
+    val italic:  bool = angle != 0.0 || (t.face.head.mac_style & 2) != 0;
+    var ascent:  i64  = t.face.head.y_max::i64;
+    var descent: i64  = t.face.head.y_min::i64;
+    if (sel t.face.hhea.some) {
+        ascent  = t.face.hhea.some.ascent::i64;
+        descent = t.face.hhea.some.descent::i64;
+    }
+    var cap:    i64 = ascent;
+    var weight: i64 = 400;
+    if (sel os2.ok.some) {
+        weight = os2.ok.some.weight_class::i64;
+        if (sel os2.ok.some.cap_height.some) { cap = os2.ok.some.cap_height.some::i64; }
+    }
+    # the dominant stem width estimated from the weight class, which the face does not state
+    val stem: i64 = 10 + 220 * (weight - 50) / 900;
+
+    var box: [4]i64 = [4]i64{
+        scaled(t, t.face.head.x_min::i64), scaled(t, t.face.head.y_min::i64),
+        scaled(t, t.face.head.x_max::i64), scaled(t, t.face.head.y_max::i64)
+    };
+    val bbox: res[object.Object, error.Error] = integers(a, ?box[0], 4);
+    if (sel bbox.err) { ret failure[object.Ref](bbox.err); }
+    val slant: res[object.Real, error.Error] = object.real_of(angle, 4);
+    if (sel slant.err) { ret failure[object.Ref](slant.err); }
+    val d: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel d.err) { ret failure[object.Ref](d.err); }
+    val set: err[error.Error] = error.first(
+        object.set_name(d.ok, "Type", "FontDescriptor"),
+        object.set(d.ok, "FontName", name),
+        object.set(d.ok, "Flags", object.integer(flags(fixed, italic))),
+        object.set(d.ok, "FontBBox", bbox.ok),
+        object.set(d.ok, "ItalicAngle", object.real(slant.ok)),
+        object.set(d.ok, "Ascent", object.integer(scaled(t, ascent))),
+        object.set(d.ok, "Descent", object.integer(scaled(t, descent))),
+        object.set(d.ok, "CapHeight", object.integer(scaled(t, cap))),
+        object.set(d.ok, "StemV", object.integer(stem)),
+        object.set(d.ok, "FontFile2", object.reference(program)));
+    if (sel set.err) { ret failure[object.Ref](set.err); }
+    ret document.add(t.doc, object.Object.dict{d.ok});
+}
+
+# the /W array, one run of every cid's width from cid 0
+fun widths(t: *TrueType) res[object.Object, error.Error] {
+    val a:   *allocator.Allocator            = document.objects(t.doc);
+    val run: res[*object.Array, error.Error] = object.array(a);
+    if (sel run.err) { ret failure[object.Object](run.err); }
+    var cid: usize = 0;
+    for (cid <= t.codes.len) {
+        var glyph: u16 = 0;
+        if (cid > 0) { glyph = t.glyphs.data[cid - 1]; }
+        val m: res[ttf.HMetrics, ttf.FontError] = ttf.glyph_hmetrics(?t.face, glyph);
+        if (sel m.err) { ret failure[object.Object](error.Error.font{m.err}); }
+        val pushed: err[error.Error] = object.push(run.ok, object.integer(scaled(t, m.ok.advance::i64)));
+        if (sel pushed.err) { ret failure[object.Object](pushed.err); }
+        cid = cid + 1;
+    }
+    val w: res[*object.Array, error.Error] = object.array(a);
+    if (sel w.err) { ret failure[object.Object](w.err); }
+    val set: err[error.Error] = error.first(
+        object.push(w.ok, object.integer(0)),
+        object.push(w.ok, object.Object.array{run.ok}));
+    if (sel set.err) { ret failure[object.Object](set.err); }
+    ret res[object.Object, error.Error].ok{object.Object.array{w.ok}};
+}
+
+fun cid_system_info(a: *allocator.Allocator) res[object.Object, error.Error] {
+    val d: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel d.err) { ret failure[object.Object](d.err); }
+    val registry: res[object.Object, error.Error] = object.text(a, "Adobe");
+    if (sel registry.err) { ret failure[object.Object](registry.err); }
+    val ordering: res[object.Object, error.Error] = object.text(a, "Identity");
+    if (sel ordering.err) { ret failure[object.Object](ordering.err); }
+    val set: err[error.Error] = error.first(
+        object.set(d.ok, "Registry", registry.ok),
+        object.set(d.ok, "Ordering", ordering.ok),
+        object.set(d.ok, "Supplement", object.integer(0)));
+    if (sel set.err) { ret failure[object.Object](set.err); }
+    ret res[object.Object, error.Error].ok{object.Object.dict{d.ok}};
+}
+
+fun stream_ref(t: *TrueType, s: *object.Stream) res[object.Ref, error.Error] {
+    ret document.add(t.doc, object.Object.stream{s});
+}
+
+# write the subset and every object the font is made of, and define its
+# reference
+#
+# call once, after the last text in the face and before the document is
+# saved. text already given cids can still be shown after.
+# ---
+# t:   the face
+# ret: ok, `invalid` for a second embed or a face with no postscript name,
+#      `font` with mach-font's reason for a face it cannot subset, or the
+#      allocator's refusal
+pub fun embed(t: *TrueType) err[error.Error] {
+    if (t.embedded) { ret fault(error.Error.invalid{}); }
+    val a: *allocator.Allocator = document.objects(t.doc);
+
+    # the subset's glyphs: .notdef, each cid's glyph once in cid order, then the components they draw
+    val total: usize                      = t.face.num_glyphs::usize;
+    val list:  res[*u16, allocator.Error] = allocator.allocate[u16](a, total);
+    if (sel list.err) { ret fault(error.from_allocator(list.err)); }
+    val place: res[*u16, allocator.Error] = allocator.allocate[u16](a, total);
+    if (sel place.err) { ret fault(error.from_allocator(place.err)); }
+    var g: usize = 0;
+    for (g < total) {
+        place.ok[g] = NONE;
+        g           = g + 1;
+    }
+    list.ok[0]  = 0;
+    place.ok[0] = 0;
+    var count: usize = 1;
+    var i:     usize = 0;
+    for (i < t.glyphs.len) {
+        val glyph: u16 = t.glyphs.data[i];
+        if (place.ok[glyph::usize] == NONE) {
+            place.ok[glyph::usize] = count::u16;
+            list.ok[count]         = glyph;
+            count                  = count + 1;
+        }
+        i = i + 1;
+    }
+    val closed: res[usize, ttf.FontError] = ttf.closure(?t.face, list.ok, count, total);
+    if (sel closed.err) { ret font_fault(closed.err); }
+    val size: res[usize, ttf.FontError] = ttf.subset_size(?t.face, list.ok, closed.ok);
+    if (sel size.err) { ret font_fault(size.err); }
+
+    val program: res[*object.Stream, error.Error] = object.stream(a);
+    if (sel program.err) { ret fault(program.err); }
+    val room: res[usize, allocator.Error] = vector.reserve[u8](?program.ok.data, size.ok);
+    if (sel room.err) { ret fault(error.from_allocator(room.err)); }
+    val wrote: res[usize, ttf.FontError] = ttf.write_subset(?t.face, list.ok, closed.ok, program.ok.data.data, size.ok);
+    if (sel wrote.err) { ret font_fault(wrote.err); }
+    program.ok.data.len = wrote.ok;
+
+    # cid to glyph: two big-endian bytes per cid from 0
+    val gid_map: res[*object.Stream, error.Error] = object.stream(a);
+    if (sel gid_map.err) { ret fault(gid_map.err); }
+    var cid: usize = 0;
+    for (cid <= t.codes.len) {
+        var gid: u16 = 0;
+        if (cid > 0) { gid = place.ok[t.glyphs.data[cid - 1]::usize]; }
+        var pair:  [2]u8            = [2]u8{(gid >> 8)::u8, (gid & 0xff)::u8};
+        val added: err[error.Error] = object.write(gid_map.ok, ?pair[0], 2);
+        if (sel added.err) { ret added; }
+        cid = cid + 1;
+    }
+
+    val unicode: res[*object.Stream, error.Error] = object.stream(a);
+    if (sel unicode.err) { ret fault(unicode.err); }
+    val mapped: err[error.Error] = to_unicode(t, unicode.ok);
+    if (sel mapped.err) { ret mapped; }
+
+    # the base font: the tag, a plus, then the postscript name
+    var base:  [71]u8;
+    val named: res[opt[usize], ttf.FontError] = ttf.postscript_name(?t.face, ?base[TAG_LEN + 1], ttf.POSTSCRIPT_NAME_MAX);
+    if (sel named.err)     { ret font_fault(named.err); }
+    if (sel named.ok.none) { ret fault(error.Error.invalid{}); }
+    tag(program.ok.data.data, program.ok.data.len, gid_map.ok, unicode.ok, ?base[0]);
+    base[TAG_LEN]                     = '+';
+    base[TAG_LEN + 1 + named.ok.some] = 0;
+    val name: res[object.Object, error.Error] = object.name(a, ?base[0]);
+    if (sel name.err) { ret fault(name.err); }
+
+    val length: err[error.Error] = object.set(program.ok.dict, "Length1", object.integer(wrote.ok::i64));
+    if (sel length.err) { ret length; }
+    val program_ref: res[object.Ref, error.Error] = stream_ref(t, program.ok);
+    if (sel program_ref.err) { ret fault(program_ref.err); }
+    val described: res[object.Ref, error.Error] = descriptor(t, name.ok, program_ref.ok);
+    if (sel described.err) { ret fault(described.err); }
+    val map_ref: res[object.Ref, error.Error] = stream_ref(t, gid_map.ok);
+    if (sel map_ref.err) { ret fault(map_ref.err); }
+    val unicode_ref: res[object.Ref, error.Error] = stream_ref(t, unicode.ok);
+    if (sel unicode_ref.err) { ret fault(unicode_ref.err); }
+    val w: res[object.Object, error.Error] = widths(t);
+    if (sel w.err) { ret fault(w.err); }
+    val system: res[object.Object, error.Error] = cid_system_info(a);
+    if (sel system.err) { ret fault(system.err); }
+
+    val descendant: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel descendant.err) { ret fault(descendant.err); }
+    val described_set: err[error.Error] = error.first(
+        object.set_name(descendant.ok, "Type", "Font"),
+        object.set_name(descendant.ok, "Subtype", "CIDFontType2"),
+        object.set(descendant.ok, "BaseFont", name.ok),
+        object.set(descendant.ok, "CIDSystemInfo", system.ok),
+        object.set(descendant.ok, "FontDescriptor", object.reference(described.ok)),
+        object.set(descendant.ok, "W", w.ok),
+        object.set(descendant.ok, "CIDToGIDMap", object.reference(map_ref.ok)));
+    if (sel described_set.err) { ret described_set; }
+    val descendant_ref: res[object.Ref, error.Error] = document.add(t.doc, object.Object.dict{descendant.ok});
+    if (sel descendant_ref.err) { ret fault(descendant_ref.err); }
+
+    val descendants: res[*object.Array, error.Error] = object.array(a);
+    if (sel descendants.err) { ret fault(descendants.err); }
+    val top: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel top.err) { ret fault(top.err); }
+    val top_set: err[error.Error] = error.first(
+        object.push(descendants.ok, object.reference(descendant_ref.ok)),
+        object.set_name(top.ok, "Type", "Font"),
+        object.set_name(top.ok, "Subtype", "Type0"),
+        object.set(top.ok, "BaseFont", name.ok),
+        object.set_name(top.ok, "Encoding", "Identity-H"),
+        object.set(top.ok, "DescendantFonts", object.Object.array{descendants.ok}),
+        object.set(top.ok, "ToUnicode", object.reference(unicode_ref.ok)));
+    if (sel top_set.err) { ret top_set; }
+    val defined: err[error.Error] = document.define(t.doc, t.font, object.Object.dict{top.ok});
+    if (sel defined.err) { ret defined; }
+    t.embedded = true;
+    ret err[error.Error].ok{};
 }

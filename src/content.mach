@@ -60,7 +60,13 @@ pub fun finish(b: *Builder) err[error.Error] {
     ret output.status(?b.out);
 }
 
-fun fail(b: *Builder, cause: error.Error) {
+# remember a failure, for an operator built on top of the builder's own
+#
+# the first failure wins, and finish reports it.
+# ---
+# b:     the builder
+# cause: why an operator could not be written
+pub fun fail(b: *Builder, cause: error.Error) {
     if (!b.failed) {
         b.failed = true;
         b.cause  = cause;

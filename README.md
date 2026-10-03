@@ -26,7 +26,8 @@ and it depends on mach-std only.
 - `pdf.content` writes content stream operators: graphics state, paths, fill
   and stroke, text positioning, font selection, strings and glyph runs.
 - `pdf.page` builds the page tree, pages, their content and font resources.
-- `pdf.font` adds standard 14 font dictionaries.
+- `pdf.font` adds standard 14 font dictionaries, and embeds TrueType faces as
+  subsets (see below).
 - `pdf.text` writes text strings: ascii as it is, anything else as utf-16be.
 - `pdf.form` builds an AcroForm: groups, text, date and unsigned signature
   fields, and their widgets with appearance streams.
@@ -146,9 +147,37 @@ A signature field is written unsigned, with no `/V`. Signing it is an
 incremental update that gives the field's dictionary (`Field.node`) a `/V`.
 
 `form.standard` is a face over a standard 14 font, which needs no embedding but
-is not allowed in PDF/A. An embedded font drops in as another `Face`: its
-`show` writes text in the font's own encoding, such as Identity-H glyph codes,
-and refuses a character the font has no glyph for.
+is not allowed in PDF/A. `form.embedded` is a face over an embedded TrueType
+subset, which PDF/A allows: it writes Identity-H glyph codes and refuses a
+character the face has no glyph for. Every value must be set before the face is
+embedded.
+
+## Embedded fonts
+
+`font.truetype` starts embedding a TrueType face, parsed and subset by
+[mach-font](https://github.com/briar-systems/mach-font). `font.show` writes
+UTF-8 text in it as two-byte codes, giving each distinct code point the next
+cid in order of first use, and `font.embed` writes the font once the text is
+done: a Type0 font with Identity-H encoding over a CIDFontType2 descendant, the
+subset holding only the glyphs the text reaches (composite components
+included), a `/CIDToGIDMap`, `/W` widths, a `FontDescriptor` with the program
+as `/FontFile2`, and a `/ToUnicode` cmap, so text extracts as it was written.
+The subset tag comes from a digest of the subset, so the same document gives
+the same bytes. A code point the face has no glyph for is the error `glyph`
+naming it, never a silent `.notdef`.
+
+```mach
+val mono: res[*font.TrueType, error.Error] = font.truetype(?doc, data, len);
+page.use_font(?doc, ?p, "F1", mono.ok.font);
+content.font(?b, "F1", 11.0);
+font.show(?b, mono.ok, "Grüße, Ζεύς");
+content.finish(?b);
+val embedded: err[error.Error] = font.embed(mono.ok);
+```
+
+`src/test/fonts.mach` sets Latin, accented, Cyrillic and Greek text in
+Liberation Mono (`src/test/fixtures/liberation`, SIL OFL 1.1), and the PDF/A-3b
+sample sets its text and form field in it too.
 
 ## Signatures and other late values
 
@@ -166,8 +195,8 @@ mach build .
 mach test . --all --timeout 5m
 ```
 
-`demo/sample` writes the sample document to two files and the pdf/a-3b sample
-to a third, and `demo/fields` the sample form to one, the golden files the
+`demo/sample` writes the sample document to two files, the pdf/a-3b sample to
+a third and the embedded font sample to a fourth, and `demo/fields` the sample form to one, the golden files the
 tests compare against. Check them with `qpdf --check` and a renderer
 (`pdftoppm`, `mutool`, pdf.js) after any change to the output:
 
@@ -175,7 +204,7 @@ tests compare against. Check them with `qpdf --check` and a renderer
 cd demo/sample
 mach dep pull .
 mach build .
-./out/linux-x86_64/debug/bin/sample ../../src/test/golden/table.pdf ../../src/test/golden/stream.pdf ../../src/test/golden/archive.pdf
+./out/linux-x86_64/debug/bin/sample ../../src/test/golden/table.pdf ../../src/test/golden/stream.pdf ../../src/test/golden/archive.pdf ../../src/test/golden/fonts.pdf
 ```
 
 The sample form should also fill in a viewer with a form API, such as MuPDF
