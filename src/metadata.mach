@@ -36,18 +36,25 @@ use pdf.text;
 # producer: /Producer and pdf:Producer, the tool that wrote the pdf
 # created:  /CreationDate and xmp:CreateDate
 # modified: /ModDate and xmp:ModifyDate
+# props:    count `props_len` more xmp properties the caller owns, such as
+#           dc:identifier, written after the ones above and before any claim
+#           the writer adds. they have no information dictionary entry. nil
+#           when props_len is 0
 pub rec Metadata {
-    title:    str;
-    author:   str;
-    subject:  str;
-    keywords: str;
-    creator:  str;
-    producer: str;
-    created:  opt[date.Date];
-    modified: opt[date.Date];
+    title:     str;
+    author:    str;
+    subject:   str;
+    keywords:  str;
+    creator:   str;
+    producer:  str;
+    created:   opt[date.Date];
+    modified:  opt[date.Date];
+    props:     *Claim;
+    props_len: usize;
 }
 
-# one more xmp property in its own namespace, such as a conformance claim
+# one more xmp property in its own namespace, a simple text value such as
+# dc:identifier or a conformance claim
 # ---
 # prefix:   the namespace prefix, such as "pdfaid"
 # uri:      the namespace uri
@@ -129,26 +136,7 @@ fun moment(out: *output.Output, name: str, when: opt[date.Date]) err[error.Error
     ret err[error.Error].ok{};
 }
 
-fun packet(out: *output.Output, meta: *Metadata, claims: *Claim, count: usize) err[error.Error] {
-    output.text(out, "<?xpacket begin=\"\xef\xbb\xbf\" id=\"");
-    output.text(out, PACKET_ID);
-    output.text(out, "\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n");
-    output.text(out, " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n");
-    output.text(out, "  <rdf:Description rdf:about=\"\"");
-    output.text(out, " xmlns:dc=\"http://purl.org/dc/elements/1.1/\"");
-    output.text(out, " xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"");
-    output.text(out, " xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\">\n");
-    val described: err[error.Error] = error.first(
-        container(out, "dc:title", "Alt", " xml:lang=\"x-default\"", meta.title),
-        container(out, "dc:creator", "Seq", "", meta.author),
-        container(out, "dc:description", "Alt", " xml:lang=\"x-default\"", meta.subject),
-        element(out, "pdf:Keywords", meta.keywords),
-        element(out, "xmp:CreatorTool", meta.creator),
-        element(out, "pdf:Producer", meta.producer),
-        moment(out, "xmp:CreateDate", meta.created),
-        moment(out, "xmp:ModifyDate", meta.modified));
-    if (sel described.err) { ret described; }
-    output.text(out, "  </rdf:Description>\n");
+fun properties(out: *output.Output, claims: *Claim, count: usize) err[error.Error] {
     var i: usize = 0;
     for (i < count) {
         val c: *Claim = ?claims[i];
@@ -171,6 +159,33 @@ fun packet(out: *output.Output, meta: *Metadata, claims: *Claim, count: usize) e
         output.text(out, ">\n  </rdf:Description>\n");
         i = i + 1;
     }
+    ret err[error.Error].ok{};
+}
+
+fun packet(out: *output.Output, meta: *Metadata, claims: *Claim, count: usize) err[error.Error] {
+    output.text(out, "<?xpacket begin=\"\xef\xbb\xbf\" id=\"");
+    output.text(out, PACKET_ID);
+    output.text(out, "\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n");
+    output.text(out, " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n");
+    output.text(out, "  <rdf:Description rdf:about=\"\"");
+    output.text(out, " xmlns:dc=\"http://purl.org/dc/elements/1.1/\"");
+    output.text(out, " xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"");
+    output.text(out, " xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\">\n");
+    val described: err[error.Error] = error.first(
+        container(out, "dc:title", "Alt", " xml:lang=\"x-default\"", meta.title),
+        container(out, "dc:creator", "Seq", "", meta.author),
+        container(out, "dc:description", "Alt", " xml:lang=\"x-default\"", meta.subject),
+        element(out, "pdf:Keywords", meta.keywords),
+        element(out, "xmp:CreatorTool", meta.creator),
+        element(out, "pdf:Producer", meta.producer),
+        moment(out, "xmp:CreateDate", meta.created),
+        moment(out, "xmp:ModifyDate", meta.modified));
+    if (sel described.err) { ret described; }
+    output.text(out, "  </rdf:Description>\n");
+    val listed: err[error.Error] = properties(out, meta.props, meta.props_len);
+    if (sel listed.err) { ret listed; }
+    val added: err[error.Error] = properties(out, claims, count);
+    if (sel added.err) { ret added; }
     output.text(out, " </rdf:RDF>\n</x:xmpmeta>\n<?xpacket end=\"w\"?>");
     ret output.status(out);
 }
@@ -213,7 +228,8 @@ fun place(doc: *document.Document, held: opt[object.Ref], value: object.Object) 
 # ---
 # doc:    the document
 # meta:   the description
-# claims: count more properties for the xmp stream, nil when count is 0
+# claims: count more properties the writer adds after meta's own, such as a
+#         conformance claim, nil when count is 0
 # count:  the count of claims
 # ret:    ok, `invalid` for text that is not utf-8 or holds control
 #         characters, a date out of range, or a catalog /Metadata that is not
@@ -293,6 +309,9 @@ $if (capability.HOSTED) {
         meta.title    = "A & B";
         meta.producer = "mach-pdf";
         meta.created  = opt[date.Date].some{date.Date{year: 2026, month: 1, day: 2, hour: 3, minute: 4, second: 5, offset: 60}};
+        var prop: Claim = Claim{prefix: "dc", uri: "http://purl.org/dc/elements/1.1/", property: "identifier", value: "X-1"};
+        meta.props     = ?prop;
+        meta.props_len = 1;
         var claim: Claim            = Claim{prefix: "pdfaid", uri: "http://www.aiim.org/pdfa/ns/id/", property: "part", value: "3"};
         val wrote: err[error.Error] = write(?doc, ?meta, ?claim, 1);
         if (sel wrote.err) { ret 2; }
@@ -317,6 +336,7 @@ $if (capability.HOSTED) {
         if (!holds(bytes, len, "<rdf:li xml:lang=\"x-default\">A &amp; B</rdf:li>"))          { ret 11; }
         if (!holds(bytes, len, "<xmp:CreateDate>2026-01-02T03:04:05+01:00</xmp:CreateDate>")) { ret 12; }
         if (!holds(bytes, len, "<pdfaid:part>3</pdfaid:part>"))                               { ret 13; }
+        if (!holds(bytes, len, "<dc:identifier>X-1</dc:identifier>"))                         { ret 17; }
         if (holds(bytes, len, "Author"))                                                      { ret 14; }
 
         # a second write replaces both in place

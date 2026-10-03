@@ -33,8 +33,8 @@ and it depends on mach-std only.
   fields, and their widgets with appearance streams.
 - `pdf.date` spells a caller's date as a pdf date string or an xmp date.
 - `pdf.metadata` writes the information dictionary and the xmp metadata
-  stream together from one description, with extra xmp claims such as a
-  conformance level's.
+  stream together from one description, with extra xmp properties from the
+  caller (`props`) and claims the writer adds, such as a conformance level's.
 - `pdf.embed` attaches files: an embedded file stream, its file
   specification with its `/AFRelationship`, the catalog's `/EmbeddedFiles`
   name tree and its `/AF` array.
@@ -100,7 +100,8 @@ sample document in `src/test/sample.mach` byte for byte against the files in
 
 ## PDF/A-3b
 
-`pdfa.conform` writes the metadata with the pdf/a-3b identification, adds an
+`pdfa.conform` writes the metadata once, the caller's description and its extra
+xmp properties (`meta.props`) with the pdf/a-3b identification, adds an
 srgb output intent with its icc profile embedded, and has every later save run
 `pdfa.check` first through `document.require`. The check refuses, as
 `nonconforming` naming the offending object, unembedded fonts, encryption,
@@ -113,6 +114,10 @@ fonts and attaches files with `embed.attach`:
 var meta: metadata.Metadata;
 meta.title    = "Report";
 meta.producer = "mach-pdf";
+var id: metadata.Claim = metadata.Claim{prefix: "dc", uri: "http://purl.org/dc/elements/1.1/",
+    property: "identifier", value: "REP-1"};
+meta.props     = ?id;
+meta.props_len = 1;
 val made: err[error.Error] = pdfa.conform(?doc, ?meta);
 var source: embed.File = embed.File{name: "report.txt", data: text, len: len,
     mime: "text/plain", relationship: embed.Relationship.source{},
