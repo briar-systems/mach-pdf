@@ -14,6 +14,7 @@ use std.types.string.str;
 use pdf.content;
 use pdf.document;
 use pdf.error;
+use pdf.filter;
 use pdf.object;
 
 # a rectangle in default user space, such as a /MediaBox
@@ -132,7 +133,8 @@ pub fun add(doc: *document.Document, t: *Tree, media: Rect) res[Page, error.Erro
 
 # give a page a new content stream and start writing operators into it
 #
-# the stream becomes the page's /Contents. content.finish completes it.
+# the stream becomes the page's /Contents, compressed with FlateDecode.
+# content.finish completes it.
 # ---
 # doc: the document
 # p:   the page
@@ -140,6 +142,8 @@ pub fun add(doc: *document.Document, t: *Tree, media: Rect) res[Page, error.Erro
 pub fun contents(doc: *document.Document, p: *Page) res[content.Builder, error.Error] {
     val s: res[*object.Stream, error.Error] = object.stream(document.objects(doc));
     if (sel s.err) { ret failure[content.Builder](s.err); }
+    val flated: err[error.Error] = object.filter_with(s.ok, filter.flate(), object.null());
+    if (sel flated.err) { ret failure[content.Builder](flated.err); }
     val node: res[object.Ref, error.Error] = document.add(doc, object.Object.stream{s.ok});
     if (sel node.err) { ret failure[content.Builder](node.err); }
     val set: err[error.Error] = object.set(p.dict, "Contents", object.reference(node.ok));

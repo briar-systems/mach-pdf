@@ -6,8 +6,8 @@
 # does, so the writer encodes through them last to first and a reader decodes
 # first to last. a filter with no encoder can still be named over data the
 # caller encoded itself, such as a jpeg under DCTDecode, and a filter with no
-# decoder over data a reader keeps as it is. FlateDecode decodes through
-# std.compress.zlib, and gains an encoder once std has a deflate compressor.
+# decoder over data a reader keeps as it is. FlateDecode encodes through
+# std.compress.deflate and decodes through std.compress.zlib.
 
 use std.allocator;
 use std.collections.vector;
@@ -21,6 +21,7 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
+use std.compress.deflate;
 use std.compress.zlib;
 
 use pdf.error;
@@ -42,6 +43,15 @@ pub val PARMS: i64 = 3;
 # the `codec` code for predicted rows that do not decode, such as a png row
 # with an unknown filter type or a partial last row
 pub val PREDICTED: i64 = 4;
+
+# the `codec` code for a compressor that refused its input
+pub val DEFLATE: i64 = 5;
+
+# the deflate level every FlateDecode stream is written at
+#
+# zlib's default balance of size and speed. it is fixed so the same objects
+# give the same bytes from every caller and on every host.
+pub val FLATE_LEVEL: u8 = 6;
 
 val HEX: str = "0123456789ABCDEF";
 
@@ -282,6 +292,24 @@ fun inflate_failed(cause: zlib.InflateError) err[error.Error] {
     ret codec(CORRUPT);
 }
 
+fun deflate_failed(cause: deflate.DeflateError) err[error.Error] {
+    if (sel cause.alloc) { ret refused(cause.alloc); }
+    ret codec(DEFLATE);
+}
+
+# the compressor's scratch comes from output's allocator, and the stream goes
+# straight into output, which bound sizes exactly enough
+fun flate_encode(ctx: ptr, input: *u8, len: usize, output: *vector.Vector[u8]) err[error.Error] {
+    val most: usize                       = deflate.bound(len, deflate.ZLIB);
+    val room: res[usize, allocator.Error] = vector.reserve[u8](output, most);
+    if (sel room.err) { ret refused(room.err); }
+    val packed: res[usize, deflate.DeflateError] = deflate.compress_into(output.a, FLATE_LEVEL, deflate.ZLIB,
+        input, len, ?output.data[output.len], most);
+    if (sel packed.err) { ret deflate_failed(packed.err); }
+    output.len = output.len + packed.ok;
+    ret err[error.Error].ok{};
+}
+
 fun flate_decode(ctx: ptr, input: *u8, len: usize, parms: object.Object, limit: usize, output: *vector.Vector[u8]) err[error.Error] {
     val start: usize                                     = output.len;
     val made:  res[zlib.Decompressor, zlib.InflateError] = zlib.init(output.a);
@@ -313,12 +341,13 @@ fun flate_decode(ctx: ptr, input: *u8, len: usize, parms: object.Object, limit: 
     ret unpredict(output, start, parms);
 }
 
-# the FlateDecode filter, which decodes zlib data and undoes a png or tiff
-# predictor its parameters name
+# the FlateDecode filter, which encodes a zlib stream at FLATE_LEVEL with no
+# predictor, and decodes zlib data undoing a png or tiff predictor its
+# parameters name
 # ---
-# ret: the filter, with no encoder until std has a deflate compressor
+# ret: the filter
 pub fun flate() Filter {
-    ret Filter{name: "FlateDecode", ctx: nil, encode: nil, decode: flate_decode};
+    ret Filter{name: "FlateDecode", ctx: nil, encode: flate_encode, decode: flate_decode};
 }
 
 # the filter this library implements under a /Filter name
@@ -397,6 +426,32 @@ $if (capability.HOSTED) {
         output.len = 0;
         val cut: err[error.Error] = filter.decode(filter.ctx, ?HELLO[0], 9, object.null(), 64, ?output);
         if (!coded(cut, TRUNCATED)) { ret 5; }
+        ret 0;
+    }
+
+    test flate__encodes_a_zlib_stream_that_decodes_to_the_input {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var packed: vector.Vector[u8] = vector.init[u8](?a);
+        fin { vector.dnit[u8](?packed); }
+        var back: vector.Vector[u8] = vector.init[u8](?a);
+        fin { vector.dnit[u8](?back); }
+        val word:  str   = "stream ";
+        var input: [64]u8;
+        var i:     usize = 0;
+        for (i < 64) {
+            input[i] = word[i % 7];
+            i        = i + 1;
+        }
+        val filter:  Filter           = flate();
+        val encoded: err[error.Error] = filter.encode(filter.ctx, ?input[0], 64, ?packed);
+        if (sel encoded.err)                    { ret 1; }
+        if (packed.len < 7 || packed.len >= 64) { ret 2; }
+        if (packed.data[0] != 0x78)             { ret 3; }
+        val decoded: err[error.Error] = filter.decode(filter.ctx, packed.data, packed.len, object.null(), 64, ?back);
+        if (sel decoded.err)                                         { ret 4; }
+        if (back.len != 64)                                          { ret 5; }
+        if (!memory.raw_equal(back.data::ptr, (?input[0])::ptr, 64)) { ret 6; }
         ret 0;
     }
 
