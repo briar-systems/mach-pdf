@@ -1,0 +1,408 @@
+# content stream operators (iso 32000-2 sections 8 and 9)
+#
+# a builder writes operators into a stream's data, one per line, with numbers
+# rounded to four decimal places. a failure is remembered rather than
+# returned: the builder stops writing and `finish` reports the first one.
+
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use pdf.error;
+use pdf.object;
+use pdf.output;
+use pdf.syntax;
+
+val PLACES: u8 = 4;
+
+val HEX: *u8 = "0123456789ABCDEF";
+
+# a content stream under construction
+# ---
+# stream: the stream the operators land in
+# out:    the stream's data while the builder holds it
+# failed: an operator could not be written
+# cause:  the first failure, when failed
+pub rec Builder {
+    stream: *object.Stream;
+    out:    output.Output;
+    failed: bool;
+    cause:  error.Error;
+}
+
+# start writing operators after a stream's data
+#
+# the builder holds the stream's data until finish, so nothing else writes to
+# the stream in between.
+# ---
+# s:   the stream
+# ret: the builder
+pub fun begin(s: *object.Stream) Builder {
+    var b: Builder;
+    b.stream    = s;
+    b.out.bytes = s.data;
+    ret b;
+}
+
+# hand the data back to the stream
+# ---
+# b:   the builder
+# ret: ok, or the first failure
+pub fun finish(b: *Builder) err[error.Error] {
+    b.stream.data = b.out.bytes;
+    if (b.failed) { ret err[error.Error].err{b.cause}; }
+    ret output.status(?b.out);
+}
+
+# remember a failure, for an operator built on top of the builder's own
+#
+# the first failure wins, and finish reports it.
+# ---
+# b:     the builder
+# cause: why an operator could not be written
+pub fun fail(b: *Builder, cause: error.Error) {
+    if (!b.failed) {
+        b.failed = true;
+        b.cause  = cause;
+    }
+}
+
+fun number(b: *Builder, value: f64) {
+    val decimal: res[object.Real, error.Error] = object.real_of(value, PLACES);
+    if (sel decimal.err) {
+        fail(b, decimal.err);
+        ret;
+    }
+    syntax.write(?b.out, object.real(decimal.ok));
+    output.byte(?b.out, ' ');
+}
+
+fun operator(b: *Builder, op: str) {
+    output.text(?b.out, op);
+    output.byte(?b.out, '\n');
+}
+
+fun numbers(b: *Builder, values: *f64, count: usize, op: str) {
+    var i: usize = 0;
+    for (i < count) {
+        number(b, values[i]);
+        i = i + 1;
+    }
+    operator(b, op);
+}
+
+# save the graphics state, q
+# ---
+# b: the builder
+pub fun save(b: *Builder) {
+    operator(b, "q");
+}
+
+# restore the graphics state, Q
+# ---
+# b: the builder
+pub fun restore(b: *Builder) {
+    operator(b, "Q");
+}
+
+# concatenate a matrix to the current transformation, cm
+# ---
+# b: the builder
+# a, bb, c, d, e, f: the matrix [a b c d e f]
+pub fun transform(b: *Builder, a: f64, bb: f64, c: f64, d: f64, e: f64, f: f64) {
+    var values: [6]f64 = [6]f64{a, bb, c, d, e, f};
+    numbers(b, ?values[0], 6, "cm");
+}
+
+# set the line width, w
+# ---
+# b:     the builder
+# width: the width in user space units
+pub fun line_width(b: *Builder, width: f64) {
+    numbers(b, ?width, 1, "w");
+}
+
+# set the fill colour to an rgb value, rg
+# ---
+# b: the builder
+# r, g, v: the components, 0 to 1
+pub fun fill_rgb(b: *Builder, r: f64, g: f64, v: f64) {
+    var values: [3]f64 = [3]f64{r, g, v};
+    numbers(b, ?values[0], 3, "rg");
+}
+
+# set the stroke colour to an rgb value, RG
+# ---
+# b: the builder
+# r, g, v: the components, 0 to 1
+pub fun stroke_rgb(b: *Builder, r: f64, g: f64, v: f64) {
+    var values: [3]f64 = [3]f64{r, g, v};
+    numbers(b, ?values[0], 3, "RG");
+}
+
+# set the fill colour to a gray level, g
+# ---
+# b:     the builder
+# level: 0 for black to 1 for white
+pub fun fill_gray(b: *Builder, level: f64) {
+    numbers(b, ?level, 1, "g");
+}
+
+# set the stroke colour to a gray level, G
+# ---
+# b:     the builder
+# level: 0 for black to 1 for white
+pub fun stroke_gray(b: *Builder, level: f64) {
+    numbers(b, ?level, 1, "G");
+}
+
+# begin a subpath at a point, m
+# ---
+# b: the builder
+# x, y: the point
+pub fun move_to(b: *Builder, x: f64, y: f64) {
+    var values: [2]f64 = [2]f64{x, y};
+    numbers(b, ?values[0], 2, "m");
+}
+
+# append a line to a point, l
+# ---
+# b: the builder
+# x, y: the point
+pub fun line_to(b: *Builder, x: f64, y: f64) {
+    var values: [2]f64 = [2]f64{x, y};
+    numbers(b, ?values[0], 2, "l");
+}
+
+# append a cubic bezier curve, c
+# ---
+# b: the builder
+# x1, y1: the first control point
+# x2, y2: the second control point
+# x3, y3: the end point
+pub fun curve_to(b: *Builder, x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64) {
+    var values: [6]f64 = [6]f64{x1, y1, x2, y2, x3, y3};
+    numbers(b, ?values[0], 6, "c");
+}
+
+# close the current subpath, h
+# ---
+# b: the builder
+pub fun close(b: *Builder) {
+    operator(b, "h");
+}
+
+# append a rectangle as a closed subpath, re
+# ---
+# b: the builder
+# x, y:          the lower left corner
+# width, height: the size
+pub fun rectangle(b: *Builder, x: f64, y: f64, width: f64, height: f64) {
+    var values: [4]f64 = [4]f64{x, y, width, height};
+    numbers(b, ?values[0], 4, "re");
+}
+
+# fill the path by the nonzero winding rule, f
+# ---
+# b: the builder
+pub fun fill(b: *Builder) {
+    operator(b, "f");
+}
+
+# stroke the path, S
+# ---
+# b: the builder
+pub fun stroke(b: *Builder) {
+    operator(b, "S");
+}
+
+# fill then stroke the path, B
+# ---
+# b: the builder
+pub fun fill_stroke(b: *Builder) {
+    operator(b, "B");
+}
+
+# intersect the clipping path with the current path by the nonzero winding
+# rule, W
+# ---
+# b: the builder
+pub fun clip(b: *Builder) {
+    operator(b, "W");
+}
+
+# end the path without filling or stroking it, n
+# ---
+# b: the builder
+pub fun end_path(b: *Builder) {
+    operator(b, "n");
+}
+
+# begin a marked content sequence, BMC
+# ---
+# b:   the builder
+# tag: the sequence's tag, without its slash
+pub fun begin_marked(b: *Builder, tag: str) {
+    syntax.write(?b.out, object.Object.name{object.Name{data: tag, len: str_len(tag)}});
+    output.byte(?b.out, ' ');
+    operator(b, "BMC");
+}
+
+# end a marked content sequence, EMC
+# ---
+# b: the builder
+pub fun end_marked(b: *Builder) {
+    operator(b, "EMC");
+}
+
+# begin a text object, BT
+# ---
+# b: the builder
+pub fun begin_text(b: *Builder) {
+    operator(b, "BT");
+}
+
+# end a text object, ET
+# ---
+# b: the builder
+pub fun end_text(b: *Builder) {
+    operator(b, "ET");
+}
+
+# select a font from the resources and a size, Tf
+# ---
+# b:    the builder
+# name: the font's resource name, without its slash
+# size: the size in text space units
+pub fun font(b: *Builder, name: str, size: f64) {
+    syntax.write(?b.out, object.Object.name{object.Name{data: name, len: str_len(name)}});
+    output.byte(?b.out, ' ');
+    numbers(b, ?size, 1, "Tf");
+}
+
+# set the text leading, TL
+# ---
+# b:     the builder
+# value: the distance between baselines
+pub fun leading(b: *Builder, value: f64) {
+    numbers(b, ?value, 1, "TL");
+}
+
+# move to the start of the next line offset by x, y, Td
+# ---
+# b: the builder
+# x, y: the offset from the start of the current line
+pub fun move_text(b: *Builder, x: f64, y: f64) {
+    var values: [2]f64 = [2]f64{x, y};
+    numbers(b, ?values[0], 2, "Td");
+}
+
+# set the text matrix and line matrix, Tm
+# ---
+# b: the builder
+# a, bb, c, d, e, f: the matrix [a b c d e f]
+pub fun text_matrix(b: *Builder, a: f64, bb: f64, c: f64, d: f64, e: f64, f: f64) {
+    var values: [6]f64 = [6]f64{a, bb, c, d, e, f};
+    numbers(b, ?values[0], 6, "Tm");
+}
+
+# move to the start of the next line by the leading, T*
+# ---
+# b: the builder
+pub fun next_line(b: *Builder) {
+    operator(b, "T*");
+}
+
+# show a string of single-byte character codes, Tj
+# ---
+# b:     the builder
+# codes: the codes in the current font's encoding
+# len:   the count of codes
+pub fun show(b: *Builder, codes: *u8, len: usize) {
+    syntax.write(?b.out, object.Object.string{object.String{data: codes, len: len, hex: false}});
+    output.byte(?b.out, ' ');
+    operator(b, "Tj");
+}
+
+# show the text of s as single-byte codes, Tj
+# ---
+# b: the builder
+# s: the text in the current font's encoding
+pub fun show_text(b: *Builder, s: str) {
+    show(b, s, str_len(s));
+}
+
+fun glyph(b: *Builder, id: u16) {
+    output.byte(?b.out, HEX[((id >> 12) & 0xf)::usize]);
+    output.byte(?b.out, HEX[((id >> 8) & 0xf)::usize]);
+    output.byte(?b.out, HEX[((id >> 4) & 0xf)::usize]);
+    output.byte(?b.out, HEX[(id & 0xf)::usize]);
+}
+
+# show a run of two-byte glyph codes, as an Identity-H font takes them
+#
+# with adjustments the run is a TJ array: adjust[i] moves the glyph after
+# glyph i back by thousandths of a text space unit, and a zero adjustment
+# leaves glyphs in one string. without them the run is one Tj string.
+# ---
+# b:      the builder
+# ids:    the glyph codes
+# adjust: one adjustment per glyph, or nil for none
+# count:  the count of glyphs
+pub fun show_glyphs(b: *Builder, ids: *u16, adjust: *f64, count: usize) {
+    if (adjust == nil) {
+        output.byte(?b.out, '<');
+        var i: usize = 0;
+        for (i < count) {
+            glyph(b, ids[i]);
+            i = i + 1;
+        }
+        output.text(?b.out, "> ");
+        operator(b, "Tj");
+        ret;
+    }
+    output.text(?b.out, "[<");
+    var i: usize = 0;
+    for (i < count) {
+        glyph(b, ids[i]);
+        if (adjust[i] != 0.0 && i + 1 < count) {
+            output.text(?b.out, "> ");
+            number(b, adjust[i]);
+            output.byte(?b.out, '<');
+        }
+        i = i + 1;
+    }
+    output.text(?b.out, ">] ");
+    operator(b, "TJ");
+}
+
+$if (capability.HOSTED) {
+    use std.allocator;
+    use std.allocator.page;
+    use std.memory;
+
+    test show_glyphs__groups_unadjusted_glyphs_and_writes_adjustments {
+        var a: allocator.Allocator;
+        page.make(?a);
+        val s: res[*object.Stream, error.Error] = object.stream(?a);
+        if (sel s.err) { ret 1; }
+        var b:      Builder = begin(s.ok);
+        var ids:    [3]u16  = [3]u16{1, 0xabc, 2};
+        var adjust: [3]f64  = [3]f64{0.0, -120.5, 7.0};
+        show_glyphs(?b, ?ids[0], ?adjust[0], 3);
+        show_glyphs(?b, ?ids[0], nil, 2);
+        fill_rgb(?b, 1.0, 0.5, 0.0);
+        val finished: err[error.Error] = finish(?b);
+        if (sel finished.err) { ret 2; }
+        val expected: str = "[<00010ABC> -120.5 <0002>] TJ\n<00010ABC> Tj\n1 0.5 0 rg\n";
+        if (s.ok.data.len != str_len(expected))                                   { ret 3; }
+        if (!memory.raw_equal(s.ok.data.data::ptr, expected::ptr, s.ok.data.len)) { ret 4; }
+        ret 0;
+    }
+}

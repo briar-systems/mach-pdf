@@ -1,0 +1,19 @@
+# public module surface for mach-pdf
+
+use std.runtime;
+
+fwd pdf.error;
+fwd pdf.object;
+fwd pdf.filter;
+fwd pdf.output;
+fwd pdf.syntax;
+fwd pdf.document;
+fwd pdf.content;
+fwd pdf.page;
+fwd pdf.font;
+fwd pdf.text;
+fwd pdf.form;
+fwd pdf.date;
+fwd pdf.metadata;
+fwd pdf.embed;
+fwd pdf.pdfa;

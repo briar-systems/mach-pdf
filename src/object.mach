@@ -1,0 +1,482 @@
+# the pdf object model (iso 32000-2 section 7.3)
+#
+# every object that holds bytes or children lives in the allocator it was
+# built with, normally a document's arena, and copies what it is given, so a
+# caller's buffers are free once a constructor returns. a dictionary keeps its
+# entries in insertion order and an array its items in push order, which is the
+# order the writer emits them in.
+
+use std.allocator;
+use std.collections.vector;
+use std.memory;
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use pdf.error;
+use pdf.filter;
+
+# an indirect reference, `number generation R`
+# ---
+# number:     the object number, from 1
+# generation: the generation number
+pub rec Ref {
+    number:     u32;
+    generation: u16;
+}
+
+# a real number held as a decimal, mantissa / 10^places
+#
+# a decimal keeps the writer exact and host independent, and keeps the digits
+# a reader parsed.
+# ---
+# mantissa: the digits as an integer
+# places:   the count of digits after the decimal point
+pub rec Real {
+    mantissa: i64;
+    places:   u8;
+}
+
+# a string object's bytes
+# ---
+# data: the bytes
+# len:  the count of bytes
+# hex:  written as a hexadecimal string rather than a literal one
+pub rec String {
+    data: *u8;
+    len:  usize;
+    hex:  bool;
+}
+
+# a name object's bytes, without the leading slash or any # escapes
+# ---
+# data: the bytes
+# len:  the count of bytes
+pub rec Name {
+    data: *u8;
+    len:  usize;
+}
+
+# an array object
+# ---
+# items: the elements in order
+pub rec Array {
+    items: vector.Vector[Object];
+}
+
+# one dictionary entry
+# ---
+# key:   the entry's name
+# value: the entry's value
+pub rec Entry {
+    key:   Name;
+    value: Object;
+}
+
+# a dictionary object
+# ---
+# entries: the entries in insertion order, each key once
+pub rec Dict {
+    entries: vector.Vector[Entry];
+}
+
+# a filter applied to a stream and its decode parameters
+# ---
+# filter: the filter
+# parms:  its /DecodeParms value, null for none
+pub rec Applied {
+    filter: filter.Filter;
+    parms:  Object;
+}
+
+# a stream object
+#
+# the writer owns /Length, /Filter and /DecodeParms: it drops any the caller
+# put in dict and writes its own from data and filters.
+# ---
+# dict:    the stream dictionary
+# data:    the bytes, unencoded unless encoded is set
+# filters: the filters in decode order, the order /Filter lists them
+# encoded: data already passed through filters, so the writer copies it as is
+pub rec Stream {
+    dict:    *Dict;
+    data:    vector.Vector[u8];
+    filters: vector.Vector[Applied];
+    encoded: bool;
+}
+
+# a fixed-width span of the file reserved for a value written after the fact
+#
+# the writer emits initial padded with spaces to width and records where it
+# put it, so a value only known once the bytes exist, such as a signature's
+# /Contents or /ByteRange, is filled into the file in place.
+# ---
+# width:   the byte width of the span
+# initial: the value written into the span
+# offset:  where the writer put the span in its output, set on write
+# written: the writer has put the span
+pub rec Reserved {
+    width:   usize;
+    initial: Object;
+    offset:  usize;
+    written: bool;
+}
+
+# a pdf object
+pub tag Object: u8 {
+    null;
+    boolean:   bool;
+    integer:   i64;
+    real:      Real;
+    string:    String;
+    name:      Name;
+    array:     *Array;
+    dict:      *Dict;
+    stream:    *Stream;
+    reference: Ref;
+    reserved:  *Reserved;
+}
+
+fun refused[T](cause: allocator.Error) res[T, error.Error] {
+    ret res[T, error.Error].err{error.from_allocator(cause)};
+}
+
+fun failed(cause: allocator.Error) err[error.Error] {
+    ret err[error.Error].err{error.from_allocator(cause)};
+}
+
+fun copy_bytes(a: *allocator.Allocator, data: *u8, len: usize) res[*u8, error.Error] {
+    if (len == 0) { ret res[*u8, error.Error].ok{nil}; }
+    val got: res[*u8, allocator.Error] = allocator.allocate[u8](a, len);
+    if (sel got.err) { ret refused[*u8](got.err); }
+    memory.copy[u8](got.ok, data, len);
+    ret res[*u8, error.Error].ok{got.ok};
+}
+
+fun make[T](a: *allocator.Allocator) res[*T, error.Error] {
+    val got: res[*T, allocator.Error] = allocator.zallocate[T](a, 1);
+    if (sel got.err) { ret refused[*T](got.err); }
+    ret res[*T, error.Error].ok{got.ok};
+}
+
+# the null object
+# ---
+# ret: null
+pub fun null() Object {
+    ret Object.null{};
+}
+
+# a boolean object
+# ---
+# value: the value
+# ret:   the object
+pub fun boolean(value: bool) Object {
+    ret Object.boolean{value};
+}
+
+# an integer object
+# ---
+# value: the value
+# ret:   the object
+pub fun integer(value: i64) Object {
+    ret Object.integer{value};
+}
+
+# a real object
+# ---
+# value: the value
+# ret:   the object
+pub fun real(value: Real) Object {
+    ret Object.real{value};
+}
+
+# a reference object
+# ---
+# target: the referenced object
+# ret:    the object
+pub fun reference(target: Ref) Object {
+    ret Object.reference{target};
+}
+
+val MAX_PLACES: u8 = 9;
+
+# the decimal nearest value with at most places digits after the point
+#
+# rounding is half away from zero over one ieee multiply, so it is the same on
+# every host.
+# ---
+# value:  the number
+# places: the digits after the point to keep, at most 9
+# ret:    the decimal, or `invalid` for a non-finite value, more than 9 places,
+#         or a magnitude the mantissa cannot hold
+pub fun real_of(value: f64, places: u8) res[Real, error.Error] {
+    if (places > MAX_PLACES) { ret res[Real, error.Error].err{error.Error.invalid{}}; }
+    var scale: f64 = 1.0;
+    var i:     u8  = 0;
+    for (i < places) {
+        scale = scale * 10.0;
+        i     = i + 1;
+    }
+    val scaled: f64 = value * scale;
+    # also false for nan
+    if (!(scaled > -9.0e18 && scaled < 9.0e18)) {
+        ret res[Real, error.Error].err{error.Error.invalid{}};
+    }
+    var mantissa: i64 = 0;
+    if (scaled >= 0.0) {
+        mantissa = (scaled + 0.5)::i64;
+    }
+    or {
+        mantissa = (scaled - 0.5)::i64;
+    }
+    ret res[Real, error.Error].ok{Real{mantissa: mantissa, places: places}};
+}
+
+# a literal string object holding a copy of len bytes at data
+# ---
+# a:    the allocator to copy into
+# data: the bytes
+# len:  the count of bytes
+# ret:  the object, or the allocator's refusal
+pub fun string(a: *allocator.Allocator, data: *u8, len: usize) res[Object, error.Error] {
+    val copied: res[*u8, error.Error] = copy_bytes(a, data, len);
+    if (sel copied.err) { ret res[Object, error.Error].err{copied.err}; }
+    ret res[Object, error.Error].ok{Object.string{String{data: copied.ok, len: len, hex: false}}};
+}
+
+# a hexadecimal string object holding a copy of len bytes at data
+# ---
+# a:    the allocator to copy into
+# data: the bytes
+# len:  the count of bytes
+# ret:  the object, or the allocator's refusal
+pub fun hex_string(a: *allocator.Allocator, data: *u8, len: usize) res[Object, error.Error] {
+    val copied: res[*u8, error.Error] = copy_bytes(a, data, len);
+    if (sel copied.err) { ret res[Object, error.Error].err{copied.err}; }
+    ret res[Object, error.Error].ok{Object.string{String{data: copied.ok, len: len, hex: true}}};
+}
+
+# a literal string object holding a copy of the text of s
+# ---
+# a:   the allocator to copy into
+# s:   the text
+# ret: the object, or the allocator's refusal
+pub fun text(a: *allocator.Allocator, s: str) res[Object, error.Error] {
+    ret string(a, s, str_len(s));
+}
+
+# a name holding a copy of s
+# ---
+# a:   the allocator to copy into
+# s:   the name without its slash
+# ret: the name, or the allocator's refusal
+pub fun name_of(a: *allocator.Allocator, s: str) res[Name, error.Error] {
+    val len:    usize                 = str_len(s);
+    val copied: res[*u8, error.Error] = copy_bytes(a, s, len);
+    if (sel copied.err) { ret res[Name, error.Error].err{copied.err}; }
+    ret res[Name, error.Error].ok{Name{data: copied.ok, len: len}};
+}
+
+# a name object holding a copy of s
+# ---
+# a:   the allocator to copy into
+# s:   the name without its slash
+# ret: the object, or the allocator's refusal
+pub fun name(a: *allocator.Allocator, s: str) res[Object, error.Error] {
+    val made: res[Name, error.Error] = name_of(a, s);
+    if (sel made.err) { ret res[Object, error.Error].err{made.err}; }
+    ret res[Object, error.Error].ok{Object.name{made.ok}};
+}
+
+# whether a name spells s
+# ---
+# n:   the name
+# s:   the text to compare
+# ret: true when the bytes match
+pub fun name_is(n: Name, s: str) bool {
+    if (str_len(s) != n.len) { ret false; }
+    if (n.len == 0)          { ret true; }
+    ret memory.raw_equal(n.data::ptr, s::ptr, n.len);
+}
+
+# an empty array
+# ---
+# a:   the allocator the array and its items live in
+# ret: the array, or the allocator's refusal
+pub fun array(a: *allocator.Allocator) res[*Array, error.Error] {
+    val made: res[*Array, error.Error] = make[Array](a);
+    if (sel made.err) { ret made; }
+    made.ok.items = vector.init[Object](a);
+    ret made;
+}
+
+# append value to an array
+# ---
+# list:  the array
+# value: the item
+# ret:   ok, or the allocator's refusal
+pub fun push(list: *Array, value: Object) err[error.Error] {
+    val pushed: res[usize, allocator.Error] = vector.push[Object](?list.items, value);
+    if (sel pushed.err) { ret failed(pushed.err); }
+    ret err[error.Error].ok{};
+}
+
+# an empty dictionary
+# ---
+# a:   the allocator the dictionary and its entries live in
+# ret: the dictionary, or the allocator's refusal
+pub fun dict(a: *allocator.Allocator) res[*Dict, error.Error] {
+    val made: res[*Dict, error.Error] = make[Dict](a);
+    if (sel made.err) { ret made; }
+    made.ok.entries = vector.init[Entry](a);
+    ret made;
+}
+
+# the value under key in d
+# ---
+# d:   the dictionary
+# key: the name without its slash
+# ret: a pointer to the value, or none when d holds no such key
+pub fun get(d: *Dict, key: str) opt[*Object] {
+    var i: usize = 0;
+    for (i < d.entries.len) {
+        if (name_is(d.entries.data[i].key, key)) {
+            ret opt[*Object].some{?d.entries.data[i].value};
+        }
+        i = i + 1;
+    }
+    ret opt[*Object].none{};
+}
+
+# set key to value in d, in place when the key is present and appended when not
+# ---
+# d:     the dictionary
+# key:   the name without its slash
+# value: the value
+# ret:   ok, or the allocator's refusal
+pub fun set(d: *Dict, key: str, value: Object) err[error.Error] {
+    val present: opt[*Object] = get(d, key);
+    if (sel present.some) {
+        @present.some = value;
+        ret err[error.Error].ok{};
+    }
+    val made: res[Name, error.Error] = name_of(d.entries.a, key);
+    if (sel made.err) { ret err[error.Error].err{made.err}; }
+    val pushed: res[usize, allocator.Error] = vector.push[Entry](?d.entries, Entry{key: made.ok, value: value});
+    if (sel pushed.err) { ret failed(pushed.err); }
+    ret err[error.Error].ok{};
+}
+
+# set key to the name object value in d
+# ---
+# d:     the dictionary
+# key:   the name without its slash
+# value: the name the entry holds, without its slash
+# ret:   ok, or the allocator's refusal
+pub fun set_name(d: *Dict, key: str, value: str) err[error.Error] {
+    val made: res[Object, error.Error] = name(d.entries.a, value);
+    if (sel made.err) { ret err[error.Error].err{made.err}; }
+    ret set(d, key, made.ok);
+}
+
+# an empty stream with an empty dictionary and no filters
+# ---
+# a:   the allocator the stream and its data live in
+# ret: the stream, or the allocator's refusal
+pub fun stream(a: *allocator.Allocator) res[*Stream, error.Error] {
+    val made: res[*Stream, error.Error] = make[Stream](a);
+    if (sel made.err) { ret made; }
+    val d: res[*Dict, error.Error] = dict(a);
+    if (sel d.err) { ret res[*Stream, error.Error].err{d.err}; }
+    made.ok.dict    = d.ok;
+    made.ok.data    = vector.init[u8](a);
+    made.ok.filters = vector.init[Applied](a);
+    ret made;
+}
+
+# append len bytes at data to a stream's data
+# ---
+# s:    the stream
+# data: the bytes
+# len:  the count of bytes
+# ret:  ok, or the allocator's refusal
+pub fun write(s: *Stream, data: *u8, len: usize) err[error.Error] {
+    if (len == 0) { ret err[error.Error].ok{}; }
+    val room: res[usize, allocator.Error] = vector.reserve[u8](?s.data, len);
+    if (sel room.err) { ret failed(room.err); }
+    memory.copy[u8](?s.data.data[s.data.len], data, len);
+    s.data.len = s.data.len + len;
+    ret err[error.Error].ok{};
+}
+
+# list f after a stream's filters, so it decodes after them
+# ---
+# s:     the stream
+# f:     the filter
+# parms: its decode parameters, null for none
+# ret:   ok, or the allocator's refusal
+pub fun filter_with(s: *Stream, f: filter.Filter, parms: Object) err[error.Error] {
+    val pushed: res[usize, allocator.Error] = vector.push[Applied](?s.filters, Applied{filter: f, parms: parms});
+    if (sel pushed.err) { ret failed(pushed.err); }
+    ret err[error.Error].ok{};
+}
+
+# a reservation of width bytes that holds initial until it is filled
+# ---
+# a:       the allocator the reservation lives in
+# width:   the byte width of the span, at least initial's written width
+# initial: the value written into the span
+# ret:     the reservation, or the allocator's refusal
+pub fun reserve(a: *allocator.Allocator, width: usize, initial: Object) res[*Reserved, error.Error] {
+    val made: res[*Reserved, error.Error] = make[Reserved](a);
+    if (sel made.err) { ret made; }
+    made.ok.width   = width;
+    made.ok.initial = initial;
+    ret made;
+}
+
+$if (capability.HOSTED) {
+    use std.allocator.page;
+
+    test real_of__rounds_half_away_from_zero_and_refuses_the_unrepresentable {
+        val up: res[Real, error.Error] = real_of(2.675, 2);
+        if (!(sel up.ok && up.ok.mantissa == 268)) { ret 1; }
+        val down: res[Real, error.Error] = real_of(-0.125, 2);
+        if (!(sel down.ok && down.ok.mantissa == -13)) { ret 2; }
+        val huge: res[Real, error.Error] = real_of(1.0e300, 0);
+        if (sel huge.ok) { ret 3; }
+        val zero: f64                    = 0.0;
+        val nan:  res[Real, error.Error] = real_of(zero / zero, 2);
+        if (sel nan.ok) { ret 4; }
+        val fine: res[Real, error.Error] = real_of(1.0, 10);
+        if (sel fine.ok) { ret 5; }
+        ret 0;
+    }
+
+    test set__replaces_in_place_and_appends_new_keys {
+        var a: allocator.Allocator;
+        page.make(?a);
+        val made: res[*Dict, error.Error] = dict(?a);
+        if (sel made.err) { ret 1; }
+        val d: *Dict = made.ok;
+        set(d, "A", integer(1));
+        set(d, "B", integer(2));
+        set(d, "A", integer(3));
+        if (d.entries.len != 2)                   { ret 2; }
+        if (!name_is(d.entries.data[0].key, "A")) { ret 3; }
+        val got: opt[*Object] = get(d, "A");
+        if (!sel got.some) { ret 4; }
+        val value: Object = @got.some;
+        if (!(sel value.integer && value.integer == 3)) { ret 5; }
+        val absent: opt[*Object] = get(d, "C");
+        if (sel absent.some) { ret 6; }
+        ret 0;
+    }
+}

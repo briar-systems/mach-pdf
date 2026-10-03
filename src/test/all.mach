@@ -1,0 +1,6 @@
+# the test-only modules, reached by the tests artifact
+
+use std.runtime;
+
+use pdf.test.fonts;
+use pdf.test.golden;

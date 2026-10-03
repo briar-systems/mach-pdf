@@ -1,0 +1,201 @@
+# the bytes of a pdf file as the writer produces them
+#
+# the whole file stays in memory so every object's byte offset is known and a
+# reserved span can be filled in place after the rest is written. a write that
+# the allocator refuses is remembered rather than returned: the output stops
+# growing and `status` reports the first refusal, so a writer checks once at the
+# end.
+
+use std.allocator;
+use std.collections.vector;
+use std.memory;
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use pdf.error;
+
+# a growing file image
+# ---
+# bytes:  the file so far
+# failed: a write was refused, so bytes stopped growing
+# cause:  the first refusal, when failed
+pub rec Output {
+    bytes:  vector.Vector[u8];
+    failed: bool;
+    cause:  error.Error;
+}
+
+# an empty output
+# ---
+# a:   the allocator the bytes grow in
+# ret: the output
+pub fun init(a: *allocator.Allocator) Output {
+    var out: Output;
+    out.bytes = vector.init[u8](a);
+    ret out;
+}
+
+# release an output's bytes
+# ---
+# out: the output
+pub fun dnit(out: *Output) {
+    vector.dnit[u8](?out.bytes);
+}
+
+# the first refusal since the output was made
+# ---
+# out: the output
+# ret: ok, or the refusal
+pub fun status(out: *Output) err[error.Error] {
+    if (out.failed) { ret err[error.Error].err{out.cause}; }
+    ret err[error.Error].ok{};
+}
+
+# the offset the next byte lands at
+# ---
+# out: the output
+# ret: the count of bytes written
+pub fun offset(out: *Output) usize {
+    ret out.bytes.len;
+}
+
+# the bytes written
+# ---
+# out: the output
+# ret: a pointer to them, valid until the next write
+pub fun data(out: *Output) *u8 {
+    ret out.bytes.data;
+}
+
+fun fail(out: *Output, cause: error.Error) {
+    if (!out.failed) {
+        out.failed = true;
+        out.cause  = cause;
+    }
+}
+
+# append len bytes at bytes
+# ---
+# out:   the output
+# bytes: the bytes
+# len:   the count of bytes
+pub fun put(out: *Output, bytes: *u8, len: usize) {
+    if (out.failed || len == 0) { ret; }
+    val room: res[usize, allocator.Error] = vector.reserve[u8](?out.bytes, len);
+    if (sel room.err) {
+        fail(out, error.from_allocator(room.err));
+        ret;
+    }
+    memory.copy[u8](?out.bytes.data[out.bytes.len], bytes, len);
+    out.bytes.len = out.bytes.len + len;
+}
+
+# append one byte
+# ---
+# out:   the output
+# value: the byte
+pub fun byte(out: *Output, value: u8) {
+    var one: u8 = value;
+    put(out, ?one, 1);
+}
+
+# append the text of s
+# ---
+# out: the output
+# s:   the text
+pub fun text(out: *Output, s: str) {
+    put(out, s, str_len(s));
+}
+
+# append value in decimal
+# ---
+# out:   the output
+# value: the integer
+pub fun integer(out: *Output, value: i64) {
+    var digits: [20]u8;
+    var count:  usize = 0;
+    # negate digit by digit so the most negative value needs no wider type
+    var rest: i64 = value;
+    if (rest == 0) {
+        byte(out, '0');
+        ret;
+    }
+    if (rest < 0) { byte(out, '-'); }
+    for (rest != 0) {
+        var digit: i64 = rest % 10;
+        if (digit < 0) { digit = -digit; }
+        digits[count] = '0' + digit::u8;
+        count         = count + 1;
+        rest          = rest / 10;
+    }
+    for (count > 0) {
+        count = count - 1;
+        byte(out, digits[count]);
+    }
+}
+
+# append value in decimal, zero padded to width digits
+# ---
+# out:   the output
+# value: the integer
+# width: the least count of digits
+pub fun padded(out: *Output, value: u64, width: usize) {
+    var digits: [20]u8;
+    var count:  usize = 0;
+    var rest:   u64   = value;
+    for (rest != 0 || count == 0) {
+        digits[count] = '0' + (rest % 10)::u8;
+        count         = count + 1;
+        rest          = rest / 10;
+    }
+    var pad: usize = count;
+    for (pad < width) {
+        byte(out, '0');
+        pad = pad + 1;
+    }
+    for (count > 0) {
+        count = count - 1;
+        byte(out, digits[count]);
+    }
+}
+
+# overwrite len bytes at offset with bytes
+# ---
+# out:    the output
+# offset: where the span starts
+# bytes:  the replacement
+# len:    the count of bytes, inside what is written
+# ret:    ok, or `invalid` for a span past the end
+pub fun patch(out: *Output, offset: usize, bytes: *u8, len: usize) err[error.Error] {
+    if (offset > out.bytes.len || len > out.bytes.len - offset) {
+        ret err[error.Error].err{error.Error.invalid{}};
+    }
+    if (len > 0) { memory.copy[u8](?out.bytes.data[offset], bytes, len); }
+    ret err[error.Error].ok{};
+}
+
+$if (capability.HOSTED) {
+    use std.allocator.page;
+
+    test integer__spells_the_extremes {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var out: Output = init(?a);
+        fin { dnit(?out); }
+        integer(?out, -9223372036854775807 - 1);
+        byte(?out, ' ');
+        integer(?out, 0);
+        byte(?out, ' ');
+        padded(?out, 42, 5);
+        val expected: str = "-9223372036854775808 0 00042";
+        if (offset(?out) != str_len(expected))                               { ret 1; }
+        if (!memory.raw_equal(data(?out)::ptr, expected::ptr, offset(?out))) { ret 2; }
+        ret 0;
+    }
+}

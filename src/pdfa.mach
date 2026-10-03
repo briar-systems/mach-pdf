@@ -1,0 +1,417 @@
+# pdf/a-3b output (iso 19005-3, conformance level b)
+#
+# `conform` makes a document claim pdf/a-3b: xmp metadata identifying the
+# part and level, an srgb output intent with its icc profile embedded, and a
+# rule every save then enforces. the rule refuses what pdf/a forbids of the
+# objects the document holds (unembedded fonts, encryption, javascript and the
+# other forbidden actions, and content outside the file) and what it requires
+# of the document (an /ID, the metadata, the output intent, and embedded files
+# associated with their relationship). files attach through `pdf.embed`.
+#
+# the rule judges the objects this document holds. objects an update leaves
+# in a prior revision were judged when that revision was written.
+
+use std.allocator;
+use std.collections.vector;
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use pdf.document;
+use pdf.error;
+use pdf.metadata;
+use pdf.object;
+
+# the srgb profile the output intent embeds, an icc v2 profile in the public
+# domain (see src/icc)
+#[embed("icc/sRGB-v2-magic.icc")]
+val SRGB: [_]u8;
+
+val CONDITION: str = "sRGB IEC61966-2.1";
+
+# actions iso 19005-3 section 6.6.1 forbids
+val FORBIDDEN_ACTIONS: [11]str = [11]str{
+    "Launch", "Sound", "Movie", "ResetForm", "ImportData", "Hide", "SetOCGState",
+    "Rendition", "Trans", "GoTo3DView", "JavaScript"
+};
+
+# font subtypes whose glyphs live in a font program the file must embed
+val PROGRAM_FONTS: [5]str = [5]str{"Type1", "MMType1", "TrueType", "CIDFontType0", "CIDFontType2"};
+
+fun broken(number: u32) err[error.Error] {
+    ret err[error.Error].err{error.Error.nonconforming{number}};
+}
+
+fun has(d: *object.Dict, key: str) bool {
+    val held: opt[*object.Object] = object.get(d, key);
+    ret sel held.some;
+}
+
+# whether d's entry under key is the name value
+fun named(d: *object.Dict, key: str, value: str) bool {
+    val held: opt[*object.Object] = object.get(d, key);
+    if (!sel held.some) { ret false; }
+    val found: object.Object = @held.some;
+    if (!sel found.name) { ret false; }
+    ret object.name_is(found.name, value);
+}
+
+fun named_any(d: *object.Dict, key: str, values: *str, count: usize) bool {
+    var i: usize = 0;
+    for (i < count) {
+        if (named(d, key, values[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the dictionary an entry names directly or through a reference the document
+# holds, a stream's dictionary for a stream
+fun resolved(doc: *document.Document, d: *object.Dict, key: str) opt[*object.Dict] {
+    val held: opt[*object.Object] = object.get(d, key);
+    if (!sel held.some) { ret opt[*object.Dict].none{}; }
+    val entry: object.Object = @held.some;
+    var value: object.Object = entry;
+    if (sel entry.reference) {
+        val found: opt[object.Object] = document.lookup(doc, entry.reference);
+        if (!sel found.some) { ret opt[*object.Dict].none{}; }
+        value = found.some;
+    }
+    if (sel value.dict)   { ret opt[*object.Dict].some{value.dict}; }
+    if (sel value.stream) { ret opt[*object.Dict].some{value.stream.dict}; }
+    ret opt[*object.Dict].none{};
+}
+
+# the state of one pass over the document's objects
+# ---
+# doc:   the document
+# specs: the indirect file specifications that embed a file
+# af:    the object numbers every /AF array names
+rec Walk {
+    doc:   *document.Document;
+    specs: vector.Vector[u32];
+    af:    vector.Vector[u32];
+}
+
+fun noted(list: *vector.Vector[u32], number: u32) err[error.Error] {
+    val pushed: res[usize, allocator.Error] = vector.push[u32](list, number);
+    if (sel pushed.err) { ret err[error.Error].err{error.from_allocator(pushed.err)}; }
+    ret err[error.Error].ok{};
+}
+
+fun fonts(w: *Walk, d: *object.Dict, number: u32) err[error.Error] {
+    if (!named_any(d, "Subtype", ?PROGRAM_FONTS[0], 5)) { ret err[error.Error].ok{}; }
+    if (has(d, "Type") && !named(d, "Type", "Font"))    { ret err[error.Error].ok{}; }
+    val descriptor: opt[*object.Dict] = resolved(w.doc, d, "FontDescriptor");
+    if (!sel descriptor.some) { ret broken(number); }
+    val program: *object.Dict = descriptor.some;
+    if (has(program, "FontFile") || has(program, "FontFile2") || has(program, "FontFile3")) {
+        ret err[error.Error].ok{};
+    }
+    ret broken(number);
+}
+
+fun spec(w: *Walk, d: *object.Dict, number: u32, top: bool) err[error.Error] {
+    if (!has(d, "EF")) { ret err[error.Error].ok{}; }
+    # an /AF array names a specification by reference, so a direct one cannot be associated
+    if (!top)                                                       { ret broken(number); }
+    if (!has(d, "F") || !has(d, "UF") || !has(d, "AFRelationship")) { ret broken(number); }
+    val ef: opt[*object.Dict] = resolved(w.doc, d, "EF");
+    if (!sel ef.some) { ret broken(number); }
+    val file: opt[*object.Dict] = resolved(w.doc, ef.some, "F");
+    if (!sel file.some)             { ret broken(number); }
+    if (!has(file.some, "Subtype")) { ret broken(number); }
+    ret noted(?w.specs, number);
+}
+
+fun associated(w: *Walk, d: *object.Dict) err[error.Error] {
+    val held: opt[*object.Object] = object.get(d, "AF");
+    if (!sel held.some) { ret err[error.Error].ok{}; }
+    val list: object.Object = @held.some;
+    if (!sel list.array) { ret err[error.Error].ok{}; }
+    var i: usize = 0;
+    for (i < list.array.items.len) {
+        val item: object.Object = list.array.items.data[i];
+        if (sel item.reference) {
+            val kept: err[error.Error] = noted(?w.af, item.reference.number);
+            if (sel kept.err) { ret kept; }
+        }
+        i = i + 1;
+    }
+    ret err[error.Error].ok{};
+}
+
+fun dict(w: *Walk, d: *object.Dict, number: u32, top: bool) err[error.Error] {
+    if (has(d, "JS") || has(d, "AA") || has(d, "JavaScript")) { ret broken(number); }
+    if (named_any(d, "S", ?FORBIDDEN_ACTIONS[0], 11))         { ret broken(number); }
+    # postscript, reference and opi xobjects draw content from outside the file
+    if (has(d, "OPI") || named(d, "Subtype", "PS"))   { ret broken(number); }
+    if (named(d, "Subtype", "Form") && has(d, "Ref")) { ret broken(number); }
+    val checked: err[error.Error] = error.first(
+        fonts(w, d, number),
+        spec(w, d, number, top),
+        associated(w, d));
+    if (sel checked.err) { ret checked; }
+    var i: usize = 0;
+    for (i < d.entries.len) {
+        val inner: err[error.Error] = walk(w, d.entries.data[i].value, number);
+        if (sel inner.err) { ret inner; }
+        i = i + 1;
+    }
+    ret err[error.Error].ok{};
+}
+
+fun stream(w: *Walk, s: *object.Stream, number: u32) err[error.Error] {
+    # a stream whose data lives in another file, or is encrypted
+    if (has(s.dict, "F") || has(s.dict, "FFilter") || has(s.dict, "FDecodeParms")) { ret broken(number); }
+    var i: usize = 0;
+    for (i < s.filters.len) {
+        if (str_equals(s.filters.data[i].filter.name, "Crypt")) { ret broken(number); }
+        i = i + 1;
+    }
+    ret dict(w, s.dict, number, true);
+}
+
+fun walk(w: *Walk, value: object.Object, number: u32) err[error.Error] {
+    if (sel value.dict) { ret dict(w, value.dict, number, false); }
+    if (sel value.array) {
+        var i: usize = 0;
+        for (i < value.array.items.len) {
+            val inner: err[error.Error] = walk(w, value.array.items.data[i], number);
+            if (sel inner.err) { ret inner; }
+            i = i + 1;
+        }
+    }
+    ret err[error.Error].ok{};
+}
+
+fun contains(list: *vector.Vector[u32], number: u32) bool {
+    var i: usize = 0;
+    for (i < list.len) {
+        if (list.data[i] == number) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun objects(w: *Walk) err[error.Error] {
+    val size: u32 = document.size(w.doc);
+    var n:    u32 = 1;
+    for (n < size) {
+        val held: opt[document.Held] = document.numbered(w.doc, n);
+        if (sel held.some) {
+            val value:   object.Object    = held.some.value;
+            var checked: err[error.Error] = err[error.Error].ok{};
+            if (sel value.stream) {
+                checked = stream(w, value.stream, n);
+            }
+            or (sel value.dict) {
+                checked = dict(w, value.dict, n, true);
+            }
+            or {
+                checked = walk(w, value, n);
+            }
+            if (sel checked.err) { ret checked; }
+        }
+        n = n + 1;
+    }
+    var i: usize = 0;
+    for (i < w.specs.len) {
+        if (!contains(?w.af, w.specs.data[i])) { ret broken(w.specs.data[i]); }
+        i = i + 1;
+    }
+    ret err[error.Error].ok{};
+}
+
+# the catalog parts pdf/a requires, which conform made
+fun required(doc: *document.Document) err[error.Error] {
+    if (doc.version.major != 1) { ret broken(0); }
+    if (sel doc.id.null)        { ret broken(0); }
+    if (!sel doc.root.some)     { ret broken(0); }
+    val number: u32                = doc.root.some.number;
+    val root:   opt[object.Object] = document.lookup(doc, doc.root.some);
+    if (!sel root.some) { ret broken(number); }
+    val catalog: object.Object = root.some;
+    if (!sel catalog.dict) { ret broken(number); }
+    val xmp: opt[*object.Object] = object.get(catalog.dict, "Metadata");
+    if (!sel xmp.some) { ret broken(number); }
+    val link: object.Object = @xmp.some;
+    if (!sel link.reference) { ret broken(number); }
+    val packet: opt[object.Object] = document.lookup(doc, link.reference);
+    if (!sel packet.some) { ret broken(link.reference.number); }
+    val s: object.Object = packet.some;
+    # the metadata stays readable without decoding
+    if (!(sel s.stream && s.stream.filters.len == 0)) { ret broken(link.reference.number); }
+    val intents: opt[*object.Object] = object.get(catalog.dict, "OutputIntents");
+    if (!sel intents.some) { ret broken(number); }
+    ret err[error.Error].ok{};
+}
+
+# whether a document as it stands would be written as pdf/a-3b
+#
+# conform requires this of every save, so a caller only calls it to ask early.
+# ---
+# doc: the document
+# ret: ok, `nonconforming` naming the first object that breaks a rule, or 0
+#      when the document lacks an /ID, its catalog, metadata or output intent,
+#      or declares a version other than 1.x, or the allocator's refusal
+pub fun check(doc: *document.Document) err[error.Error] {
+    val held: err[error.Error] = required(doc);
+    if (sel held.err) { ret held; }
+    var w: Walk = Walk{doc: doc, specs: vector.init[u32](doc.backing), af: vector.init[u32](doc.backing)};
+    fin {
+        vector.dnit[u32](?w.specs);
+        vector.dnit[u32](?w.af);
+    }
+    ret objects(?w);
+}
+
+fun rule(ctx: ptr, doc: *document.Document) err[error.Error] {
+    ret check(doc);
+}
+
+fun intent(doc: *document.Document, root: *object.Dict) err[error.Error] {
+    val a:       *allocator.Allocator             = document.objects(doc);
+    val profile: res[*object.Stream, error.Error] = object.stream(a);
+    if (sel profile.err) { ret err[error.Error].err{profile.err}; }
+    val filled: err[error.Error] = error.first(
+        object.set(profile.ok.dict, "N", object.integer(3)),
+        object.write(profile.ok, ?SRGB[0], $length_of(SRGB)));
+    if (sel filled.err) { ret filled; }
+    val icc: res[object.Ref, error.Error] = document.add(doc, object.Object.stream{profile.ok});
+    if (sel icc.err) { ret err[error.Error].err{icc.err}; }
+
+    val d: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel d.err) { ret err[error.Error].err{d.err}; }
+    val condition: res[object.Object, error.Error] = object.text(a, CONDITION);
+    if (sel condition.err) { ret err[error.Error].err{condition.err}; }
+    val registry: res[object.Object, error.Error] = object.text(a, "http://www.color.org");
+    if (sel registry.err) { ret err[error.Error].err{registry.err}; }
+    val list: res[*object.Array, error.Error] = object.array(a);
+    if (sel list.err) { ret err[error.Error].err{list.err}; }
+    val set: err[error.Error] = error.first(
+        object.set_name(d.ok, "Type", "OutputIntent"),
+        object.set_name(d.ok, "S", "GTS_PDFA1"),
+        object.set(d.ok, "OutputConditionIdentifier", condition.ok),
+        object.set(d.ok, "RegistryName", registry.ok),
+        object.set(d.ok, "Info", condition.ok),
+        object.set(d.ok, "DestOutputProfile", object.reference(icc.ok)),
+        object.push(list.ok, object.Object.dict{d.ok}));
+    if (sel set.err) { ret set; }
+    ret object.set(root, "OutputIntents", object.Object.array{list.ok});
+}
+
+# make a document pdf/a-3b
+#
+# writes the information dictionary and xmp metadata from meta with the
+# pdf/a-3b identification, adds the srgb output intent, and requires check of
+# every later save. the caller still sets the /ID with document.set_id, embeds
+# every font it uses, and attaches files through pdf.embed.
+# ---
+# doc:  the document
+# meta: its description
+# ret:  ok, `invalid` for a document that already has output intents or for
+#       metadata write refuses, or the allocator's refusal
+pub fun conform(doc: *document.Document, meta: *metadata.Metadata) err[error.Error] {
+    val root: res[*object.Dict, error.Error] = document.catalog(doc);
+    if (sel root.err)                  { ret err[error.Error].err{root.err}; }
+    if (has(root.ok, "OutputIntents")) { ret err[error.Error].err{error.Error.invalid{}}; }
+    var claims: [2]metadata.Claim = [2]metadata.Claim{
+        metadata.Claim{prefix: "pdfaid", uri: "http://www.aiim.org/pdfa/ns/id/", property: "part", value: "3"},
+        metadata.Claim{prefix: "pdfaid", uri: "http://www.aiim.org/pdfa/ns/id/", property: "conformance", value: "B"}
+    };
+    val described: err[error.Error] = metadata.write(doc, meta, ?claims[0], 2);
+    if (sel described.err) { ret described; }
+    val intended: err[error.Error] = intent(doc, root.ok);
+    if (sel intended.err) { ret intended; }
+    ret document.require(doc, document.Check{ctx: nil, run: rule});
+}
+
+$if (capability.HOSTED) {
+    use pages: std.allocator.page;
+
+    use pdf.font;
+    use pdf.output;
+    use pdf.page;
+
+    # a conforming one-page document, or the step that failed
+    fun started(doc: *document.Document) i32 {
+        val tree: res[page.Tree, error.Error] = page.tree(doc);
+        if (sel tree.err) { ret 1; }
+        var t:     page.Tree                   = tree.ok;
+        val added: res[page.Page, error.Error] = page.add(doc, ?t, page.A4);
+        if (sel added.err) { ret 2; }
+        var meta: metadata.Metadata;
+        meta.title = "pdf/a";
+        val made: err[error.Error] = conform(doc, ?meta);
+        if (sel made.err) { ret 3; }
+        val id: str = "0123456789abcdef";
+        document.set_id(doc, id, 16, id, 16);
+        ret 0;
+    }
+
+    fun refuses(doc: *document.Document, a: *allocator.Allocator, number: u32) bool {
+        var out: output.Output = output.init(a);
+        fin { output.dnit(?out); }
+        val saved: err[error.Error] = document.save(doc, ?out);
+        if (!sel saved.err) { ret false; }
+        val cause: error.Error = saved.err;
+        ret sel cause.nonconforming && cause.nonconforming == number && output.offset(?out) == 0;
+    }
+
+    test conform__saves_a_conforming_document_and_refuses_twice {
+        var a: allocator.Allocator;
+        pages.make(?a);
+        var doc:  document.Document;
+        val init: err[error.Error] = document.init(?doc, ?a);
+        if (sel init.err) { ret 1; }
+        fin { document.dnit(?doc); }
+        val made: i32 = started(?doc);
+        if (made != 0) { ret 10 + made; }
+        var meta:  metadata.Metadata;
+        val again: err[error.Error] = conform(?doc, ?meta);
+        if (!(sel again.err && sel again.err.invalid)) { ret 2; }
+        var out: output.Output = output.init(?a);
+        fin { output.dnit(?out); }
+        val saved: err[error.Error] = document.save(?doc, ?out);
+        if (sel saved.err) { ret 3; }
+        ret 0;
+    }
+
+    test check__refuses_a_missing_id_unembedded_fonts_and_javascript {
+        var a: allocator.Allocator;
+        pages.make(?a);
+        var doc:  document.Document;
+        val init: err[error.Error] = document.init(?doc, ?a);
+        if (sel init.err) { ret 1; }
+        fin { document.dnit(?doc); }
+        if (started(?doc) != 0) { ret 2; }
+
+        val id: object.Object = doc.id;
+        doc.id = object.null();
+        if (!refuses(?doc, ?a, 0)) { ret 3; }
+        doc.id = id;
+
+        val helvetica: res[object.Ref, error.Error] = font.standard(?doc, "Helvetica");
+        if (sel helvetica.err)                       { ret 4; }
+        if (!refuses(?doc, ?a, helvetica.ok.number)) { ret 5; }
+        document.define(?doc, helvetica.ok, object.null());
+
+        val action: res[*object.Dict, error.Error] = object.dict(document.objects(?doc));
+        if (sel action.err) { ret 6; }
+        object.set_name(action.ok, "S", "JavaScript");
+        val root: res[*object.Dict, error.Error] = document.catalog(?doc);
+        if (sel root.err) { ret 7; }
+        object.set(root.ok, "OpenAction", object.Object.dict{action.ok});
+        if (!sel doc.root.some)                       { ret 8; }
+        if (!refuses(?doc, ?a, doc.root.some.number)) { ret 9; }
+        ret 0;
+    }
+}

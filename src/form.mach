@@ -1,0 +1,725 @@
+# interactive forms (iso 32000-2 section 12.7)
+#
+# a form is the catalog's /AcroForm and the tree of fields under it. a group
+# is a non-terminal field that only names its children, so the fully qualified
+# name of a field is its ancestors' partial names joined by periods. a terminal
+# field holds the value and has its widgets as kids, never merged into it, so
+# a field placed several times is one field with several widgets and a value
+# entered in one shows in all of them.
+#
+# every widget carries a normal appearance stream, the print flag and nothing
+# a viewer must compute, and the form never sets /NeedAppearances, as pdf/a
+# requires. an appearance draws only the value, with no background or border,
+# so whatever the page draws beneath the widget shows through.
+#
+# a date is a text field. pdf formats and validates dates through javascript
+# actions, which pdf/a forbids, so a date field carries its expected format as
+# a hint in its tooltip and leaves the entry to the viewer.
+#
+# a signature field is written unsigned, with no /V. signing it is an
+# incremental update that gives the field's dictionary a /V, which the field's
+# `node` reaches.
+
+use std.allocator;
+use std.system.capability;
+use std.text.utf8;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use pdf.content;
+use pdf.document;
+use pdf.error;
+use pdf.font;
+use pdf.object;
+use pdf.output;
+use pdf.page;
+use pdf.syntax;
+use pdf.text;
+
+# the annotation flag that makes a widget print (iso 32000-2 table 167)
+val PRINT: i64 = 4;
+
+# the form flag that marks a document holding signature fields (table 225)
+val SIGNATURES_EXIST: i64 = 1;
+
+# the space between a widget's edge and the value drawn in it
+val INSET: f64 = 2.0;
+
+# show len bytes of utf-8 text at data in a face's font, at the current text
+# position of a builder
+#
+# a character the font cannot show is a failure, never a substitute glyph.
+# ---
+# ctx:     the face's state
+# scratch: an allocator for working memory, released with the document
+# b:       the builder, inside a text object with the face's font selected
+# data:    the text as utf-8
+# len:     the count of bytes
+# ret:     ok, `invalid` or `glyph` for a character the font cannot show, or
+#          the allocator's refusal
+pub def Show: fun(ptr, *allocator.Allocator, *content.Builder, *u8, usize) err[error.Error];
+
+# the font a form draws its values in
+#
+# a standard font from `standard` needs no embedding but is not allowed in
+# pdf/a. an embedded font supplies its own encoding through show, such as
+# glyph codes for an Identity-H font, and its own vertical metrics.
+# ---
+# font:    the font dictionary
+# name:    the resource name the font is selected by, without its slash, which
+#          must outlive the form
+# ascent:  the height above the baseline, as a fraction of the font size
+# descent: the depth below the baseline, as a negative fraction of the size
+# ctx:     state passed to show
+# show:    writes text in the font's encoding
+pub rec Face {
+    font:    object.Ref;
+    name:    str;
+    ascent:  f64;
+    descent: f64;
+    ctx:     ptr;
+    show:    Show;
+}
+
+# a document's form
+# ---
+# node:   the /AcroForm object
+# dict:   its dictionary
+# fields: its /Fields array, the top level fields
+# face:   the font every value is drawn in
+pub rec Form {
+    node:   object.Ref;
+    dict:   *object.Dict;
+    fields: *object.Array;
+    face:   Face;
+}
+
+# what a field is
+# ---
+# group:     a non-terminal field whose kids are fields
+# text:      a text field whose kids are its widgets
+# signature: a signature field whose kids are its widgets
+pub tag Kind: u8 {
+    group;
+    text;
+    signature;
+}
+
+# a field
+# ---
+# node:      the field's object
+# dict:      its dictionary
+# kids:      its /Kids array, fields for a group and widgets otherwise
+# kind:      what the field is
+# size:      the font size its value is drawn at, for a text field
+# value:     its value as utf-8, nil for none
+# value_len: the count of bytes in value
+pub rec Field {
+    node:      object.Ref;
+    dict:      *object.Dict;
+    kids:      *object.Array;
+    kind:      Kind;
+    size:      f64;
+    value:     *u8;
+    value_len: usize;
+}
+
+# a text field
+# ---
+# name:    the partial name, with no period
+# tooltip: the text a viewer shows for the field (/TU), nil for none
+# value:   the initial value as utf-8, nil for none
+# size:    the font size the value is drawn at, above zero
+pub rec Text {
+    name:    str;
+    tooltip: str;
+    value:   str;
+    size:    f64;
+}
+
+# a date field, a text field whose tooltip names the format it expects
+# ---
+# name:    the partial name, with no period
+# tooltip: the text a viewer shows for the field, nil for none
+# hint:    the expected format, such as "YYYY-MM-DD", nil for none
+# value:   the initial value as utf-8, nil for none
+# size:    the font size the value is drawn at, above zero
+pub rec Date {
+    name:    str;
+    tooltip: str;
+    hint:    str;
+    value:   str;
+    size:    f64;
+}
+
+# an unsigned signature field
+# ---
+# name:    the partial name, with no period
+# tooltip: the text a viewer shows for the field, nil for none
+pub rec Signature {
+    name:    str;
+    tooltip: str;
+}
+
+fun failure[T](cause: error.Error) res[T, error.Error] {
+    ret res[T, error.Error].err{cause};
+}
+
+fun invalid[T]() res[T, error.Error] {
+    ret res[T, error.Error].err{error.Error.invalid{}};
+}
+
+# a default appearance string selecting the face at size in black
+fun appearance(a: *allocator.Allocator, face: Face, size: f64) res[object.Object, error.Error] {
+    val decimal: res[object.Real, error.Error] = object.real_of(size, 4);
+    if (sel decimal.err) { ret failure[object.Object](decimal.err); }
+    var out: output.Output = output.init(a);
+    fin { output.dnit(?out); }
+    syntax.write(?out, object.Object.name{object.Name{data: face.name, len: str_len(face.name)}});
+    output.byte(?out, ' ');
+    syntax.write(?out, object.real(decimal.ok));
+    output.text(?out, " Tf 0 g");
+    val status: err[error.Error] = output.status(?out);
+    if (sel status.err) { ret failure[object.Object](status.err); }
+    ret object.string(a, output.data(?out), output.offset(?out));
+}
+
+# a resource dictionary holding the face's font
+fun resources(a: *allocator.Allocator, face: Face) res[*object.Dict, error.Error] {
+    val d: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel d.err) { ret d; }
+    val fonts: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel fonts.err) { ret fonts; }
+    val set: err[error.Error] = error.first(
+        object.set(fonts.ok, face.name, object.reference(face.font)),
+        object.set(d.ok, "Font", object.Object.dict{fonts.ok}));
+    if (sel set.err) { ret failure[*object.Dict](set.err); }
+    ret d;
+}
+
+# give a document a form that draws its values in face
+# ---
+# doc:  the document
+# face: the font values are drawn in
+# ret:  the form, `invalid` when the catalog already has an /AcroForm, or the
+#       allocator's refusal
+pub fun init(doc: *document.Document, face: Face) res[Form, error.Error] {
+    val a:    *allocator.Allocator           = document.objects(doc);
+    val root: res[*object.Dict, error.Error] = document.catalog(doc);
+    if (sel root.err) { ret failure[Form](root.err); }
+    val present: opt[*object.Object] = object.get(root.ok, "AcroForm");
+    if (sel present.some) { ret invalid[Form](); }
+    val d: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel d.err) { ret failure[Form](d.err); }
+    val fields: res[*object.Array, error.Error] = object.array(a);
+    if (sel fields.err) { ret failure[Form](fields.err); }
+    val dr: res[*object.Dict, error.Error] = resources(a, face);
+    if (sel dr.err) { ret failure[Form](dr.err); }
+    val da: res[object.Object, error.Error] = appearance(a, face, 0.0);
+    if (sel da.err) { ret failure[Form](da.err); }
+    val set: err[error.Error] = error.first(
+        object.set(d.ok, "Fields", object.Object.array{fields.ok}),
+        object.set(d.ok, "DR", object.Object.dict{dr.ok}),
+        object.set(d.ok, "DA", da.ok));
+    if (sel set.err) { ret failure[Form](set.err); }
+    val node: res[object.Ref, error.Error] = document.add(doc, object.Object.dict{d.ok});
+    if (sel node.err) { ret failure[Form](node.err); }
+    val linked: err[error.Error] = object.set(root.ok, "AcroForm", object.reference(node.ok));
+    if (sel linked.err) { ret failure[Form](linked.err); }
+    ret res[Form, error.Error].ok{Form{node: node.ok, dict: d.ok, fields: fields.ok, face: face}};
+}
+
+fun same(x: object.String, y: object.String) bool {
+    if (x.len != y.len || x.hex != y.hex) { ret false; }
+    var i: usize = 0;
+    for (i < x.len) {
+        if (x.data[i] != y.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether a field in list already has the partial name t
+fun taken(doc: *document.Document, list: *object.Array, spelled: object.Object) bool {
+    if (!sel spelled.string) { ret false; }
+    var i: usize = 0;
+    for (i < list.items.len) {
+        val item: object.Object = list.items.data[i];
+        i = i + 1;
+        if (!sel item.reference) { cnt; }
+        val found: opt[object.Object] = document.lookup(doc, item.reference);
+        if (!sel found.some) { cnt; }
+        val value: object.Object = found.some;
+        if (!sel value.dict) { cnt; }
+        val held: opt[*object.Object] = object.get(value.dict, "T");
+        if (!sel held.some) { cnt; }
+        val name: object.Object = @held.some;
+        if (sel name.string) {
+            if (same(name.string, spelled.string)) { ret true; }
+        }
+    }
+    ret false;
+}
+
+fun has_period(s: str) bool {
+    var i: usize = 0;
+    for (s[i] != 0) {
+        if (s[i] == '.') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# make a field named name under parent, or at the top level for a nil parent
+fun field(doc: *document.Document, f: *Form, parent: *Field, name: str, kind: Kind, type: str, tooltip: object.Object) res[Field, error.Error] {
+    val a: *allocator.Allocator = document.objects(doc);
+    if (name == nil)                      { ret invalid[Field](); }
+    if (name[0] == 0 || has_period(name)) { ret invalid[Field](); }
+    var siblings: *object.Array = f.fields;
+    if (parent != nil) {
+        if (!sel parent.kind.group) { ret invalid[Field](); }
+        siblings = parent.kids;
+    }
+    val t: res[object.Object, error.Error] = text.of(a, name);
+    if (sel t.err)                  { ret failure[Field](t.err); }
+    if (taken(doc, siblings, t.ok)) { ret invalid[Field](); }
+
+    val d: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel d.err) { ret failure[Field](d.err); }
+    val kids: res[*object.Array, error.Error] = object.array(a);
+    if (sel kids.err) { ret failure[Field](kids.err); }
+    if (type != nil) {
+        val typed: err[error.Error] = object.set_name(d.ok, "FT", type);
+        if (sel typed.err) { ret failure[Field](typed.err); }
+    }
+    val named: err[error.Error] = object.set(d.ok, "T", t.ok);
+    if (sel named.err) { ret failure[Field](named.err); }
+    if (!sel tooltip.null) {
+        val described: err[error.Error] = object.set(d.ok, "TU", tooltip);
+        if (sel described.err) { ret failure[Field](described.err); }
+    }
+    if (parent != nil) {
+        val up: err[error.Error] = object.set(d.ok, "Parent", object.reference(parent.node));
+        if (sel up.err) { ret failure[Field](up.err); }
+    }
+    val listed: err[error.Error] = object.set(d.ok, "Kids", object.Object.array{kids.ok});
+    if (sel listed.err) { ret failure[Field](listed.err); }
+    val node: res[object.Ref, error.Error] = document.add(doc, object.Object.dict{d.ok});
+    if (sel node.err) { ret failure[Field](node.err); }
+    val linked: err[error.Error] = object.push(siblings, object.reference(node.ok));
+    if (sel linked.err) { ret failure[Field](linked.err); }
+    ret res[Field, error.Error].ok{Field{node: node.ok, dict: d.ok, kids: kids.ok, kind: kind,
+        size: 0.0, value: nil, value_len: 0}};
+}
+
+fun tooltip_of(a: *allocator.Allocator, tooltip: str) res[object.Object, error.Error] {
+    if (tooltip == nil) { ret res[object.Object, error.Error].ok{object.null()}; }
+    ret text.of(a, tooltip);
+}
+
+# add a group, a field that only names the fields under it
+# ---
+# doc:    the document
+# f:      the form
+# parent: the group it sits under, nil for the top level
+# name:   its partial name, with no period
+# ret:    the group, `invalid` for an empty name, one with a period, one a
+#         sibling has, or a parent that is not a group, or the allocator's
+#         refusal
+pub fun group(doc: *document.Document, f: *Form, parent: *Field, name: str) res[Field, error.Error] {
+    ret field(doc, f, parent, name, Kind.group{}, nil, object.null());
+}
+
+fun textual(doc: *document.Document, f: *Form, parent: *Field, name: str, tooltip: object.Object, value: str, size: f64) res[Field, error.Error] {
+    val a: *allocator.Allocator = document.objects(doc);
+    if (!(size > 0.0)) { ret invalid[Field](); }
+    val da: res[object.Object, error.Error] = appearance(a, f.face, size);
+    if (sel da.err) { ret failure[Field](da.err); }
+    val made: res[Field, error.Error] = field(doc, f, parent, name, Kind.text{}, "Tx", tooltip);
+    if (sel made.err) { ret made; }
+    var fd: Field = made.ok;
+    fd.size = size;
+    if (value != nil) {
+        val len: usize = str_len(value);
+        if (len > 0) {
+            val v: res[object.Object, error.Error] = text.string(a, value, len);
+            if (sel v.err) { ret failure[Field](v.err); }
+            val copied: res[*u8, allocator.Error] = allocator.allocate[u8](a, len);
+            if (sel copied.err) { ret failure[Field](error.from_allocator(copied.err)); }
+            var i: usize = 0;
+            for (i < len) {
+                copied.ok[i] = value[i];
+                i            = i + 1;
+            }
+            fd.value     = copied.ok;
+            fd.value_len = len;
+            val held: err[error.Error] = object.set(fd.dict, "V", v.ok);
+            if (sel held.err) { ret failure[Field](held.err); }
+        }
+    }
+    val drawn: err[error.Error] = object.set(fd.dict, "DA", da.ok);
+    if (sel drawn.err) { ret failure[Field](drawn.err); }
+    ret res[Field, error.Error].ok{fd};
+}
+
+# add a text field
+# ---
+# doc:    the document
+# f:      the form
+# parent: the group it sits under, nil for the top level
+# spec:   the field
+# ret:    the field, `invalid` for a name group refuses, a size not above
+#         zero or text that is not utf-8, or the allocator's refusal
+pub fun text_field(doc: *document.Document, f: *Form, parent: *Field, spec: Text) res[Field, error.Error] {
+    val tooltip: res[object.Object, error.Error] = tooltip_of(document.objects(doc), spec.tooltip);
+    if (sel tooltip.err) { ret failure[Field](tooltip.err); }
+    ret textual(doc, f, parent, spec.name, tooltip.ok, spec.value, spec.size);
+}
+
+# the tooltip of a date field: the tooltip, the hint, or the tooltip followed
+# by the hint in parentheses
+fun hinted(a: *allocator.Allocator, tooltip: str, hint: str) res[object.Object, error.Error] {
+    if (hint == nil)    { ret tooltip_of(a, tooltip); }
+    if (tooltip == nil) { ret text.of(a, hint); }
+    var out: output.Output = output.init(a);
+    fin { output.dnit(?out); }
+    output.text(?out, tooltip);
+    output.text(?out, " (");
+    output.text(?out, hint);
+    output.byte(?out, ')');
+    val status: err[error.Error] = output.status(?out);
+    if (sel status.err) { ret failure[object.Object](status.err); }
+    ret text.string(a, output.data(?out), output.offset(?out));
+}
+
+# add a date field, a text field whose tooltip carries the expected format
+# ---
+# doc:    the document
+# f:      the form
+# parent: the group it sits under, nil for the top level
+# spec:   the field
+# ret:    the field, `invalid` as for text_field, or the allocator's refusal
+pub fun date_field(doc: *document.Document, f: *Form, parent: *Field, spec: Date) res[Field, error.Error] {
+    val tooltip: res[object.Object, error.Error] = hinted(document.objects(doc), spec.tooltip, spec.hint);
+    if (sel tooltip.err) { ret failure[Field](tooltip.err); }
+    ret textual(doc, f, parent, spec.name, tooltip.ok, spec.value, spec.size);
+}
+
+# add an unsigned signature field, and mark the form as holding one
+# ---
+# doc:    the document
+# f:      the form
+# parent: the group it sits under, nil for the top level
+# spec:   the field
+# ret:    the field, `invalid` for a name group refuses, or the allocator's
+#         refusal
+pub fun signature_field(doc: *document.Document, f: *Form, parent: *Field, spec: Signature) res[Field, error.Error] {
+    val tooltip: res[object.Object, error.Error] = tooltip_of(document.objects(doc), spec.tooltip);
+    if (sel tooltip.err) { ret failure[Field](tooltip.err); }
+    val made: res[Field, error.Error] = field(doc, f, parent, spec.name, Kind.signature{}, "Sig", tooltip.ok);
+    if (sel made.err) { ret made; }
+    val flagged: err[error.Error] = object.set(f.dict, "SigFlags", object.integer(SIGNATURES_EXIST));
+    if (sel flagged.err) { ret failure[Field](flagged.err); }
+    ret made;
+}
+
+# draw a text field's value into its appearance, vertically centred
+fun draw(a: *allocator.Allocator, face: Face, fd: *Field, b: *content.Builder, width: f64, height: f64) err[error.Error] {
+    content.begin_marked(b, "Tx");
+    if (fd.value_len > 0) {
+        val baseline: f64 = (height - (face.ascent - face.descent) * fd.size) / 2.0 - face.descent * fd.size;
+        content.save(b);
+        content.rectangle(b, 1.0, 1.0, width - 2.0, height - 2.0);
+        content.clip(b);
+        content.end_path(b);
+        content.begin_text(b);
+        content.font(b, face.name, fd.size);
+        content.fill_gray(b, 0.0);
+        content.move_text(b, INSET, baseline);
+        val shown: err[error.Error] = face.show(face.ctx, a, b, fd.value, fd.value_len);
+        if (sel shown.err) { ret shown; }
+        content.end_text(b);
+        content.restore(b);
+    }
+    content.end_marked(b);
+    ret err[error.Error].ok{};
+}
+
+# place a widget for a field on a page
+#
+# the widget is a kid of the field and an annotation of the page, with a
+# normal appearance showing the field's value. a signature's appearance is
+# empty until it is signed.
+# ---
+# doc:  the document
+# f:    the form
+# fd:   a text or signature field
+# p:    the page
+# rect: where the widget sits on the page, empty only for a signature
+# ret:  the widget's annotation, `invalid` for a group, an inverted or empty
+#       rectangle, a value the face cannot show, or the page's /Annots not
+#       being an array, or the allocator's refusal
+pub fun widget(doc: *document.Document, f: *Form, fd: *Field, p: *page.Page, rect: page.Rect) res[object.Ref, error.Error] {
+    val a:      *allocator.Allocator = document.objects(doc);
+    val width:  f64                  = rect.right - rect.left;
+    val height: f64                  = rect.top - rect.bottom;
+    if (sel fd.kind.group)           { ret invalid[object.Ref](); }
+    if (width < 0.0 || height < 0.0) { ret invalid[object.Ref](); }
+    if (sel fd.kind.text) {
+        if (width == 0.0 || height == 0.0) { ret invalid[object.Ref](); }
+    }
+
+    val s: res[*object.Stream, error.Error] = object.stream(a);
+    if (sel s.err) { ret failure[object.Ref](s.err); }
+    val bbox: res[object.Object, error.Error] = page.box(doc,
+        page.Rect{left: 0.0, bottom: 0.0, right: width, top: height});
+    if (sel bbox.err) { ret failure[object.Ref](bbox.err); }
+    val shaped: err[error.Error] = error.first(
+        object.set_name(s.ok.dict, "Type", "XObject"),
+        object.set_name(s.ok.dict, "Subtype", "Form"),
+        object.set(s.ok.dict, "BBox", bbox.ok));
+    if (sel shaped.err) { ret failure[object.Ref](shaped.err); }
+    if (sel fd.kind.text) {
+        val r: res[*object.Dict, error.Error] = resources(a, f.face);
+        if (sel r.err) { ret failure[object.Ref](r.err); }
+        val held: err[error.Error] = object.set(s.ok.dict, "Resources", object.Object.dict{r.ok});
+        if (sel held.err) { ret failure[object.Ref](held.err); }
+        var b:     content.Builder  = content.begin(s.ok);
+        val drawn: err[error.Error] = draw(a, f.face, fd, ?b, width, height);
+        val done:  err[error.Error] = content.finish(?b);
+        if (sel drawn.err) { ret failure[object.Ref](drawn.err); }
+        if (sel done.err)  { ret failure[object.Ref](done.err); }
+    }
+    val look: res[object.Ref, error.Error] = document.add(doc, object.Object.stream{s.ok});
+    if (sel look.err) { ret failure[object.Ref](look.err); }
+
+    val ap: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel ap.err) { ret failure[object.Ref](ap.err); }
+    val d: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel d.err) { ret failure[object.Ref](d.err); }
+    val placed: res[object.Object, error.Error] = page.box(doc, rect);
+    if (sel placed.err) { ret failure[object.Ref](placed.err); }
+    val set: err[error.Error] = error.first(
+        object.set(ap.ok, "N", object.reference(look.ok)),
+        object.set_name(d.ok, "Type", "Annot"),
+        object.set_name(d.ok, "Subtype", "Widget"),
+        object.set(d.ok, "Rect", placed.ok),
+        object.set(d.ok, "P", object.reference(p.node)),
+        object.set(d.ok, "F", object.integer(PRINT)),
+        object.set(d.ok, "Parent", object.reference(fd.node)),
+        object.set(d.ok, "AP", object.Object.dict{ap.ok}));
+    if (sel set.err) { ret failure[object.Ref](set.err); }
+    val node: res[object.Ref, error.Error] = document.add(doc, object.Object.dict{d.ok});
+    if (sel node.err) { ret node; }
+    val linked: err[error.Error] = error.first(
+        object.push(fd.kids, object.reference(node.ok)),
+        page.annotate(doc, p, node.ok));
+    if (sel linked.err) { ret failure[object.Ref](linked.err); }
+    ret node;
+}
+
+# the unicode characters at 0x80 to 0x9f in WinAnsiEncoding, zero where it
+# has none (iso 32000-2 annex d.2)
+val WIN_ANSI_HIGH: [32]u16 = [32]u16{
+    0x20ac, 0, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021,
+    0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017d, 0,
+    0, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
+    0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0, 0x017e, 0x0178
+};
+
+# the WinAnsiEncoding code for a character, or -1 when it has none
+fun win_ansi(cp: u32) i32 {
+    if ((cp >= 0x20 && cp <= 0x7e) || (cp >= 0xa0 && cp <= 0xff)) { ret cp::i32; }
+    var i: usize = 0;
+    for (i < 32) {
+        if (WIN_ANSI_HIGH[i] != 0 && WIN_ANSI_HIGH[i]::u32 == cp) { ret (0x80 + i)::i32; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun show_win_ansi(ctx: ptr, scratch: *allocator.Allocator, b: *content.Builder, data: *u8, len: usize) err[error.Error] {
+    if (len == 0) { ret err[error.Error].ok{}; }
+    val codes: res[*u8, allocator.Error] = allocator.allocate[u8](scratch, len);
+    if (sel codes.err) { ret err[error.Error].err{error.from_allocator(codes.err)}; }
+    fin { allocator.deallocate[u8](scratch, codes.ok, len); }
+    var count: usize = 0;
+    var i:     usize = 0;
+    for (i < len) {
+        var cp:   utf8.Codepoint = 0;
+        val used: usize          = utf8.decode(?data[i], len - i, ?cp);
+        if (used == 0) { ret err[error.Error].err{error.Error.invalid{}}; }
+        val code: i32 = win_ansi(cp);
+        if (code < 0) { ret err[error.Error].err{error.Error.invalid{}}; }
+        codes.ok[count] = code::u8;
+        count           = count + 1;
+        i               = i + used;
+    }
+    content.show(b, codes.ok, count);
+    ret err[error.Error].ok{};
+}
+
+fun starts(s: str, prefix: str) bool {
+    var i: usize = 0;
+    for (prefix[i] != 0) {
+        if (s[i] != prefix[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a face over one of the standard 14 fonts, encoded as WinAnsiEncoding
+#
+# the font is not embedded, so a form drawn in it is not pdf/a. a value with a
+# character outside WinAnsiEncoding cannot be drawn.
+# ---
+# doc:  the document
+# base: the font's /BaseFont, such as "Helvetica"
+# name: the resource name to select it by, which must outlive the form
+# ret:  the face, or the allocator's refusal
+pub fun standard(doc: *document.Document, base: str, name: str) res[Face, error.Error] {
+    val made: res[object.Ref, error.Error] = font.standard(doc, base);
+    if (sel made.err) { ret failure[Face](made.err); }
+    # each family's ascender and descender from its afm metrics
+    var ascent:  f64 = 0.718;
+    var descent: f64 = -0.207;
+    if (starts(base, "Times")) {
+        ascent  = 0.683;
+        descent = -0.217;
+    }
+    or (starts(base, "Courier")) {
+        ascent  = 0.629;
+        descent = -0.157;
+    }
+    ret res[Face, error.Error].ok{Face{font: made.ok, name: name, ascent: ascent, descent: descent,
+        ctx: nil, show: show_win_ansi}};
+}
+
+fun show_embedded(ctx: ptr, scratch: *allocator.Allocator, b: *content.Builder, data: *u8, len: usize) err[error.Error] {
+    ret font.show_utf8(b, ctx::*font.TrueType, data, len);
+}
+
+# a face over an embedded truetype subset, which pdf/a allows
+#
+# a value draws as the face's glyph codes, so every value must be set before
+# font.embed writes the subset, and a value with a character the face has no
+# glyph for is refused naming it.
+# ---
+# t:    the face, from font.truetype
+# name: the resource name to select it by, which must outlive the form
+# ret:  the face
+pub fun embedded(t: *font.TrueType, name: str) Face {
+    ret Face{font: t.font, name: name, ascent: font.ascent(t), descent: font.descent(t),
+        ctx: t, show: show_embedded};
+}
+
+$if (capability.HOSTED) {
+    use heap: std.allocator.page;
+    use std.memory;
+
+    test win_ansi__maps_latin_and_the_high_specials_and_refuses_the_rest {
+        if (win_ansi('A') != 0x41)    { ret 1; }
+        if (win_ansi(0xe9) != 0xe9)   { ret 2; }
+        if (win_ansi(0x20ac) != 0x80) { ret 3; }
+        if (win_ansi(0x0178) != 0x9f) { ret 4; }
+        if (win_ansi(0x0416) != -1)   { ret 5; }
+        if (win_ansi('\n') != -1)     { ret 6; }
+        ret 0;
+    }
+
+    fun has(s: *object.Stream, needle: str) bool {
+        val len: usize = str_len(needle);
+        var i:   usize = 0;
+        for (i + len <= s.data.len) {
+            if (memory.raw_equal((?s.data.data[i])::ptr, needle::ptr, len)) { ret true; }
+            i = i + 1;
+        }
+        ret false;
+    }
+
+    fun appearance_of(doc: *document.Document, widget: object.Ref) *object.Stream {
+        val found: opt[object.Object] = document.lookup(doc, widget);
+        if (!sel found.some) { ret nil; }
+        val w: object.Object = found.some;
+        if (!sel w.dict) { ret nil; }
+        val ap: opt[*object.Object] = object.get(w.dict, "AP");
+        if (!sel ap.some) { ret nil; }
+        val apd: object.Object = @ap.some;
+        if (!sel apd.dict) { ret nil; }
+        val n: opt[*object.Object] = object.get(apd.dict, "N");
+        if (!sel n.some) { ret nil; }
+        val nr: object.Object = @n.some;
+        if (!sel nr.reference) { ret nil; }
+        val stream: opt[object.Object] = document.lookup(doc, nr.reference);
+        if (!sel stream.some) { ret nil; }
+        val sv: object.Object = stream.some;
+        if (!sel sv.stream) { ret nil; }
+        ret sv.stream;
+    }
+
+    test widget__places_one_value_in_every_widget_of_a_field {
+        var a: allocator.Allocator;
+        heap.make(?a);
+        var doc:     document.Document;
+        val started: err[error.Error] = document.init(?doc, ?a);
+        if (sel started.err) { ret 1; }
+        fin { document.dnit(?doc); }
+        val tree: res[page.Tree, error.Error] = page.tree(?doc);
+        if (sel tree.err) { ret 2; }
+        var t:     page.Tree                   = tree.ok;
+        val added: res[page.Page, error.Error] = page.add(?doc, ?t, page.A4);
+        if (sel added.err) { ret 3; }
+        var p:    page.Page              = added.ok;
+        val face: res[Face, error.Error] = standard(?doc, "Helvetica", "Helv");
+        if (sel face.err) { ret 4; }
+        val made: res[Form, error.Error] = init(?doc, face.ok);
+        if (sel made.err) { ret 5; }
+        var f:     Form                    = made.ok;
+        val owner: res[Field, error.Error] = group(?doc, ?f, nil, "owner");
+        if (sel owner.err) { ret 6; }
+        var g:    Field                   = owner.ok;
+        val name: res[Field, error.Error] = text_field(?doc, ?f, ?g,
+            Text{name: "name", tooltip: "Owner name", value: "Ren\xc3\xa9", size: 10.0});
+        if (sel name.err) { ret 7; }
+        var fd:    Field                        = name.ok;
+        val first: res[object.Ref, error.Error] = widget(?doc, ?f, ?fd, ?p,
+            page.Rect{left: 72.0, bottom: 700.0, right: 272.0, top: 716.0});
+        val second: res[object.Ref, error.Error] = widget(?doc, ?f, ?fd, ?p,
+            page.Rect{left: 72.0, bottom: 600.0, right: 172.0, top: 620.0});
+        if (sel first.err)          { ret 8; }
+        if (sel second.err)         { ret 8; }
+        if (fd.kids.items.len != 2) { ret 9; }
+        val one: *object.Stream = appearance_of(?doc, first.ok);
+        val two: *object.Stream = appearance_of(?doc, second.ok);
+        if (one == nil || two == nil)   { ret 10; }
+        if (!has(one, "(Ren\\351) Tj")) { ret 11; }
+        if (!has(two, "(Ren\\351) Tj")) { ret 12; }
+        val annots: opt[*object.Object] = object.get(p.dict, "Annots");
+        if (!sel annots.some) { ret 13; }
+        val listed: object.Object = @annots.some;
+        if (!(sel listed.array && listed.array.items.len == 2)) { ret 14; }
+
+        val twin: res[Field, error.Error] = text_field(?doc, ?f, ?g,
+            Text{name: "name", tooltip: nil, value: nil, size: 10.0});
+        if (!(sel twin.err && sel twin.err.invalid)) { ret 15; }
+        val dotted: res[Field, error.Error] = group(?doc, ?f, nil, "a.b");
+        if (!(sel dotted.err && sel dotted.err.invalid)) { ret 16; }
+        val under: res[Field, error.Error] = group(?doc, ?f, ?fd, "x");
+        if (!(sel under.err && sel under.err.invalid)) { ret 17; }
+        val foreign: res[Field, error.Error] = text_field(?doc, ?f, nil,
+            Text{name: "cyrillic", tooltip: nil, value: "\xd0\x96", size: 10.0});
+        if (sel foreign.err) { ret 18; }
+        var cf:      Field                        = foreign.ok;
+        val refused: res[object.Ref, error.Error] = widget(?doc, ?f, ?cf, ?p,
+            page.Rect{left: 0.0, bottom: 0.0, right: 10.0, top: 10.0});
+        if (!(sel refused.err && sel refused.err.invalid)) { ret 19; }
+        ret 0;
+    }
+}

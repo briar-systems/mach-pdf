@@ -1,46 +1,214 @@
-# mach-template
+# mach-pdf
 
-<!-- template -->
-A bone stock [Mach](https://github.com/briar-systems/mach) 6.3 Hello, World,
-the project `mach init` makes with every host target declared and its entry at
-`src/bin/<id>.mach`, with a GitHub repository set up around it: pull request CI
-on Linux, Windows and macOS, tag-driven releases with prebuilt binaries,
-protected branches, and a label set.
+PDF for Mach (ISO 32000-2): an object model and a deterministic writer, with
+incremental updates and reserved spans for values written after the fact. It
+is a spec implementation with no knowledge of any document format above it,
+and it depends on mach-std only.
 
-## Using this template
+## Modules
 
-```sh
-gh repo create <owner>/<repo> --template briar-systems/mach-template --public --clone
-cd <repo>
-./setup.sh
+- `pdf.object` is the object model: null, booleans, integers, decimal reals,
+  strings, names, arrays, dictionaries, streams, indirect references, and
+  `Reserved` spans. Objects live in the allocator they were built with and copy
+  what they are given.
+- `pdf.filter` is the stream filter contract. A stream lists its filters in
+  decode order and the writer encodes through them. `ascii_hex` is the one
+  encoder so far; FlateDecode drops in as another `Filter` once std has a
+  deflate compressor.
+- `pdf.document` numbers indirect objects, owns them in an arena, and saves
+  the whole file (`save`) or an incremental update of what changed since
+  (`append`), with a cross-reference table or stream. `rebase` starts from a
+  revision read from a file.
+- `pdf.syntax` spells objects as bytes and fills a written reservation in
+  place.
+- `pdf.output` is the file image the writer produces, kept in memory so every
+  byte offset is known.
+- `pdf.content` writes content stream operators: graphics state, paths, fill
+  and stroke, text positioning, font selection, strings and glyph runs.
+- `pdf.page` builds the page tree, pages, their content and font resources.
+- `pdf.font` adds standard 14 font dictionaries, and embeds TrueType faces as
+  subsets (see below).
+- `pdf.text` writes text strings: ascii as it is, anything else as utf-16be.
+- `pdf.form` builds an AcroForm: groups, text, date and unsigned signature
+  fields, and their widgets with appearance streams.
+- `pdf.date` spells a caller's date as a pdf date string or an xmp date.
+- `pdf.metadata` writes the information dictionary and the xmp metadata
+  stream together from one description, with extra xmp claims such as a
+  conformance level's.
+- `pdf.embed` attaches files: an embedded file stream, its file
+  specification with its `/AFRelationship`, the catalog's `/EmbeddedFiles`
+  name tree and its `/AF` array.
+- `pdf.pdfa` makes a document pdf/a-3b (see below).
+- `pdf.error` is the failure every module reports.
+
+`use pdf;` binds `pdf.lib.pdf`, which re-exports these modules.
+
+## Use
+
+```mach
+use pdf.content;
+use pdf.document;
+use pdf.error;
+use pdf.font;
+use pdf.object;
+use pdf.output;
+use pdf.page;
+
+# write a one-page document into out, drawing on the allocator a
+fun hello(a: *allocator.Allocator, out: *output.Output) err[error.Error] {
+    var doc: document.Document;
+    val started: err[error.Error] = document.init(?doc, a);
+    if (sel started.err) { ret started; }
+    fin { document.dnit(?doc); }
+
+    val tree: res[page.Tree, error.Error] = page.tree(?doc);
+    if (sel tree.err) { ret err[error.Error].err{tree.err}; }
+    var pages: page.Tree = tree.ok;
+    val helvetica: res[object.Ref, error.Error] = font.standard(?doc, "Helvetica");
+    if (sel helvetica.err) { ret err[error.Error].err{helvetica.err}; }
+    val added: res[page.Page, error.Error] = page.add(?doc, ?pages, page.A4);
+    if (sel added.err) { ret err[error.Error].err{added.err}; }
+    var p: page.Page = added.ok;
+    val fonts: err[error.Error] = page.use_font(?doc, ?p, "F1", helvetica.ok);
+    if (sel fonts.err) { ret fonts; }
+
+    val started_content: res[content.Builder, error.Error] = page.contents(?doc, ?p);
+    if (sel started_content.err) { ret err[error.Error].err{started_content.err}; }
+    var b: content.Builder = started_content.ok;
+    content.begin_text(?b);
+    content.font(?b, "F1", 12.0);
+    content.move_text(?b, 72.0, 770.0);
+    content.show_text(?b, "Hello");
+    content.end_text(?b);
+    val finished: err[error.Error] = content.finish(?b);
+    if (sel finished.err) { ret finished; }
+
+    # out then holds output.offset(out) bytes of pdf at output.data(out)
+    ret document.save(?doc, out);
+}
 ```
 
-`setup.sh` is run-and-delete. It runs once, removes itself in the commit it
-makes, and is never needed again. If it fails partway, fix the cause and run
-it again. It:
+## Determinism
 
-- sets the project id to the repository name, minus any leading `mach-` and
-  with dashes turned into underscores, and renames the entry file to match.
-  Pass an id to choose another: `./setup.sh <id>`
-- removes this section from the README
-- commits and pushes those changes
-- creates the `main` and `dev` branches and makes `dev` the default
-- allows merge commits only
-- replaces GitHub's stock labels with the set below
-- adds rulesets that protect `main`, `dev` and `v*` tags
+The same objects built in the same order give the same bytes on every host.
+Nothing time or host dependent is written: no dates unless the caller gives
+them, and no `/ID` unless the caller sets one with `document.set_id`. Reals are decimals rounded half away
+from zero, and every object has exactly one spelling. The tests compare the
+sample document in `src/test/sample.mach` byte for byte against the files in
+`src/test/golden/`, in both cross-reference forms, and the pdf/a-3b sample in
+`src/test/archive.mach` likewise.
 
-It needs `git` and `gh`, logged in with admin rights on the repository.
-Update the copyright holder in `LICENSE` yourself.
-<!-- /template -->
+## PDF/A-3b
+
+`pdfa.conform` writes the metadata with the pdf/a-3b identification, adds an
+srgb output intent with its icc profile embedded, and has every later save run
+`pdfa.check` first through `document.require`. The check refuses, as
+`nonconforming` naming the offending object, unembedded fonts, encryption,
+javascript and the other actions pdf/a forbids, and content outside the file,
+and it requires an `/ID`, the metadata, the output intent and every embedded
+file associated through an `/AF` array. The caller sets the `/ID`, embeds its
+fonts and attaches files with `embed.attach`:
+
+```mach
+var meta: metadata.Metadata;
+meta.title    = "Report";
+meta.producer = "mach-pdf";
+val made: err[error.Error] = pdfa.conform(?doc, ?meta);
+var source: embed.File = embed.File{name: "report.txt", data: text, len: len,
+    mime: "text/plain", relationship: embed.Relationship.source{},
+    description: nil, modified: opt[date.Date].none{}};
+val attached: res[object.Ref, error.Error] = embed.attach(?doc, ?source);
+val identified: err[error.Error] = document.set_id(?doc, id, 16, id, 16);
+```
+
+Nothing is implied: no dates, identifiers or tool names the caller did not
+give. `src/test/archive.mach` builds a sample that `src/test/golden/archive.pdf`
+holds, and [veraPDF](https://verapdf.org) validates that file as pdf/a-3b
+(`verapdf --flavour 3b archive.pdf`). veraPDF is a local check, not a CI one.
+
+## Forms
+
+`form.init` gives the catalog an `/AcroForm` whose values are drawn in a
+`form.Face`. A group only names the fields under it, so `group(nil, "owner")`
+then `text_field(?owner, "name")` is the field `owner.name`. A terminal field
+keeps its widgets as kids, never merged into it: `form.widget` places another
+one on a page, and a value entered in any of them shows in all of them.
+
+Every widget is written the way PDF/A asks: a normal appearance stream, the
+print flag, and no `/NeedAppearances`, actions or JavaScript. An appearance
+draws only the value, with no background or border, so whatever the page draws
+beneath a widget, such as the dots of a blank, shows through.
+
+A date field is a text field. PDF formats dates through JavaScript actions,
+which PDF/A forbids, so a date field puts its expected format in its tooltip
+(`Date signed (YYYY-MM-DD)`) and leaves the entry to the viewer.
+
+A signature field is written unsigned, with no `/V`. Signing it is an
+incremental update that gives the field's dictionary (`Field.node`) a `/V`.
+
+`form.standard` is a face over a standard 14 font, which needs no embedding but
+is not allowed in PDF/A. `form.embedded` is a face over an embedded TrueType
+subset, which PDF/A allows: it writes Identity-H glyph codes and refuses a
+character the face has no glyph for. Every value must be set before the face is
+embedded.
+
+## Embedded fonts
+
+`font.truetype` starts embedding a TrueType face, parsed and subset by
+[mach-font](https://github.com/briar-systems/mach-font). `font.show` writes
+UTF-8 text in it as two-byte codes, giving each distinct code point the next
+cid in order of first use, and `font.embed` writes the font once the text is
+done: a Type0 font with Identity-H encoding over a CIDFontType2 descendant, the
+subset holding only the glyphs the text reaches (composite components
+included), a `/CIDToGIDMap`, `/W` widths, a `FontDescriptor` with the program
+as `/FontFile2`, and a `/ToUnicode` cmap, so text extracts as it was written.
+The subset tag comes from a digest of the subset, so the same document gives
+the same bytes. A code point the face has no glyph for is the error `glyph`
+naming it, never a silent `.notdef`.
+
+```mach
+val mono: res[*font.TrueType, error.Error] = font.truetype(?doc, data, len);
+page.use_font(?doc, ?p, "F1", mono.ok.font);
+content.font(?b, "F1", 11.0);
+font.show(?b, mono.ok, "Grüße, Ζεύς");
+content.finish(?b);
+val embedded: err[error.Error] = font.embed(mono.ok);
+```
+
+`src/test/fonts.mach` sets Latin, accented, Cyrillic and Greek text in
+Liberation Mono (`src/test/fixtures/liberation`, SIL OFL 1.1), and the PDF/A-3b
+sample sets its text and form field in it too.
+
+## Signatures and other late values
+
+A `Reserved` object writes a fixed-width placeholder and records its byte
+offset when it is saved. Once the file is written, `syntax.fill` puts the real
+value in its place, padded with spaces. A signature reserves its `/Contents`
+and `/ByteRange` this way, computes the byte range from the recorded offsets,
+and fills both after hashing.
 
 ## Build
 
 ```sh
 mach dep pull .
 mach build .
-mach run .
-mach test . --timeout 5m
+mach test . --all --timeout 5m
 ```
+
+`demo/sample` writes the sample document to two files, the pdf/a-3b sample to
+a third and the embedded font sample to a fourth, and `demo/fields` the sample form to one, the golden files the
+tests compare against. Check them with `qpdf --check` and a renderer
+(`pdftoppm`, `mutool`, pdf.js) after any change to the output:
+
+```sh
+cd demo/sample
+mach dep pull .
+mach build .
+./out/linux-x86_64/debug/bin/sample ../../src/test/golden/table.pdf ../../src/test/golden/stream.pdf ../../src/test/golden/archive.pdf ../../src/test/golden/fonts.pdf
+```
+
+The sample form should also fill in a viewer with a form API, such as MuPDF
+(`pymupdf`) or pdf.js: entering `owner.name` in one widget shows it in both.
 
 ## Workflow
 
@@ -105,4 +273,6 @@ is published as a prerelease.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The srgb profile in `src/icc` is from
+[Compact-ICC-Profiles](https://github.com/saucecontrol/Compact-ICC-Profiles)
+and in the public domain under CC0, see [src/icc/LICENSE](src/icc/LICENSE).
