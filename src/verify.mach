@@ -28,8 +28,9 @@
 #   update adds, at 1, when no object refers to it
 # - the form, at 2: /SigFlags, /DR, and /Fields gaining signature fields
 # - a field or widget, at 2: /V, /AP and /AS, and a signature field's /V only
-#   from absent, which fills a form and signs a field. a signature field that
-#   holds a signature does not change
+#   from absent, which fills a form and signs a field. the widget of a
+#   signature field that gains its /V also gains /M and /Border, as okular
+#   signs. a signature field that holds a signature does not change
 # - a widget's appearance stream, its /AP /N, /R or /D, rewritten in place, at
 #   2, when only that widget refers to it, the widget has no /AS, and its field
 #   is not a signed signature field
@@ -808,8 +809,13 @@ fun judged(j: *Judge, number: u32, old: object.Object, new: object.Object) res[u
     val rect:    object.Object = get(x, "Rect");
     val field:   bool          = !sel typed.null || !sel titled.null;
     if (field || is_name(subtype, "Widget")) {
-        var keys: [3]str = [3]str{"V", "AP", "AS"};
-        if (!only(x, y, ?keys[0], 3)) { ret level(NEVER); }
+        # the widget of a signature field that signing fills also gains its /M and /Border, as okular writes
+        var keys:  [5]str = [5]str{"V", "AP", "AS", "M", "Border"};
+        var count: usize  = 3;
+        if (is_name(subtype, "Widget") && is_name(field_type(j.before, x), "Sig") && !signed(j.before, x) && signed(j.after, y)) {
+            count = 5;
+        }
+        if (!only(x, y, ?keys[0], count)) { ret level(NEVER); }
         # a signature's value is set once, by signing, and then stays as signed
         if (is_name(field_type(j.before, x), "Sig") && signed(j.before, x)) { ret level(NEVER); }
         val noted: err[error.Error] = note(j, j.before, x);
@@ -944,33 +950,13 @@ fun gap_holds(data: *u8, from: usize, to: usize, contents: object.String) bool {
     ret true;
 }
 
-# the length of the der element starting contents, 0 when it is not one
-fun der_length(data: *u8, len: usize) usize {
-    if (len < 2 || data[0] != 0x30) { ret 0; }
-    val first: u8 = data[1];
-    if (first < 0x80) {
-        if (2 + first::usize > len) { ret 0; }
-        ret 2 + first::usize;
-    }
-    val count: usize = (first & 0x7f)::usize;
-    if (count == 0 || count > 4 || 2 + count > len) { ret 0; }
-    var body: usize = 0;
-    var i:    usize = 0;
-    for (i < count) {
-        body = (body << 8) | data[2 + i]::usize;
-        i    = i + 1;
-    }
-    if (body > len - 2 - count) { ret 0; }
-    ret 2 + count + body;
-}
-
 fun refused(error: cms.Error) cms.Verdict {
     ret cms.Verdict{error: error, chain: path.OK};
 }
 
 # verify the signed data over the two ranges
 fun checked(data: *u8, range: [4]usize, contents: object.String, options: *Options) cms.Verdict {
-    val len: usize = der_length(contents.data, contents.len);
+    val len: usize = cms.encoded_length(contracts.Bytes{data: contents.data, len: contents.len});
     if (len == 0) { ret refused(cms.MALFORMED); }
     val der:    contracts.Bytes = contracts.Bytes{data: contents.data, len: len};
     var parsed: cms.SignedData;
