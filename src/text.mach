@@ -1,0 +1,109 @@
+# text strings (iso 32000-2 section 7.9.2.2) from utf-8
+#
+# text that pdfdocencoding spells as ascii is written as is. anything else is
+# utf-16be behind a byte order mark, so every reader decodes the same
+# characters.
+
+use std.allocator;
+use std.collections.vector;
+use std.system.capability;
+use std.text.utf8;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use pdf.error;
+use pdf.object;
+
+fun plain(data: *u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        val c: u8 = data[i];
+        if (!((c >= 0x20 && c <= 0x7e) || c == '\t' || c == '\n' || c == '\r')) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun unit(units: *vector.Vector[u8], value: u32) err[error.Error] {
+    val high: res[usize, allocator.Error] = vector.push[u8](units, ((value >> 8) & 0xff)::u8);
+    if (sel high.err) { ret err[error.Error].err{error.from_allocator(high.err)}; }
+    val low: res[usize, allocator.Error] = vector.push[u8](units, (value & 0xff)::u8);
+    if (sel low.err) { ret err[error.Error].err{error.from_allocator(low.err)}; }
+    ret err[error.Error].ok{};
+}
+
+# a text string object holding len bytes of utf-8 at data
+# ---
+# a:    the allocator the string lives in
+# data: the utf-8 bytes
+# len:  the count of bytes
+# ret:  the object, `invalid` for bytes that are not utf-8, or the allocator's
+#       refusal
+pub fun string(a: *allocator.Allocator, data: *u8, len: usize) res[object.Object, error.Error] {
+    if (!utf8.validate(data, len)) { ret res[object.Object, error.Error].err{error.Error.invalid{}}; }
+    if (plain(data, len))          { ret object.string(a, data, len); }
+    var units: vector.Vector[u8] = vector.init[u8](a);
+    fin { vector.dnit[u8](?units); }
+    val bom: err[error.Error] = unit(?units, 0xfeff);
+    if (sel bom.err) { ret res[object.Object, error.Error].err{bom.err}; }
+    var i: usize = 0;
+    for (i < len) {
+        var cp:   utf8.Codepoint = 0;
+        val used: usize          = utf8.decode(?data[i], len - i, ?cp);
+        i = i + used;
+        var put: err[error.Error] = err[error.Error].ok{};
+        if (cp >= 0x10000) {
+            val rest: u32 = cp - 0x10000;
+            put = error.first(unit(?units, 0xd800 + (rest >> 10)), unit(?units, 0xdc00 + (rest & 0x3ff)));
+        }
+        or {
+            put = unit(?units, cp);
+        }
+        if (sel put.err) { ret res[object.Object, error.Error].err{put.err}; }
+    }
+    ret object.hex_string(a, units.data, units.len);
+}
+
+# a text string object holding the utf-8 text of s
+# ---
+# a:   the allocator the string lives in
+# s:   the text
+# ret: the object, `invalid` for text that is not utf-8, or the allocator's
+#      refusal
+pub fun of(a: *allocator.Allocator, s: str) res[object.Object, error.Error] {
+    ret string(a, s, str_len(s));
+}
+
+$if (capability.HOSTED) {
+    use std.allocator.page;
+    use std.memory;
+
+    test string__keeps_ascii_and_writes_the_rest_as_utf16be {
+        var a: allocator.Allocator;
+        page.make(?a);
+        val ascii: res[object.Object, error.Error] = of(?a, "Plain (text)");
+        if (!sel ascii.ok) { ret 1; }
+        val kept: object.Object = ascii.ok;
+        if (!sel kept.string)                         { ret 2; }
+        if (kept.string.hex || kept.string.len != 12) { ret 2; }
+
+        # e with acute, then u+1f600 as a surrogate pair
+        val wide: res[object.Object, error.Error] = of(?a, "\xc3\xa9\xf0\x9f\x98\x80");
+        if (!sel wide.ok) { ret 3; }
+        val coded: object.Object = wide.ok;
+        if (!sel coded.string)                          { ret 4; }
+        if (!coded.string.hex || coded.string.len != 8) { ret 4; }
+        val expected: [8]u8 = [8]u8{0xfe, 0xff, 0x00, 0xe9, 0xd8, 0x3d, 0xde, 0x00};
+        if (!memory.raw_equal(coded.string.data::ptr, (?expected[0])::ptr, 8)) { ret 5; }
+
+        val broken: res[object.Object, error.Error] = of(?a, "\xff");
+        if (!(sel broken.err && sel broken.err.invalid)) { ret 6; }
+        ret 0;
+    }
+}
