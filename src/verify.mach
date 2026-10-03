@@ -1,0 +1,690 @@
+# verifying every signature in a file (iso 32000-2 section 12.8, etsi en 319
+# 142-1)
+#
+# `verify` reads the file and its revisions, finds each signed signature field,
+# and judges its signature three ways. its byte range must start the file,
+# leave out exactly its /Contents string and end where a revision ends. the
+# cms signed data in /Contents must verify over the digest of those bytes,
+# with its certificate path validated against the caller's trust store. and
+# every update after the revision it signs must change only what the document
+# permits.
+#
+# an update is judged object by object against the revision before it. a new
+# object is allowed, since only a changed object can make it part of the
+# document. a changed object is allowed when it is one of these and changes
+# only what is named:
+#
+# - the catalog: /DSS and /Extensions, for long term validation
+# - the document security store itself
+# - the form: /SigFlags, /DR, and /Fields gaining signature fields
+# - a field or widget: /V, /AP and /AS, and a signature field's /V only from
+#   absent, which fills a form and signs a field
+# - a page: /Annots, any change when annotations are permitted, else only
+#   gaining widgets
+# - an annotation that is not a widget, when annotations are permitted
+#
+# the certifying signature's /DocMDP permission (iso 32000-2 section 12.8.2.2)
+# narrows this: 1 permits only the security store, 2 adds form filling and
+# signing, and 3 adds annotations. a document with no /DocMDP permits what 3
+# does. an update that frees an object, changes /Root or /Info, or changes
+# anything else is not allowed. field locks (/Lock and /FieldMDP) are not read.
+
+use crypto.contracts;
+use pki.cert;
+use pki.cms;
+use path: pki.verify;
+use std.allocator;
+use std.collections.vector;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use pdf.document;
+use pdf.error;
+use pdf.form;
+use pdf.object;
+use pdf.reader;
+
+# the deepest /Parent chain and object nesting the comparisons follow
+val DEPTH: usize = 32;
+
+# how a file is verified
+# ---
+# trust: the trust anchors certificate paths must reach
+# chain: how paths are validated: the purpose, the time to validate at and
+#        the bounds
+# read:  how the file and each of its revisions are read
+pub rec Options {
+    trust: *cert.TrustStore;
+    chain: path.Options;
+    read:  reader.Options;
+}
+
+# an incremental update after a file's first revision, and whether the
+# document permits what it changed
+# ---
+# xref:     the byte offset of its cross-reference section
+# end:      one past its %%EOF line
+# allowed:  every change it makes is one the document permits
+# offender: the first object whose change is not permitted, 0 when allowed or
+#           when the trailer's /Root or /Info changed
+pub rec Update {
+    xref:     usize;
+    end:      usize;
+    allowed:  bool;
+    offender: u32;
+}
+
+# one signature's verdict
+# ---
+# name_at:   where its field's fully qualified name starts in the report's
+#            names
+# name_len:  the count of bytes in the name
+# node:      the signature dictionary
+# range:     its /ByteRange
+# covered:   the range starts the file, leaves out exactly the /Contents
+#            string, and ends where a revision ends
+# revision:  the index of the revision the range ends with, 0 for the first
+# whole:     that revision is the file's last
+# supported: its /SubFilter is ETSI.CAdES.detached or adbe.pkcs7.detached
+# cms:       the signed data's verdict over the range, its path included
+# allowed:   every update after its revision is allowed
+pub rec Signature {
+    name_at:   usize;
+    name_len:  usize;
+    node:      object.Ref;
+    range:     [4]usize;
+    covered:   bool;
+    revision:  usize;
+    whole:     bool;
+    supported: bool;
+    cms:       cms.Verdict;
+    allowed:   bool;
+}
+
+# every signature of a file and every update after its first revision
+# ---
+# signatures: the signed signature fields, in field tree order
+# updates:    the revisions after the first, oldest first, so updates[i] is
+#             revision i + 1
+# permission: the certifying signature's /DocMDP /P, 0 for none
+# names:      the fields' names, end to end
+pub rec Report {
+    signatures: vector.Vector[Signature];
+    updates:    vector.Vector[Update];
+    permission: u8;
+    names:      vector.Vector[u8];
+}
+
+# whether a signature is valid: covered, supported, verified, and followed
+# only by allowed updates
+# ---
+# s:   the signature
+# ret: whether every check passed
+pub fun valid(s: *Signature) bool {
+    ret s.covered && s.supported && s.cms.error == cms.OK && s.allowed;
+}
+
+# a signature's field name
+# ---
+# report: the report
+# s:      one of its signatures
+# ret:    the name's first byte, s.name_len of them, valid until release
+pub fun name(report: *Report, s: *Signature) *u8 {
+    ret ?report.names.data[s.name_at];
+}
+
+# release a report
+# ---
+# report: the report
+pub fun release(report: *Report) {
+    vector.dnit[Signature](?report.signatures);
+    vector.dnit[Update](?report.updates);
+    vector.dnit[u8](?report.names);
+}
+
+fun failed(cause: allocator.Error) err[error.Error] {
+    ret err[error.Error].err{error.from_allocator(cause)};
+}
+
+fun get(d: *object.Dict, key: str) object.Object {
+    val held: opt[*object.Object] = object.get(d, key);
+    if (!sel held.some) { ret object.null(); }
+    ret @held.some;
+}
+
+fun is_name(value: object.Object, s: str) bool {
+    ret sel value.name && object.name_is(value.name, s);
+}
+
+fun dict_of(doc: *document.Document, value: object.Object) *object.Dict {
+    val held: res[object.Object, error.Error] = document.deref(doc, value);
+    if (sel held.err) { ret nil; }
+    val got: object.Object = held.ok;
+    if (!sel got.dict) { ret nil; }
+    ret got.dict;
+}
+
+fun bytes_same(x: *u8, y: *u8, len: usize) bool {
+    if (len == 0) { ret true; }
+    ret memory.raw_equal(x::ptr, y::ptr, len);
+}
+
+fun names_same(x: object.Name, y: object.Name) bool {
+    ret x.len == y.len && bytes_same(x.data, y.data, x.len);
+}
+
+fun dicts_same(x: *object.Dict, y: *object.Dict, depth: usize) bool {
+    if (x.entries.len != y.entries.len) { ret false; }
+    var i: usize = 0;
+    for (i < x.entries.len) {
+        val key:   object.Name         = x.entries.data[i].key;
+        val other: opt[*object.Object] = find(y, key);
+        if (!sel other.some)                                        { ret false; }
+        if (!same(x.entries.data[i].value, @other.some, depth + 1)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun find(d: *object.Dict, key: object.Name) opt[*object.Object] {
+    var i: usize = 0;
+    for (i < d.entries.len) {
+        if (names_same(d.entries.data[i].key, key)) { ret opt[*object.Object].some{?d.entries.data[i].value}; }
+        i = i + 1;
+    }
+    ret opt[*object.Object].none{};
+}
+
+# whether two objects are equal as written, references compared as references
+fun same(x: object.Object, y: object.Object, depth: usize) bool {
+    if (depth > DEPTH) { ret false; }
+    if (sel x.null)    { ret sel y.null; }
+    if (sel x.boolean) { ret sel y.boolean && y.boolean == x.boolean; }
+    if (sel x.integer) { ret sel y.integer && y.integer == x.integer; }
+    if (sel x.real) {
+        if (!sel y.real) { ret false; }
+        ret x.real.mantissa == y.real.mantissa && x.real.places == y.real.places;
+    }
+    if (sel x.string) {
+        if (!sel y.string) { ret false; }
+        ret x.string.len == y.string.len && bytes_same(x.string.data, y.string.data, x.string.len);
+    }
+    if (sel x.name) { ret sel y.name && names_same(x.name, y.name); }
+    if (sel x.reference) {
+        if (!sel y.reference) { ret false; }
+        ret x.reference.number == y.reference.number && x.reference.generation == y.reference.generation;
+    }
+    if (sel x.array) {
+        if (!sel y.array)                           { ret false; }
+        if (x.array.items.len != y.array.items.len) { ret false; }
+        var i: usize = 0;
+        for (i < x.array.items.len) {
+            if (!same(x.array.items.data[i], y.array.items.data[i], depth + 1)) { ret false; }
+            i = i + 1;
+        }
+        ret true;
+    }
+    if (sel x.dict) { ret sel y.dict && dicts_same(x.dict, y.dict, depth); }
+    if (sel x.stream) {
+        if (!sel y.stream) { ret false; }
+        val a: *object.Stream = x.stream;
+        val b: *object.Stream = y.stream;
+        if (a.data.len != b.data.len || a.filters.len != b.filters.len || a.encoded != b.encoded) { ret false; }
+        if (!bytes_same(a.data.data, b.data.data, a.data.len))                                    { ret false; }
+        ret dicts_same(a.dict, b.dict, depth);
+    }
+    ret false;
+}
+
+# whether every key whose value differs between two dictionaries is one of
+# the allowed keys
+fun only(x: *object.Dict, y: *object.Dict, allowed: *str, count: usize) bool {
+    if (!changes_within(x, y, allowed, count)) { ret false; }
+    ret changes_within(y, x, allowed, count);
+}
+
+fun listed(key: object.Name, allowed: *str, count: usize) bool {
+    var i: usize = 0;
+    for (i < count) {
+        if (object.name_is(key, allowed[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun changes_within(x: *object.Dict, y: *object.Dict, allowed: *str, count: usize) bool {
+    var i: usize = 0;
+    for (i < x.entries.len) {
+        val key:   object.Name         = x.entries.data[i].key;
+        val other: opt[*object.Object] = find(y, key);
+        i = i + 1;
+        if (listed(key, allowed, count))                        { cnt; }
+        if (!sel other.some)                                    { ret false; }
+        if (!same(x.entries.data[i - 1].value, @other.some, 0)) { ret false; }
+    }
+    ret true;
+}
+
+fun differs(x: *object.Dict, y: *object.Dict, key: str) bool {
+    ret !same(get(x, key), get(y, key), 0);
+}
+
+fun number_of(value: object.Object) u32 {
+    if (sel value.reference) { ret value.reference.number; }
+    ret 0;
+}
+
+# a field's /FT, its own or the nearest ancestor's
+fun field_type(doc: *document.Document, d: *object.Dict) object.Object {
+    var at:    *object.Dict = d;
+    var depth: usize        = 0;
+    for (at != nil && depth < DEPTH) {
+        val own: object.Object = get(at, "FT");
+        if (sel own.name) { ret own; }
+        at    = dict_of(doc, get(at, "Parent"));
+        depth = depth + 1;
+    }
+    ret object.null();
+}
+
+# whether every item that grows an array past the old one is a dictionary in
+# doc that holds check's mark
+fun grows(doc: *document.Document, old: object.Object, new: object.Object, key: str, value: str) bool {
+    if (!sel new.array) { ret false; }
+    var kept: usize = 0;
+    var i:    usize = 0;
+    if (sel old.array) {
+        kept = old.array.items.len;
+        if (new.array.items.len < kept) { ret false; }
+        for (i < kept) {
+            if (!same(old.array.items.data[i], new.array.items.data[i], 0)) { ret false; }
+            i = i + 1;
+        }
+    }
+    or (!sel old.null) {
+        ret false;
+    }
+    for (i < new.array.items.len) {
+        val d: *object.Dict = dict_of(doc, new.array.items.data[i]);
+        i = i + 1;
+        if (d == nil) { ret false; }
+        if (str_is(key, "FT")) {
+            if (!is_name(field_type(doc, d), value)) { ret false; }
+        }
+        or (!is_name(get(d, key), value)) {
+            ret false;
+        }
+    }
+    ret true;
+}
+
+fun str_is(s: str, t: str) bool {
+    var i: usize = 0;
+    for (s[i] == t[i]) {
+        if (s[i] == 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether a changed object is one the permission allows to change as it did
+fun judged(before: *document.Document, after: *document.Document, number: u32, old: object.Object, new: object.Object, permission: u8) bool {
+    if (!sel old.dict) { ret false; }
+    if (!sel new.dict) { ret false; }
+    val x:        *object.Dict = old.dict;
+    val y:        *object.Dict = new.dict;
+    val forms:    bool         = permission != 1;
+    val annotate: bool         = permission == 0 || permission == 3;
+    var root:     u32          = 0;
+    if (sel before.root.some) { root = before.root.some.number; }
+
+    if (number == root) {
+        var keys: [2]str = [2]str{"DSS", "Extensions"};
+        ret only(x, y, ?keys[0], 2);
+    }
+    val catalog: *object.Dict = dict_of(before, object.reference(object.Ref{number: root, generation: 0}));
+    if (catalog != nil) {
+        if (number == number_of(get(catalog, "DSS"))) { ret true; }
+        if (number == number_of(get(catalog, "AcroForm"))) {
+            if (!forms) { ret false; }
+            var keys: [3]str = [3]str{"SigFlags", "DR", "Fields"};
+            if (!only(x, y, ?keys[0], 3)) { ret false; }
+            ret !differs(x, y, "Fields") || grows(after, get(x, "Fields"), get(y, "Fields"), "FT", "Sig");
+        }
+    }
+    val subtype: object.Object = get(x, "Subtype");
+    val typed:   object.Object = get(x, "FT");
+    val titled:  object.Object = get(x, "T");
+    val rect:    object.Object = get(x, "Rect");
+    val field:   bool          = !sel typed.null || !sel titled.null;
+    if (field || is_name(subtype, "Widget")) {
+        if (!forms) { ret false; }
+        var keys: [3]str = [3]str{"V", "AP", "AS"};
+        if (!only(x, y, ?keys[0], 3)) { ret false; }
+        # a signature's value is set once, by signing
+        val value: object.Object = get(x, "V");
+        if (differs(x, y, "V") && is_name(field_type(before, x), "Sig")) { ret sel value.null; }
+        ret true;
+    }
+    if (is_name(get(x, "Type"), "Page")) {
+        if (annotate) {
+            var keys: [1]str = [1]str{"Annots"};
+            ret only(x, y, ?keys[0], 1);
+        }
+        if (!forms) { ret false; }
+        var keys: [1]str = [1]str{"Annots"};
+        if (!only(x, y, ?keys[0], 1)) { ret false; }
+        ret grows(after, get(x, "Annots"), get(y, "Annots"), "Subtype", "Widget");
+    }
+    if (sel subtype.name && !sel rect.null) { ret annotate; }
+    ret false;
+}
+
+fun same_ref(x: opt[object.Ref], y: opt[object.Ref]) bool {
+    if (sel x.some) {
+        if (!sel y.some) { ret false; }
+        ret x.some.number == y.some.number && x.some.generation == y.some.generation;
+    }
+    ret !sel y.some;
+}
+
+# judge one update against the revision before it
+fun classify(before: *document.Document, after: *document.Document, revision: reader.Revision, permission: u8) Update {
+    var update: Update = Update{xref: revision.xref, end: revision.end, allowed: false, offender: 0};
+    if (!same_ref(before.root, after.root) || !same_ref(before.info, after.info)) { ret update; }
+    var i: usize = 0;
+    for (i < revision.count) {
+        val number: u32 = revision.numbers[i];
+        i               = i + 1;
+        update.offender = number;
+        val old: res[opt[document.Held], error.Error] = document.load(before, number);
+        val new: res[opt[document.Held], error.Error] = document.load(after, number);
+        if (sel old.err) { ret update; }
+        if (sel new.err) { ret update; }
+        val was: opt[document.Held] = old.ok;
+        val now: opt[document.Held] = new.ok;
+        if (!sel was.some) { cnt; }
+        if (!sel now.some) { ret update; }
+        val x: object.Object = was.some.value;
+        val y: object.Object = now.some.value;
+        if (same(x, y, 0))                                    { cnt; }
+        if (!judged(before, after, number, x, y, permission)) { ret update; }
+    }
+    update.allowed  = true;
+    update.offender = 0;
+    ret update;
+}
+
+# the certifying signature's /DocMDP /P, 0 for none and 1 for one that is
+# malformed
+fun permission_of(doc: *document.Document) u8 {
+    val root: res[*object.Dict, error.Error] = document.catalog(doc);
+    if (sel root.err) { ret 0; }
+    val perms: *object.Dict = dict_of(doc, get(root.ok, "Perms"));
+    if (perms == nil) { ret 0; }
+    val held: object.Object = get(perms, "DocMDP");
+    if (sel held.null) { ret 0; }
+    val signature: *object.Dict = dict_of(doc, held);
+    if (signature == nil) { ret 1; }
+    val listed: res[object.Object, error.Error] = document.deref(doc, get(signature, "Reference"));
+    if (sel listed.err) { ret 1; }
+    val references: object.Object = listed.ok;
+    if (!sel references.array) { ret 1; }
+    var i: usize = 0;
+    for (i < references.array.items.len) {
+        val reference: *object.Dict = dict_of(doc, references.array.items.data[i]);
+        i = i + 1;
+        if (reference == nil)                                      { cnt; }
+        if (!is_name(get(reference, "TransformMethod"), "DocMDP")) { cnt; }
+        val params: *object.Dict = dict_of(doc, get(reference, "TransformParams"));
+        if (params == nil) { ret 2; }
+        val p: object.Object = get(params, "P");
+        if (sel p.null)                     { ret 2; }
+        if (!sel p.integer)                 { ret 1; }
+        if (p.integer < 1 || p.integer > 3) { ret 1; }
+        ret p.integer::u8;
+    }
+    ret 1;
+}
+
+fun hex_value(c: u8) i32 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::i32; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A' + 10)::i32; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a' + 10)::i32; }
+    ret -1;
+}
+
+# whether the gap in the file is exactly a hexadecimal string spelling
+# contents
+fun gap_holds(data: *u8, from: usize, to: usize, contents: object.String) bool {
+    if (to - from != contents.len * 2 + 2)        { ret false; }
+    if (data[from] != '<' || data[to - 1] != '>') { ret false; }
+    var i: usize = 0;
+    for (i < contents.len) {
+        val high: i32 = hex_value(data[from + 1 + i * 2]);
+        val low:  i32 = hex_value(data[from + 2 + i * 2]);
+        if (high < 0 || low < 0)                       { ret false; }
+        if ((high * 16 + low)::u8 != contents.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the length of the der element starting contents, 0 when it is not one
+fun der_length(data: *u8, len: usize) usize {
+    if (len < 2 || data[0] != 0x30) { ret 0; }
+    val first: u8 = data[1];
+    if (first < 0x80) {
+        if (2 + first::usize > len) { ret 0; }
+        ret 2 + first::usize;
+    }
+    val count: usize = (first & 0x7f)::usize;
+    if (count == 0 || count > 4 || 2 + count > len) { ret 0; }
+    var body: usize = 0;
+    var i:    usize = 0;
+    for (i < count) {
+        body = (body << 8) | data[2 + i]::usize;
+        i    = i + 1;
+    }
+    if (body > len - 2 - count) { ret 0; }
+    ret 2 + count + body;
+}
+
+fun refused(error: cms.Error) cms.Verdict {
+    ret cms.Verdict{error: error, chain: path.OK};
+}
+
+# verify the signed data over the two ranges
+fun checked(data: *u8, range: [4]usize, contents: object.String, options: *Options) cms.Verdict {
+    val len: usize = der_length(contents.data, contents.len);
+    if (len == 0) { ret refused(cms.MALFORMED); }
+    val der:    contracts.Bytes = contracts.Bytes{data: contents.data, len: len};
+    var parsed: cms.SignedData;
+    val read:   cms.Error       = cms.parse(der, ?parsed);
+    if (read != cms.OK) { ret refused(read); }
+    var info:   cms.SignerInfo;
+    val signer: cms.Error = cms.signer_info(?parsed, 0, ?info);
+    if (signer != cms.OK) { ret refused(signer); }
+    var digest: cms.Digest;
+    if (cms.digest_init(?digest, info.digest) != contracts.OK) { ret refused(cms.UNSUPPORTED_ALGORITHM); }
+    cms.digest_update(?digest, contracts.Bytes{data: data, len: range[1]});
+    cms.digest_update(?digest, contracts.Bytes{data: ?data[range[2]], len: range[3]});
+    var value: [cms.MAX_DIGEST_SIZE]u8;
+    val done:  contracts.Operation = cms.digest_final(?digest,
+        contracts.Buffer{data: ?value[0], capacity: cms.MAX_DIGEST_SIZE});
+    if (done.error != contracts.OK) { ret refused(cms.UNSUPPORTED_ALGORITHM); }
+    var o: cms.VerifyOptions;
+    o.trust          = options.trust;
+    o.chain          = options.chain;
+    o.form           = cms.DETACHED_DIGEST;
+    o.content_digest = contracts.Bytes{data: ?value[0], len: done.written};
+    ret cms.verify(der, ?o, nil);
+}
+
+# read a signature dictionary's byte range, four offsets
+fun range_of(d: *object.Dict, range: *usize) bool {
+    val held: object.Object = get(d, "ByteRange");
+    if (!sel held.array)           { ret false; }
+    if (held.array.items.len != 4) { ret false; }
+    var i: usize = 0;
+    for (i < 4) {
+        val item: object.Object = held.array.items.data[i];
+        if (!sel item.integer) { ret false; }
+        if (item.integer < 0)  { ret false; }
+        range[i] = item.integer::usize;
+        i        = i + 1;
+    }
+    ret true;
+}
+
+# judge one signed field
+fun judge(doc: *document.Document, data: *u8, len: usize, revisions: *vector.Vector[reader.Revision], options: *Options, report: *Report, field: form.Found) err[error.Error] {
+    val v: object.Object = get(field.dict, "V");
+    if (sel v.null) { ret err[error.Error].ok{}; }
+    var s: Signature;
+    s.node    = object.Ref{number: number_of(v), generation: 0};
+    s.cms     = refused(cms.MALFORMED);
+    s.name_at = report.names.len;
+    if (sel v.reference) { s.node = v.reference; }
+    var i: usize = 0;
+    for (i < field.name_len) {
+        val pushed: res[usize, allocator.Error] = vector.push[u8](?report.names, field.name[i]);
+        if (sel pushed.err) { ret failed(pushed.err); }
+        i = i + 1;
+    }
+    s.name_len = field.name_len;
+
+    val d: *object.Dict = dict_of(doc, v);
+    if (d != nil) {
+        val sub: object.Object = get(d, "SubFilter");
+        s.supported = is_name(sub, "ETSI.CAdES.detached") || is_name(sub, "adbe.pkcs7.detached");
+        val contents: object.Object = get(d, "Contents");
+        var range:    [4]usize;
+        var held:     object.String;
+        var readable: bool          = false;
+        if (sel contents.string) {
+            held     = contents.string;
+            readable = range_of(d, ?range[0]);
+        }
+        if (readable) {
+            s.range = range;
+            val inside: bool = range[1] <= len && range[2] <= len && range[3] <= len - range[2] && range[1] < range[2];
+            if (inside) {
+                val end: usize = range[2] + range[3];
+                var k:   usize = 0;
+                var at:  bool  = false;
+                for (k < revisions.len) {
+                    if (revisions.data[k].end == end) {
+                        at = true;
+                        brk;
+                    }
+                    k = k + 1;
+                }
+                s.revision = k;
+                s.whole    = at && k + 1 == revisions.len;
+                s.covered  = at && range[0] == 0 && gap_holds(data, range[1], range[2], held);
+                s.cms      = checked(data, range, held, options);
+                s.allowed  = at;
+                var u: usize = k;
+                for (at && u < report.updates.len) {
+                    if (!report.updates.data[u].allowed) { s.allowed = false; }
+                    u = u + 1;
+                }
+            }
+        }
+    }
+    val pushed: res[usize, allocator.Error] = vector.push[Signature](?report.signatures, s);
+    if (sel pushed.err) { ret failed(pushed.err); }
+    ret err[error.Error].ok{};
+}
+
+# read the file as one revision left it, marking the document live once it
+# needs releasing
+fun prefix(doc: *document.Document, live: *bool, a: *allocator.Allocator, data: *u8, len: usize, options: *Options) err[error.Error] {
+    val started: err[error.Error] = document.init(doc, a);
+    if (sel started.err) { ret started; }
+    @live = true;
+    ret reader.read(doc, data, len, options.read);
+}
+
+# judge every update after the first revision
+fun updates(a: *allocator.Allocator, data: *u8, revisions: *vector.Vector[reader.Revision], options: *Options, report: *Report) err[error.Error] {
+    if (revisions.len < 2) { ret err[error.Error].ok{}; }
+    # two documents in turn, the revision before and the one judged, since a document stays put
+    var docs: [2]document.Document;
+    var live: [2]bool;
+    fin {
+        if (live[0]) { document.dnit(?docs[0]); }
+        if (live[1]) { document.dnit(?docs[1]); }
+    }
+    val first: err[error.Error] = prefix(?docs[0], ?live[0], a, data, revisions.data[0].end, options);
+    if (sel first.err) { ret first; }
+    var k: usize = 1;
+    for (k < revisions.len) {
+        val before: usize            = (k - 1) % 2;
+        val after:  usize            = k % 2;
+        val read:   err[error.Error] = prefix(?docs[after], ?live[after], a, data, revisions.data[k].end, options);
+        if (sel read.err) { ret read; }
+        val judged_one: Update                      = classify(?docs[before], ?docs[after], revisions.data[k], report.permission);
+        val pushed:     res[usize, allocator.Error] = vector.push[Update](?report.updates, judged_one);
+        if (sel pushed.err) { ret failed(pushed.err); }
+        document.dnit(?docs[before]);
+        live[before] = false;
+        k            = k + 1;
+    }
+    ret err[error.Error].ok{};
+}
+
+# verify every signature in a file
+#
+# a signature that fails a check is reported, not refused: `valid` says
+# whether one passed every check. a file that cannot be read is the error.
+# ---
+# a:       the allocator the report and the documents read draw on
+# data:    the file's bytes
+# len:     the count of bytes
+# options: the trust anchors, path validation and reading options
+# report:  receives the verdicts, released with release
+# ret:     ok, why the file or one of its revisions could not be read, or the
+#          allocator's refusal
+pub fun verify(a: *allocator.Allocator, data: *u8, len: usize, options: *Options, report: *Report) err[error.Error] {
+    report.signatures = vector.init[Signature](a);
+    report.updates    = vector.init[Update](a);
+    report.names      = vector.init[u8](a);
+    report.permission = 0;
+    if (options == nil || options.trust == nil) { ret err[error.Error].err{error.Error.invalid{}}; }
+
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, a);
+    if (sel started.err) { ret started; }
+    fin { document.dnit(?doc); }
+    var revisions: vector.Vector[reader.Revision] = vector.init[reader.Revision](a);
+    fin { vector.dnit[reader.Revision](?revisions); }
+    val read: err[error.Error] = reader.history(?doc, data, len, options.read, ?revisions);
+    if (sel read.err) { ret read; }
+    report.permission = permission_of(?doc);
+
+    val judged_all: err[error.Error] = updates(a, data, ?revisions, options, report);
+    if (sel judged_all.err) { ret judged_all; }
+
+    var fields: vector.Vector[form.Found] = vector.init[form.Found](a);
+    fin { vector.dnit[form.Found](?fields); }
+    val found: err[error.Error] = form.terminals(?doc, document.objects(?doc), ?fields);
+    if (sel found.err) { ret found; }
+    var i: usize = 0;
+    for (i < fields.len) {
+        val field: form.Found = fields.data[i];
+        i = i + 1;
+        if (!object.name_is(field.type, "Sig")) { cnt; }
+        val one: err[error.Error] = judge(?doc, data, len, ?revisions, options, report, field);
+        if (sel one.err) { ret one; }
+    }
+    ret err[error.Error].ok{};
+}

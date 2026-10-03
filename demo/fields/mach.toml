@@ -62,8 +62,17 @@ vectorize = true
 float_reassoc = false
 
 # the library from this checkout, and std through the library's own pin
+[dep.font]
+path = "../../dep/font"
+
 [dep.pdf]
 path = "../.."
 
 [dep.std]
 path = "../../dep/std"
+
+[dep.pki]
+path = "../../dep/pki"
+
+[dep.crypto]
+path = "../../dep/crypto"

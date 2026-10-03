@@ -1,0 +1,963 @@
+# reading a pdf file into a document (iso 32000-2 section 7.5)
+#
+# `read` parses the header, finds the last cross-reference section through
+# `startxref`, and walks the /Prev chain back to the first, through tables,
+# cross-reference streams and hybrid files (a table whose trailer names a
+# stream in /XRefStm). the newest entry for each object number wins. it then
+# rebases the document on the last revision, takes /Root, /Info and /ID from
+# the last trailer, and becomes the document's source, so each object is
+# parsed the first time `document.resolve` meets it, and an object stream is
+# decoded the first time one of its objects is. the document's next save is an
+# incremental update after the file's bytes.
+#
+# the reader is strict unless told otherwise (see `pdf.parse`), and bounded by
+# its options, so a hostile file ends in `malformed`, `limit` or `cycle`
+# rather than a crash, a hang or unbounded memory. an encrypted file is
+# refused as `encrypted`.
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.vector;
+use std.memory;
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use pdf.document;
+use pdf.error;
+use pdf.object;
+use pdf.parse;
+
+# the highest /Size a reader accepts unless told otherwise, the object count
+# iso 32000 lists as an implementation limit
+pub val OBJECTS: u32 = 8388607;
+
+# the most bytes one stream decodes to unless told otherwise
+pub val DECODED: usize = 268435456;
+
+# the most cross-reference sections a /Prev chain holds unless told otherwise
+pub val REVISIONS: usize = 4096;
+
+# how a file is read, and the bounds that keep a hostile one from costing more
+# than its caller allows
+# ---
+# strict:        refuse what the standard requires and the file lacks; when
+#                not strict, accept a header after leading bytes, a missing
+#                %%EOF, and the breakage `pdf.parse` lists
+# max_depth:     the most arrays and dictionaries one object nests, and the
+#                most objects one resolution loads inside another, such as a
+#                stream's indirect /Length
+# max_objects:   the highest /Size accepted
+# max_decoded:   the most bytes a cross-reference or object stream decodes to
+# max_revisions: the most cross-reference sections the /Prev chain holds
+# filters:       filters to decode streams with before the built-in ones, nil
+#                for none
+# filters_len:   the count of filters
+pub rec Options {
+    strict:        bool;
+    max_depth:     usize;
+    max_objects:   u32;
+    max_decoded:   usize;
+    max_revisions: usize;
+    filters:       *object.Filter;
+    filters_len:   usize;
+}
+
+# strict reading within the default bounds
+# ---
+# ret: the options
+pub fun defaults() Options {
+    ret Options{strict: true, max_depth: parse.DEPTH, max_objects: OBJECTS, max_decoded: DECODED,
+        max_revisions: REVISIONS, filters: nil, filters_len: 0};
+}
+
+# where in an object stream an object sits
+# ---
+# stream: the object stream's number
+# index:  the object's place among the stream's objects
+rec Packed {
+    stream: u32;
+    index:  u32;
+}
+
+# where the last revision says an object number's object is
+# ---
+# unlisted: no section lists the number
+# free:     the number holds no object
+# at:       the byte offset of its definition
+# packed:   its place in an object stream
+tag Where: u8 {
+    unlisted;
+    free;
+    at:     usize;
+    packed: Packed;
+}
+
+rec Located {
+    where:      Where;
+    generation: u16;
+}
+
+# one entry of a cross-reference section
+rec Listed {
+    number:  u64;
+    located: Located;
+}
+
+# the reader a document's source points at, living in the document's arena
+# ---
+# doc:   the document
+# data:  the file's bytes, which the caller keeps until the document is done
+# len:   the count of bytes
+# opts:  how the file is read
+# index: where each number's object is, size of them
+# size:  the last trailer's /Size
+# depth: the loads under way, one inside another
+rec Reader {
+    doc:   *document.Document;
+    data:  *u8;
+    len:   usize;
+    opts:  Options;
+    index: *Located;
+    size:  u32;
+    depth: usize;
+}
+
+# what a cross-reference section gives the document beyond its entries
+# ---
+# trailer: its trailer dictionary, or the stream's dictionary
+# stream:  the section is a cross-reference stream
+rec Section {
+    trailer: *object.Dict;
+    stream:  bool;
+}
+
+fun malformed(at: usize) err[error.Error] {
+    ret err[error.Error].err{error.Error.malformed{at}};
+}
+
+fun refused(cause: allocator.Error) err[error.Error] {
+    ret err[error.Error].err{error.from_allocator(cause)};
+}
+
+fun parser(r: *Reader, a: *allocator.Allocator, at: usize) parse.Parser {
+    var p: parse.Parser = parse.init(r.data, r.len, a);
+    p.pos         = at;
+    p.strict      = r.opts.strict;
+    p.max_depth   = r.opts.max_depth;
+    p.filters     = r.opts.filters;
+    p.filters_len = r.opts.filters_len;
+    ret p;
+}
+
+fun matches(data: *u8, len: usize, at: usize, text: str, n: usize) bool {
+    if (at > len || len - at < n) { ret false; }
+    ret memory.raw_equal((?data[at])::ptr, text::ptr, n);
+}
+
+# the header's version, `%PDF-major.minor`
+fun header(r: *Reader) err[error.Error] {
+    var at: usize = 0;
+    if (!r.opts.strict) {
+        for (at < 1024 && at < r.len && !matches(r.data, r.len, at, "%PDF-", 5)) { at = at + 1; }
+    }
+    if (!matches(r.data, r.len, at, "%PDF-", 5)) { ret malformed(at); }
+    at = at + 5;
+    if (at + 3 > r.len) { ret malformed(at); }
+    val major: u8 = r.data[at];
+    val minor: u8 = r.data[at + 2];
+    if (major < '1' || major > '9' || r.data[at + 1] != '.' || minor < '0' || minor > '9') { ret malformed(at); }
+    r.doc.version = document.Version{major: major - '0', minor: minor - '0'};
+    ret err[error.Error].ok{};
+}
+
+# the offset startxref gives, found from the end of the file
+fun startxref(r: *Reader) res[usize, error.Error] {
+    var floor: usize = 0;
+    if (r.opts.strict && r.len > 1024) { floor = r.len - 1024; }
+    var at:    usize = r.len;
+    var found: bool  = false;
+    for (at > floor) {
+        at = at - 1;
+        if (r.data[at] == 's' && matches(r.data, r.len, at, "startxref", 9)) {
+            found = true;
+            brk;
+        }
+    }
+    if (!found) { ret res[usize, error.Error].err{error.Error.malformed{r.len}}; }
+    var p: parse.Parser = parser(r, r.doc.backing, at + 9);
+    parse.skip(?p);
+    var offset: u64 = 0;
+    if (!parse.unsigned(?p, ?offset) || offset >= r.len::u64) {
+        ret res[usize, error.Error].err{parse.failure(?p)};
+    }
+    # %%EOF reads as a comment, so only whitespace is skipped to it
+    for (p.pos < r.len && parse.space(r.data[p.pos])) { p.pos = p.pos + 1; }
+    if (r.opts.strict && !matches(r.data, r.len, p.pos, "%%EOF", 5)) {
+        ret res[usize, error.Error].err{parse.failure(?p)};
+    }
+    ret res[usize, error.Error].ok{offset::usize};
+}
+
+fun listed(entries: *vector.Vector[Listed], number: u64, located: Located) err[error.Error] {
+    val pushed: res[usize, allocator.Error] = vector.push[Listed](entries, Listed{number: number, located: located});
+    if (sel pushed.err) { ret refused(pushed.err); }
+    ret err[error.Error].ok{};
+}
+
+fun digits(data: *u8, at: usize, n: usize, value: *u64) bool {
+    var total: u64   = 0;
+    var i:     usize = 0;
+    for (i < n) {
+        val c: u8 = data[at + i];
+        if (c < '0' || c > '9') { ret false; }
+        total = total * 10 + (c - '0')::u64;
+        i     = i + 1;
+    }
+    @value = total;
+    ret true;
+}
+
+# one entry of a table, `offset generation n|f` and its end of line
+fun row(r: *Reader, p: *parse.Parser, offset: *u64, generation: *u64, kind: *u8) bool {
+    if (r.opts.strict) {
+        # an entry is exactly twenty bytes
+        if (p.pos > r.len || r.len - p.pos < 20) { ret false; }
+        val at: usize = p.pos;
+        if (!digits(r.data, at, 10, offset) || r.data[at + 10] != ' ')         { ret false; }
+        if (!digits(r.data, at + 11, 5, generation) || r.data[at + 16] != ' ') { ret false; }
+        @kind = r.data[at + 17];
+        val a: u8 = r.data[at + 18];
+        val b: u8 = r.data[at + 19];
+        if (!((a == ' ' && (b == '\r' || b == '\n')) || (a == '\r' && b == '\n'))) { ret false; }
+        p.pos = at + 20;
+        ret @kind == 'n' || @kind == 'f';
+    }
+    parse.skip(p);
+    if (!parse.unsigned(p, offset)) { ret false; }
+    parse.skip(p);
+    if (!parse.unsigned(p, generation)) { ret false; }
+    parse.skip(p);
+    if (p.pos >= r.len) { ret false; }
+    @kind = r.data[p.pos];
+    p.pos = p.pos + 1;
+    ret @kind == 'n' || @kind == 'f';
+}
+
+# a cross-reference table at the parser's position, its entries in entries
+fun table(r: *Reader, p: *parse.Parser, entries: *vector.Vector[Listed]) res[*object.Dict, error.Error] {
+    if (!parse.keyword(p, "xref")) { ret res[*object.Dict, error.Error].err{parse.failure(p)}; }
+    for {
+        parse.skip(p);
+        if (parse.keyword(p, "trailer")) { brk; }
+        var first: u64 = 0;
+        var count: u64 = 0;
+        if (!parse.unsigned(p, ?first)) { ret res[*object.Dict, error.Error].err{parse.failure(p)}; }
+        parse.skip(p);
+        if (!parse.unsigned(p, ?count)) { ret res[*object.Dict, error.Error].err{parse.failure(p)}; }
+        parse.skip(p);
+        # every entry takes at least six bytes, so a count the file cannot hold is refused before the loop
+        if (count > (r.len - p.pos)::u64 / 6 || first > 0xffffffff) {
+            ret res[*object.Dict, error.Error].err{parse.failure(p)};
+        }
+        var i: u64 = 0;
+        for (i < count) {
+            var offset:     u64 = 0;
+            var generation: u64 = 0;
+            var kind:       u8  = 0;
+            if (!row(r, p, ?offset, ?generation, ?kind) || generation > 0xffff) {
+                ret res[*object.Dict, error.Error].err{parse.failure(p)};
+            }
+            var made: err[error.Error] = err[error.Error].ok{};
+            if (kind == 'n') {
+                if (offset >= r.len::u64) { ret res[*object.Dict, error.Error].err{parse.failure(p)}; }
+                made = listed(entries, first + i, Located{where: Where.at{offset::usize}, generation: generation::u16});
+            }
+            or {
+                made = listed(entries, first + i, Located{where: Where.free{}, generation: generation::u16});
+            }
+            if (sel made.err) { ret res[*object.Dict, error.Error].err{made.err}; }
+            i = i + 1;
+        }
+    }
+    val trailer: res[object.Object, error.Error] = parse.value(p);
+    if (sel trailer.err) { ret res[*object.Dict, error.Error].err{trailer.err}; }
+    val held: object.Object = trailer.ok;
+    if (!sel held.dict) { ret res[*object.Dict, error.Error].err{parse.failure(p)}; }
+    ret res[*object.Dict, error.Error].ok{held.dict};
+}
+
+fun integer(d: *object.Dict, key: str) opt[i64] {
+    val found: opt[*object.Object] = object.get(d, key);
+    if (!sel found.some) { ret opt[i64].none{}; }
+    val held: object.Object = @found.some;
+    if (!sel held.integer) { ret opt[i64].none{}; }
+    ret opt[i64].some{held.integer};
+}
+
+fun field(row: *u8, width: i64, fallback: u64) u64 {
+    if (width == 0) { ret fallback; }
+    var value: u64   = 0;
+    var i:     usize = 0;
+    for (i < width::usize) {
+        value = (value << 8) | row[i]::u64;
+        i     = i + 1;
+    }
+    ret value;
+}
+
+# a cross-reference stream at offset, its entries in entries
+fun xref_stream(r: *Reader, a: *allocator.Allocator, offset: usize, entries: *vector.Vector[Listed]) res[*object.Dict, error.Error] {
+    var p:   parse.Parser                     = parser(r, a, offset);
+    val got: res[parse.Indirect, error.Error] = parse.indirect(?p);
+    if (sel got.err) { ret res[*object.Dict, error.Error].err{got.err}; }
+    val held: object.Object = got.ok.value;
+    if (!sel held.stream) { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+    val s:     *object.Stream      = held.stream;
+    val d:     *object.Dict        = s.dict;
+    val kind:  opt[*object.Object] = object.get(d, "Type");
+    var typed: bool                = false;
+    if (sel kind.some) {
+        val named: object.Object = @kind.some;
+        typed = sel named.name && object.name_is(named.name, "XRef");
+    }
+    if (r.opts.strict && !typed) { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+    val size: opt[i64] = integer(d, "Size");
+    if (!sel size.some)                          { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+    if (size.some < 0 || size.some > 0xffffffff) { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+
+    var widths: [3]i64;
+    val w:      opt[*object.Object] = object.get(d, "W");
+    if (!sel w.some) { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+    val wv: object.Object = @w.some;
+    if (!sel wv.array)           { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+    if (wv.array.items.len != 3) { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+    var k:     usize = 0;
+    var width: i64   = 0;
+    for (k < 3) {
+        val item: object.Object = wv.array.items.data[k];
+        if (!sel item.integer)                    { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+        if (item.integer < 0 || item.integer > 8) { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+        widths[k] = item.integer;
+        width     = width + item.integer;
+        k         = k + 1;
+    }
+    if (widths[1] == 0) { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+
+    val decoded: res[vector.Vector[u8], error.Error] = document.decoded(r.doc, s, a, r.opts.max_decoded);
+    if (sel decoded.err) { ret res[*object.Dict, error.Error].err{decoded.err}; }
+    var rows: vector.Vector[u8] = decoded.ok;
+    fin { vector.dnit[u8](?rows); }
+
+    # /Index lists first, count pairs, [0 /Size] when absent
+    var index: *object.Array       = nil;
+    val given: opt[*object.Object] = object.get(d, "Index");
+    if (sel given.some) {
+        val iv: object.Object = @given.some;
+        if (!sel iv.array)               { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+        if (iv.array.items.len % 2 != 0) { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+        index = iv.array;
+    }
+    var pairs: usize = 1;
+    if (index != nil) { pairs = index.items.len / 2; }
+    var at: usize = 0;
+    var n:  usize = 0;
+    for (n < pairs) {
+        var first: i64 = 0;
+        var count: i64 = size.some;
+        if (index != nil) {
+            val f: object.Object = index.items.data[n * 2];
+            val c: object.Object = index.items.data[n * 2 + 1];
+            if (!sel f.integer) { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+            if (!sel c.integer) { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+            first = f.integer;
+            count = c.integer;
+        }
+        if (first < 0 || count < 0 || first > 0xffffffff) { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+        # the rows must be there before any is read
+        if (count::u64 > ((rows.len - at) / width::usize)::u64) {
+            ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}};
+        }
+        var i: i64 = 0;
+        for (i < count) {
+            val line:   *u8 = ?rows.data[at];
+            val kind_f: u64 = field(line, widths[0], 1);
+            val second: u64 = field(?line[widths[0]::usize], widths[1], 0);
+            val third:  u64 = field(?line[(widths[0] + widths[1])::usize], widths[2], 0);
+            at = at + width::usize;
+            var located: Located = Located{where: Where.free{}, generation: 0};
+            if (kind_f == 1) {
+                if (second >= r.len::u64 || third > 0xffff) { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+                located = Located{where: Where.at{second::usize}, generation: third::u16};
+            }
+            or (kind_f == 2) {
+                if (second > 0xffffffff || third > 0xffffffff) { ret res[*object.Dict, error.Error].err{error.Error.malformed{offset}}; }
+                located = Located{where: Where.packed{Packed{stream: second::u32, index: third::u32}}, generation: 0};
+            }
+            or (kind_f == 0 && third <= 0xffff) {
+                located.generation = third::u16;
+            }
+            val made: err[error.Error] = listed(entries, first::u64 + i::u64, located);
+            if (sel made.err) { ret res[*object.Dict, error.Error].err{made.err}; }
+            i = i + 1;
+        }
+        n = n + 1;
+    }
+    ret res[*object.Dict, error.Error].ok{d};
+}
+
+# record the entries a section lists, the newest listing of a number winning
+fun record(r: *Reader, entries: *vector.Vector[Listed], at: usize) err[error.Error] {
+    var i: usize = 0;
+    for (i < entries.len) {
+        val e: Listed = entries.data[i];
+        i = i + 1;
+        if (e.number >= r.size::u64) {
+            if (r.opts.strict) { ret malformed(at); }
+            cnt;
+        }
+        val slot: *Located = ?r.index[e.number::usize];
+        if (sel slot.where.unlisted) { @slot = e.located; }
+    }
+    ret err[error.Error].ok{};
+}
+
+fun seen(visited: *vector.Vector[usize], at: usize) bool {
+    var i: usize = 0;
+    for (i < visited.len) {
+        if (visited.data[i] == at) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun visit(r: *Reader, visited: *vector.Vector[usize], at: usize) err[error.Error] {
+    if (seen(visited, at))                   { ret malformed(at); }
+    if (visited.len >= r.opts.max_revisions) { ret err[error.Error].err{error.Error.limit{}}; }
+    val pushed: res[usize, allocator.Error] = vector.push[usize](visited, at);
+    if (sel pushed.err) { ret refused(pushed.err); }
+    ret err[error.Error].ok{};
+}
+
+# size the index from the last trailer, the first one read
+fun sized(r: *Reader, trailer: *object.Dict, at: usize) err[error.Error] {
+    val size: opt[i64] = integer(trailer, "Size");
+    if (!sel size.some)                      { ret malformed(at); }
+    if (size.some < 1)                       { ret malformed(at); }
+    if (size.some > r.opts.max_objects::i64) { ret err[error.Error].err{error.Error.limit{}}; }
+    val made: res[*Located, allocator.Error] = allocator.zallocate[Located](document.objects(r.doc), size.some::usize);
+    if (sel made.err) { ret refused(made.err); }
+    r.index = made.ok;
+    r.size  = size.some::u32;
+    ret err[error.Error].ok{};
+}
+
+# put the numbers a section lists in numbers, once each
+fun note(r: *Reader, entries: *vector.Vector[Listed], numbers: *vector.Vector[u32]) err[error.Error] {
+    var i: usize = 0;
+    for (i < entries.len) {
+        val number: u64 = entries.data[i].number;
+        i = i + 1;
+        if (number == 0 || number >= r.size::u64) { cnt; }
+        val pushed: res[usize, allocator.Error] = vector.push[u32](numbers, number::u32);
+        if (sel pushed.err) { ret refused(pushed.err); }
+    }
+    ret err[error.Error].ok{};
+}
+
+# read one section at offset, recording its entries, and return its trailer
+#
+# numbers, when not nil, receives every number the section lists.
+fun section(r: *Reader, a: *allocator.Allocator, visited: *vector.Vector[usize], offset: usize, numbers: *vector.Vector[u32]) res[Section, error.Error] {
+    val went: err[error.Error] = visit(r, visited, offset);
+    if (sel went.err) { ret res[Section, error.Error].err{went.err}; }
+    var listing: vector.Vector[Listed] = vector.init[Listed](r.doc.backing);
+    fin { vector.dnit[Listed](?listing); }
+    var hidden: vector.Vector[Listed] = vector.init[Listed](r.doc.backing);
+    fin { vector.dnit[Listed](?hidden); }
+
+    var p:       parse.Parser = parser(r, a, offset);
+    var trailer: *object.Dict = nil;
+    var stream:  bool         = false;
+    if (matches(r.data, r.len, offset, "xref", 4)) {
+        val got: res[*object.Dict, error.Error] = table(r, ?p, ?listing);
+        if (sel got.err) { ret res[Section, error.Error].err{got.err}; }
+        trailer = got.ok;
+        # a hybrid file's table lists what a pdf 1.4 reader can find, and its stream
+        # the numbers the table does not list, free ones included
+        val hybrid: opt[i64] = integer(trailer, "XRefStm");
+        if (sel hybrid.some) {
+            if (hybrid.some < 0 || hybrid.some >= r.len::i64) { ret res[Section, error.Error].err{error.Error.malformed{offset}}; }
+            val also: err[error.Error] = visit(r, visited, hybrid.some::usize);
+            if (sel also.err) { ret res[Section, error.Error].err{also.err}; }
+            val more: res[*object.Dict, error.Error] = xref_stream(r, a, hybrid.some::usize, ?hidden);
+            if (sel more.err) { ret res[Section, error.Error].err{more.err}; }
+        }
+    }
+    or {
+        val got: res[*object.Dict, error.Error] = xref_stream(r, a, offset, ?listing);
+        if (sel got.err) { ret res[Section, error.Error].err{got.err}; }
+        trailer = got.ok;
+        stream  = true;
+    }
+    val encrypt: opt[*object.Object] = object.get(trailer, "Encrypt");
+    if (sel encrypt.some) { ret res[Section, error.Error].err{error.Error.encrypted{}}; }
+    if (r.index == nil) {
+        val made: err[error.Error] = sized(r, trailer, offset);
+        if (sel made.err) { ret res[Section, error.Error].err{made.err}; }
+    }
+    val recorded: err[error.Error] = error.first(record(r, ?listing, offset), record(r, ?hidden, offset));
+    if (sel recorded.err) { ret res[Section, error.Error].err{recorded.err}; }
+    if (numbers != nil) {
+        val noted: err[error.Error] = error.first(note(r, ?listing, numbers), note(r, ?hidden, numbers));
+        if (sel noted.err) { ret res[Section, error.Error].err{noted.err}; }
+    }
+    ret res[Section, error.Error].ok{Section{trailer: trailer, stream: stream}};
+}
+
+# take /Root, /Info and /ID from the last trailer
+fun adopt(r: *Reader, trailer: *object.Dict, at: usize) err[error.Error] {
+    val root: opt[*object.Object] = object.get(trailer, "Root");
+    if (sel root.some) {
+        val value: object.Object = @root.some;
+        if (sel value.reference) {
+            document.set_root(r.doc, value.reference);
+        }
+        or (r.opts.strict) {
+            ret malformed(at);
+        }
+    }
+    or (r.opts.strict) {
+        ret malformed(at);
+    }
+    val info: opt[*object.Object] = object.get(trailer, "Info");
+    if (sel info.some) {
+        val value: object.Object = @info.some;
+        if (sel value.reference) {
+            document.set_info(r.doc, value.reference);
+        }
+        or (r.opts.strict) {
+            ret malformed(at);
+        }
+    }
+    val id: opt[*object.Object] = object.get(trailer, "ID");
+    if (!sel id.some) { ret err[error.Error].ok{}; }
+    val pair: object.Object = @id.some;
+    var ok:   bool          = false;
+    if (sel pair.array) {
+        if (pair.array.items.len == 2) {
+            val first:  object.Object = pair.array.items.data[0];
+            val second: object.Object = pair.array.items.data[1];
+            if (sel first.string) {
+                if (sel second.string) {
+                    val set: err[error.Error] = document.set_id(r.doc, first.string.data, first.string.len,
+                        second.string.data, second.string.len);
+                    if (sel set.err) { ret set; }
+                    ok = true;
+                }
+            }
+        }
+    }
+    if (!ok && r.opts.strict) { ret malformed(at); }
+    ret err[error.Error].ok{};
+}
+
+fun length_of(ctx: ptr, target: object.Ref) res[opt[i64], error.Error] {
+    val r:     *Reader                              = ctx::*Reader;
+    val found: res[opt[object.Object], error.Error] = document.resolve(r.doc, target);
+    if (sel found.err) { ret res[opt[i64], error.Error].err{found.err}; }
+    if (sel found.ok.some) {
+        val value: object.Object = found.ok.some;
+        if (sel value.integer) { ret res[opt[i64], error.Error].ok{opt[i64].some{value.integer}}; }
+    }
+    ret res[opt[i64], error.Error].ok{opt[i64].none{}};
+}
+
+# parse the object defined at offset for number
+fun defined(r: *Reader, number: u32, generation: u16, offset: usize) err[error.Error] {
+    var p: parse.Parser = parser(r, document.objects(r.doc), offset);
+    p.lengths = opt[parse.Lengths].some{parse.Lengths{ctx: r::ptr, length: length_of}};
+    val got: res[parse.Indirect, error.Error] = parse.indirect(?p);
+    if (sel got.err)                                             { ret err[error.Error].err{got.err}; }
+    if (got.ok.target.number != number)                          { ret malformed(offset); }
+    if (got.ok.target.generation != generation && r.opts.strict) { ret malformed(offset); }
+    document.provide(r.doc, object.Ref{number: number, generation: generation}, got.ok.value);
+    ret err[error.Error].ok{};
+}
+
+fun offset_of(r: *Reader, number: u32) usize {
+    if (number < r.size) {
+        val w: Where = r.index[number::usize].where;
+        if (sel w.at) { ret w.at; }
+    }
+    ret 0;
+}
+
+# decode an object stream and provide every object the index places in it
+fun unpack(r: *Reader, number: u32, place: Packed) err[error.Error] {
+    val origin: usize = offset_of(r, place.stream);
+    if (place.stream >= r.size || place.stream == number) { ret malformed(origin); }
+    val home: Located = r.index[place.stream::usize];
+    if (!sel home.where.at) { ret malformed(origin); }
+    val found: res[opt[object.Object], error.Error] = document.resolve(r.doc,
+        object.Ref{number: place.stream, generation: home.generation});
+    if (sel found.err)      { ret err[error.Error].err{found.err}; }
+    if (!sel found.ok.some) { ret malformed(origin); }
+    val held: object.Object = found.ok.some;
+    if (!sel held.stream) { ret malformed(origin); }
+    val s:     *object.Stream = held.stream;
+    val count: opt[i64]       = integer(s.dict, "N");
+    val first: opt[i64]       = integer(s.dict, "First");
+    if (!sel count.some) { ret malformed(origin); }
+    if (!sel first.some) { ret malformed(origin); }
+    val decoded: res[vector.Vector[u8], error.Error] = document.decoded(r.doc, s, r.doc.backing, r.opts.max_decoded);
+    if (sel decoded.err) { ret err[error.Error].err{decoded.err}; }
+    var bytes: vector.Vector[u8] = decoded.ok;
+    fin { vector.dnit[u8](?bytes); }
+    # every pair takes at least four bytes, so a count the stream cannot hold is refused before the loop
+    if (count.some < 0 || first.some < 0 || first.some::u64 > bytes.len::u64 || count.some::u64 > (bytes.len / 4)::u64) {
+        ret malformed(origin);
+    }
+    if (place.index::i64 >= count.some) { ret malformed(origin); }
+    var p: parse.Parser = parse.init(bytes.data, first.some::usize, document.objects(r.doc));
+    p.strict    = r.opts.strict;
+    p.max_depth = r.opts.max_depth;
+    p.inside    = true;
+    p.origin    = origin;
+    var pairs: vector.Vector[u64] = vector.init[u64](r.doc.backing);
+    fin { vector.dnit[u64](?pairs); }
+    var i: i64 = 0;
+    for (i < count.some) {
+        var k:  u64 = 0;
+        var at: u64 = 0;
+        parse.skip(?p);
+        if (!parse.unsigned(?p, ?k)) { ret malformed(origin); }
+        parse.skip(?p);
+        if (!parse.unsigned(?p, ?at))                  { ret malformed(origin); }
+        if (at > (bytes.len - first.some::usize)::u64) { ret malformed(origin); }
+        val pushed_k: res[usize, allocator.Error] = vector.push[u64](?pairs, k);
+        if (sel pushed_k.err) { ret refused(pushed_k.err); }
+        val pushed_at: res[usize, allocator.Error] = vector.push[u64](?pairs, at);
+        if (sel pushed_at.err) { ret refused(pushed_at.err); }
+        i = i + 1;
+    }
+    if (pairs.data[place.index::usize * 2] != number::u64) { ret malformed(origin); }
+    p.data = bytes.data;
+    p.len  = bytes.len;
+    var j: usize = 0;
+    for (j < pairs.len / 2) {
+        val k: u64 = pairs.data[j * 2];
+        val o: u64 = pairs.data[j * 2 + 1];
+        j = j + 1;
+        if (k >= r.size::u64) { cnt; }
+        val w: Where = r.index[k::usize].where;
+        if (!sel w.packed)                                                     { cnt; }
+        if (w.packed.stream != place.stream || w.packed.index::usize != j - 1) { cnt; }
+        p.pos   = first.some::usize + o::usize;
+        p.depth = 0;
+        val got: res[object.Object, error.Error] = parse.value(?p);
+        if (sel got.err) { ret err[error.Error].err{got.err}; }
+        document.provide(r.doc, object.Ref{number: k::u32, generation: 0}, got.ok);
+    }
+    ret err[error.Error].ok{};
+}
+
+fun load(ctx: ptr, doc: *document.Document, number: u32) err[error.Error] {
+    val r: *Reader = ctx::*Reader;
+    if (number >= r.size)            { ret err[error.Error].ok{}; }
+    if (r.depth >= r.opts.max_depth) { ret err[error.Error].err{error.Error.limit{}}; }
+    r.depth = r.depth + 1;
+    fin { r.depth = r.depth - 1; }
+    val located: Located = r.index[number::usize];
+    if (sel located.where.at)     { ret defined(r, number, located.generation, located.where.at); }
+    if (sel located.where.packed) { ret unpack(r, number, located.where.packed); }
+    ret err[error.Error].ok{};
+}
+
+# one revision of a file: the section a /Prev chain reaches, and the bytes
+# that end with its %%EOF
+# ---
+# xref:    the byte offset of its cross-reference section
+# end:     one past its %%EOF and the end of line after it, the length of the
+#          file as this revision left it
+# numbers: the object numbers its section lists, in use or free, living in the
+#          document's arena
+# count:   the count of numbers
+pub rec Revision {
+    xref:    usize;
+    end:     usize;
+    numbers: *u32;
+    count:   usize;
+}
+
+# the end of the revision whose section is at xref: one past the end of line
+# after the %%EOF that follows `startxref` naming xref, or 0 for none
+fun ending(r: *Reader, xref: usize) usize {
+    var at: usize = xref;
+    for (at < r.len) {
+        if (r.data[at] != 's' || !matches(r.data, r.len, at, "startxref", 9)) {
+            at = at + 1;
+            cnt;
+        }
+        var p: parse.Parser = parser(r, r.doc.backing, at + 9);
+        at = at + 9;
+        parse.skip(?p);
+        var offset: u64 = 0;
+        if (!parse.unsigned(?p, ?offset) || offset != xref::u64) { cnt; }
+        for (p.pos < r.len && parse.space(r.data[p.pos])) { p.pos = p.pos + 1; }
+        if (!matches(r.data, r.len, p.pos, "%%EOF", 5)) { cnt; }
+        var stop: usize = p.pos + 5;
+        if (stop < r.len && r.data[stop] == '\r') { stop = stop + 1; }
+        if (stop < r.len && r.data[stop] == '\n') { stop = stop + 1; }
+        ret stop;
+    }
+    ret 0;
+}
+
+# copy numbers into the document's arena after the count already at to
+fun kept(r: *Reader, to: *Revision, numbers: *vector.Vector[u32]) err[error.Error] {
+    if (numbers.len == 0) { ret err[error.Error].ok{}; }
+    val made: res[*u32, allocator.Error] = allocator.allocate[u32](document.objects(r.doc), to.count + numbers.len);
+    if (sel made.err) { ret refused(made.err); }
+    if (to.count > 0) { memory.copy[u32](made.ok, to.numbers, to.count); }
+    memory.copy[u32](?made.ok[to.count], numbers.data, numbers.len);
+    to.numbers = made.ok;
+    to.count   = to.count + numbers.len;
+    ret err[error.Error].ok{};
+}
+
+# read a file into a document as read does, and list its revisions
+#
+# a section with no `startxref` and %%EOF of its own after it, such as the
+# main section of a linearized file, belongs to the revision whose section
+# names it in /Prev.
+# ---
+# doc:       a document just initialized, with no objects
+# data:      the file's bytes
+# len:       the count of bytes
+# opts:      how to read it
+# revisions: receives the revisions, oldest first, nil for none
+# ret:       as read
+pub fun history(doc: *document.Document, data: *u8, len: usize, opts: Options, revisions: *vector.Vector[Revision]) err[error.Error] {
+    if (document.size(doc) != 1 || sel doc.base.some) { ret err[error.Error].err{error.Error.invalid{}}; }
+    val made: res[*Reader, allocator.Error] = allocator.zallocate[Reader](document.objects(doc), 1);
+    if (sel made.err) { ret refused(made.err); }
+    val r: *Reader = made.ok;
+    r.doc  = doc;
+    r.data = data;
+    r.len  = len;
+    r.opts = opts;
+    val headed: err[error.Error] = header(r);
+    if (sel headed.err) { ret headed; }
+    val last: res[usize, error.Error] = startxref(r);
+    if (sel last.err) { ret err[error.Error].err{last.err}; }
+
+    var scratch: arena.Arena;
+    val started: err[allocator.Error] = arena.init(?scratch, doc.backing, 0);
+    if (sel started.err) { ret refused(started.err); }
+    fin { arena.dnit(?scratch); }
+    var temporary: allocator.Allocator;
+    arena.make(?temporary, ?scratch);
+    var visited: vector.Vector[usize] = vector.init[usize](doc.backing);
+    fin { vector.dnit[usize](?visited); }
+    var numbers: vector.Vector[u32] = vector.init[u32](doc.backing);
+    fin { vector.dnit[u32](?numbers); }
+    var listing: *vector.Vector[u32] = nil;
+    if (revisions != nil) { listing = ?numbers; }
+    var mark: usize = 0;
+    if (revisions != nil) { mark = revisions.len; }
+
+    var at:     usize = last.ok;
+    var newest: bool  = true;
+    for {
+        numbers.len = 0;
+        val read_one: res[Section, error.Error] = section(r, ?temporary, ?visited, at, listing);
+        if (sel read_one.err) { ret err[error.Error].err{read_one.err}; }
+        val got: Section = read_one.ok;
+        if (newest) {
+            val based: err[error.Error] = document.rebase(doc, document.Base{xref_offset: last.ok, size: r.size});
+            if (sel based.err) { ret based; }
+            val adopted: err[error.Error] = adopt(r, got.trailer, at);
+            if (sel adopted.err) { ret adopted; }
+            doc.xref_stream = got.stream;
+        }
+        if (revisions != nil) {
+            var stop: usize = ending(r, at);
+            if (stop == 0 && newest) { stop = len; }
+            if (stop == 0) {
+                val joined: err[error.Error] = kept(r, ?revisions.data[revisions.len - 1], ?numbers);
+                if (sel joined.err) { ret joined; }
+            }
+            or {
+                var one:    Revision         = Revision{xref: at, end: stop, numbers: nil, count: 0};
+                val copied: err[error.Error] = kept(r, ?one, ?numbers);
+                if (sel copied.err) { ret copied; }
+                val pushed: res[usize, allocator.Error] = vector.push[Revision](revisions, one);
+                if (sel pushed.err) { ret refused(pushed.err); }
+            }
+        }
+        newest = false;
+        val prev: opt[i64] = integer(got.trailer, "Prev");
+        if (!sel prev.some)                         { brk; }
+        if (prev.some < 0 || prev.some >= len::i64) { ret malformed(at); }
+        at = prev.some::usize;
+    }
+    if (revisions != nil) {
+        # the walk met them newest first
+        var low:  usize = mark;
+        var high: usize = revisions.len;
+        for (high > low + 1) {
+            high = high - 1;
+            val swap: Revision = revisions.data[low];
+            revisions.data[low]  = revisions.data[high];
+            revisions.data[high] = swap;
+            low                  = low + 1;
+        }
+    }
+    document.set_source(doc, document.Source{ctx: r::ptr, load: load});
+    ret err[error.Error].ok{};
+}
+
+# read a file into a document, which resolves its objects from the file and
+# appends its next save to it as an incremental update
+#
+# the document keeps pointing into data: the caller keeps the bytes unchanged
+# until the document is done, and appends to an output that starts with them.
+# ---
+# doc:  a document just initialized, with no objects
+# data: the file's bytes
+# len:  the count of bytes
+# opts: how to read it
+# ret:  ok, `malformed` at the offending byte, `limit` past a bound,
+#       `encrypted`, `invalid` for a document that already holds objects, a
+#       filter's failure on a cross-reference stream, or the allocator's
+#       refusal
+pub fun read(doc: *document.Document, data: *u8, len: usize, opts: Options) err[error.Error] {
+    ret history(doc, data, len, opts, nil);
+}
+
+$if (capability.HOSTED) {
+    use std.allocator.page;
+
+    use pdf.output;
+
+    # a file of count objects numbered from 1, the first the catalog, with
+    # extra in its trailer, and a /Prev to its own table when prev_self
+    fun file(a: *allocator.Allocator, objects: *str, count: usize, extra: str, prev_self: bool) output.Output {
+        var out:     output.Output = output.init(a);
+        var offsets: [8]usize;
+        output.text(?out, "%PDF-1.7\n");
+        var i: usize = 0;
+        for (i < count) {
+            offsets[i] = output.offset(?out);
+            output.integer(?out, (i + 1)::i64);
+            output.text(?out, " 0 obj\n");
+            output.text(?out, objects[i]);
+            output.text(?out, "\nendobj\n");
+            i = i + 1;
+        }
+        val at: usize = output.offset(?out);
+        output.text(?out, "xref\n0 ");
+        output.integer(?out, (count + 1)::i64);
+        output.text(?out, "\n0000000000 65535 f\r\n");
+        i = 0;
+        for (i < count) {
+            output.padded(?out, offsets[i]::u64, 10);
+            output.text(?out, " 00000 n\r\n");
+            i = i + 1;
+        }
+        output.text(?out, "trailer\n<< /Size ");
+        output.integer(?out, (count + 1)::i64);
+        output.text(?out, " /Root 1 0 R ");
+        output.text(?out, extra);
+        if (prev_self) {
+            output.text(?out, " /Prev ");
+            output.integer(?out, at::i64);
+        }
+        output.text(?out, " >>\nstartxref\n");
+        output.integer(?out, at::i64);
+        output.text(?out, "\n%%EOF\n");
+        ret out;
+    }
+
+    fun opened(doc: *document.Document, a: *allocator.Allocator, out: *output.Output, len: usize, opts: Options) err[error.Error] {
+        val started: err[error.Error] = document.init(doc, a);
+        if (sel started.err) { ret started; }
+        ret read(doc, output.data(out), len, opts);
+    }
+
+    test read__refuses_a_prev_loop_encryption_and_too_many_objects {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var objects: [1]str = [1]str{"<< /Type /Catalog >>"};
+
+        var looped:     output.Output    = file(?a, ?objects[0], 1, "", true);
+        var looped_doc: document.Document;
+        val loop:       err[error.Error] = opened(?looped_doc, ?a, ?looped, output.offset(?looped), defaults());
+        document.dnit(?looped_doc);
+        if (!(sel loop.err && sel loop.err.malformed)) { ret 1; }
+
+        var locked:     output.Output    = file(?a, ?objects[0], 1, "/Encrypt << /Filter /Standard >>", false);
+        var locked_doc: document.Document;
+        val lock:       err[error.Error] = opened(?locked_doc, ?a, ?locked, output.offset(?locked), defaults());
+        document.dnit(?locked_doc);
+        if (!(sel lock.err && sel lock.err.encrypted)) { ret 2; }
+
+        var small: Options = defaults();
+        small.max_objects = 1;
+        var plain:     output.Output    = file(?a, ?objects[0], 1, "", false);
+        var plain_doc: document.Document;
+        val many:      err[error.Error] = opened(?plain_doc, ?a, ?plain, output.offset(?plain), small);
+        document.dnit(?plain_doc);
+        if (!(sel many.err && sel many.err.limit)) { ret 3; }
+
+        # a file whose %%EOF is missing is strict's to refuse and lenient's to read
+        var lenient: Options = defaults();
+        lenient.strict = false;
+        var cut:      document.Document;
+        val strictly: err[error.Error] = opened(?cut, ?a, ?plain, output.offset(?plain) - 6, defaults());
+        document.dnit(?cut);
+        if (!(sel strictly.err && sel strictly.err.malformed)) { ret 4; }
+        var kept:    document.Document;
+        val loosely: err[error.Error] = opened(?kept, ?a, ?plain, output.offset(?plain) - 6, lenient);
+        document.dnit(?kept);
+        if (sel loosely.err) { ret 5; }
+        ret 0;
+    }
+
+    test resolve__reports_a_length_cycle_and_reads_absent_numbers_as_null {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var objects: [3]str = [3]str{"<< /Type /Catalog >>", "<< /Length 2 0 R >>\nstream\nab\nendstream",
+            "4 0 obj\n7"};
+        var out: output.Output    = file(?a, ?objects[0], 3, "", false);
+        var doc: document.Document;
+        val got: err[error.Error] = opened(?doc, ?a, ?out, output.offset(?out), defaults());
+        fin { document.dnit(?doc); }
+        if (sel got.err) { ret 1; }
+        val cycle: res[opt[object.Object], error.Error] = document.resolve(?doc, object.Ref{number: 2, generation: 0});
+        if (!(sel cycle.err && sel cycle.err.cycle)) { ret 2; }
+        # an object whose definition does not parse is malformed
+        val wrong: res[opt[object.Object], error.Error] = document.resolve(?doc, object.Ref{number: 3, generation: 0});
+        if (!(sel wrong.err && sel wrong.err.malformed)) { ret 3; }
+        val past: res[opt[object.Object], error.Error] = document.resolve(?doc, object.Ref{number: 9, generation: 0});
+        if (!(sel past.ok && sel past.ok.none)) { ret 4; }
+        val other: res[opt[object.Object], error.Error] = document.resolve(?doc, object.Ref{number: 1, generation: 3});
+        if (!(sel other.ok && sel other.ok.none)) { ret 5; }
+        val root: res[opt[object.Object], error.Error] = document.resolve(?doc, object.Ref{number: 1, generation: 0});
+        if (!(sel root.ok && sel root.ok.some)) { ret 6; }
+        var again: document.Document;
+        document.init(?again, ?a);
+        fin { document.dnit(?again); }
+        document.add(?again, object.null());
+        val busy: err[error.Error] = read(?again, output.data(?out), output.offset(?out), defaults());
+        if (!(sel busy.err && sel busy.err.invalid)) { ret 7; }
+        ret 0;
+    }
+}

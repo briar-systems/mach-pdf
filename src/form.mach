@@ -21,6 +21,7 @@
 # `node` reaches.
 
 use std.allocator;
+use std.collections.vector;
 use std.system.capability;
 use std.text.utf8;
 use std.types.bool.bool;
@@ -36,6 +37,7 @@ use std.types.string.str_len;
 use pdf.content;
 use pdf.document;
 use pdf.error;
+use pdf.filter;
 use pdf.font;
 use pdf.object;
 use pdf.output;
@@ -430,6 +432,215 @@ pub fun signature_field(doc: *document.Document, f: *Form, parent: *Field, spec:
     ret made;
 }
 
+# the deepest field tree the readers below walk
+val DEPTH: usize = 32;
+
+# a terminal field read from a document's field tree
+# ---
+# node:     the field's object
+# dict:     its dictionary
+# type:     its /FT, its own or inherited, empty for none
+# name:     its fully qualified name, its ancestors' /T bytes joined by periods
+# name_len: the count of bytes in name
+pub rec Found {
+    node:     object.Ref;
+    dict:     *object.Dict;
+    type:     object.Name;
+    name:     *u8;
+    name_len: usize;
+}
+
+fun dict_at(doc: *document.Document, value: object.Object) res[*object.Dict, error.Error] {
+    val held: res[object.Object, error.Error] = document.deref(doc, value);
+    if (sel held.err) { ret failure[*object.Dict](held.err); }
+    val got: object.Object = held.ok;
+    if (!sel got.dict) { ret res[*object.Dict, error.Error].ok{nil}; }
+    ret res[*object.Dict, error.Error].ok{got.dict};
+}
+
+fun string_of(d: *object.Dict, key: str) opt[object.String] {
+    val held: opt[*object.Object] = object.get(d, key);
+    if (!sel held.some) { ret opt[object.String].none{}; }
+    val value: object.Object = @held.some;
+    if (!sel value.string) { ret opt[object.String].none{}; }
+    ret opt[object.String].some{value.string};
+}
+
+fun type_of(d: *object.Dict, inherited: object.Name) object.Name {
+    val held: opt[*object.Object] = object.get(d, "FT");
+    if (!sel held.some) { ret inherited; }
+    val value: object.Object = @held.some;
+    if (!sel value.name) { ret inherited; }
+    ret value.name;
+}
+
+# a field's kids when they are fields, which name themselves with /T, nil
+# when they are widgets or it has none
+fun parent(doc: *document.Document, d: *object.Dict) res[*object.Array, error.Error] {
+    val held: opt[*object.Object] = object.get(d, "Kids");
+    if (!sel held.some) { ret res[*object.Array, error.Error].ok{nil}; }
+    val listed: res[object.Object, error.Error] = document.deref(doc, @held.some);
+    if (sel listed.err) { ret failure[*object.Array](listed.err); }
+    val kids: object.Object = listed.ok;
+    if (!sel kids.array) { ret res[*object.Array, error.Error].ok{nil}; }
+    var i: usize = 0;
+    for (i < kids.array.items.len) {
+        val kid: res[*object.Dict, error.Error] = dict_at(doc, kids.array.items.data[i]);
+        if (sel kid.err) { ret failure[*object.Array](kid.err); }
+        i = i + 1;
+        if (kid.ok == nil) { cnt; }
+        val named: opt[*object.Object] = object.get(kid.ok, "T");
+        if (sel named.some) { ret res[*object.Array, error.Error].ok{kids.array}; }
+    }
+    ret res[*object.Array, error.Error].ok{nil};
+}
+
+fun fields_of(doc: *document.Document) res[*object.Array, error.Error] {
+    val root: res[*object.Dict, error.Error] = document.catalog(doc);
+    if (sel root.err) { ret failure[*object.Array](root.err); }
+    val held: opt[*object.Object] = object.get(root.ok, "AcroForm");
+    if (!sel held.some) { ret res[*object.Array, error.Error].ok{nil}; }
+    val acroform: res[*object.Dict, error.Error] = dict_at(doc, @held.some);
+    if (sel acroform.err)   { ret failure[*object.Array](acroform.err); }
+    if (acroform.ok == nil) { ret res[*object.Array, error.Error].ok{nil}; }
+    val listed: opt[*object.Object] = object.get(acroform.ok, "Fields");
+    if (!sel listed.some) { ret res[*object.Array, error.Error].ok{nil}; }
+    val fields: res[object.Object, error.Error] = document.deref(doc, @listed.some);
+    if (sel fields.err) { ret failure[*object.Array](fields.err); }
+    val value: object.Object = fields.ok;
+    if (!sel value.array) { ret res[*object.Array, error.Error].ok{nil}; }
+    ret res[*object.Array, error.Error].ok{value.array};
+}
+
+fun join(a: *allocator.Allocator, prefix: *u8, prefix_len: usize, part: object.String, name: *Found) err[error.Error] {
+    var len: usize = part.len;
+    if (prefix_len > 0) { len = prefix_len + 1 + part.len; }
+    if (len == 0) {
+        name.name     = nil;
+        name.name_len = 0;
+        ret err[error.Error].ok{};
+    }
+    val made: res[*u8, allocator.Error] = allocator.allocate[u8](a, len);
+    if (sel made.err) { ret err[error.Error].err{error.from_allocator(made.err)}; }
+    var at: usize = 0;
+    var i:  usize = 0;
+    for (i < prefix_len) {
+        made.ok[at] = prefix[i];
+        at          = at + 1;
+        i           = i + 1;
+    }
+    if (prefix_len > 0) {
+        made.ok[at] = '.';
+        at          = at + 1;
+    }
+    i = 0;
+    for (i < part.len) {
+        made.ok[at] = part.data[i];
+        at          = at + 1;
+        i           = i + 1;
+    }
+    name.name     = made.ok;
+    name.name_len = len;
+    ret err[error.Error].ok{};
+}
+
+fun gather(doc: *document.Document, a: *allocator.Allocator, list: *object.Array, prefix: Found, depth: usize, found: *vector.Vector[Found]) err[error.Error] {
+    if (depth >= DEPTH) { ret err[error.Error].err{error.Error.limit{}}; }
+    var i: usize = 0;
+    for (i < list.items.len) {
+        val item: object.Object = list.items.data[i];
+        i = i + 1;
+        if (!sel item.reference) { cnt; }
+        val d: res[*object.Dict, error.Error] = dict_at(doc, item);
+        if (sel d.err)   { ret err[error.Error].err{d.err}; }
+        if (d.ok == nil) { cnt; }
+        var one: Found = Found{node: item.reference, dict: d.ok, type: type_of(d.ok, prefix.type),
+            name: prefix.name, name_len: prefix.name_len};
+        val part: opt[object.String] = string_of(d.ok, "T");
+        if (sel part.some) {
+            val joined: err[error.Error] = join(a, prefix.name, prefix.name_len, part.some, ?one);
+            if (sel joined.err) { ret joined; }
+        }
+        val kids: res[*object.Array, error.Error] = parent(doc, d.ok);
+        if (sel kids.err) { ret err[error.Error].err{kids.err}; }
+        if (kids.ok != nil) {
+            val deeper: err[error.Error] = gather(doc, a, kids.ok, one, depth + 1, found);
+            if (sel deeper.err) { ret deeper; }
+            cnt;
+        }
+        val pushed: res[usize, allocator.Error] = vector.push[Found](found, one);
+        if (sel pushed.err) { ret err[error.Error].err{error.from_allocator(pushed.err)}; }
+    }
+    ret err[error.Error].ok{};
+}
+
+# every terminal field of a document's form, read from its field tree
+# ---
+# doc:   the document, such as one read from a file
+# a:     the allocator the names live in
+# found: receives the fields in tree order
+# ret:   ok, `limit` for a tree deeper than this reads, why an object could
+#        not be loaded, or the allocator's refusal
+pub fun terminals(doc: *document.Document, a: *allocator.Allocator, found: *vector.Vector[Found]) err[error.Error] {
+    val fields: res[*object.Array, error.Error] = fields_of(doc);
+    if (sel fields.err)   { ret err[error.Error].err{fields.err}; }
+    if (fields.ok == nil) { ret err[error.Error].ok{}; }
+    var top: Found;
+    ret gather(doc, a, fields.ok, top, 0, found);
+}
+
+# the terminal field a fully qualified name names
+# ---
+# doc:  the document
+# a:    the allocator the name lives in
+# name: the fully qualified name as utf-8, such as "owner.signature"
+# ret:  the field, `invalid` when no terminal field has the name, or as
+#       terminals
+pub fun find(doc: *document.Document, a: *allocator.Allocator, name: str) res[Found, error.Error] {
+    if (name == nil) { ret invalid[Found](); }
+    var found: vector.Vector[Found] = vector.init[Found](a);
+    fin { vector.dnit[Found](?found); }
+    val read: err[error.Error] = terminals(doc, a, ?found);
+    if (sel read.err) { ret failure[Found](read.err); }
+    # a name holds its parts as the writer spells them, so non-ascii parts compare as utf-16
+    var i: usize = 0;
+    for (i < found.len) {
+        if (named(a, found.data[i], name)) { ret res[Found, error.Error].ok{found.data[i]}; }
+        i = i + 1;
+    }
+    ret invalid[Found]();
+}
+
+# whether a found field's name is name, each part spelled as text.string does
+fun named(a: *allocator.Allocator, f: Found, name: str) bool {
+    var spelled: output.Output = output.init(a);
+    fin { output.dnit(?spelled); }
+    var start: usize = 0;
+    var i:     usize = 0;
+    for {
+        if (name[i] != 0 && name[i] != '.') {
+            i = i + 1;
+            cnt;
+        }
+        val part: res[object.Object, error.Error] = text.string(a, ?name[start], i - start);
+        if (sel part.err) { ret false; }
+        val value: object.Object = part.ok;
+        if (!sel value.string) { ret false; }
+        if (start > 0)         { output.byte(?spelled, '.'); }
+        output.put(?spelled, value.string.data, value.string.len);
+        if (name[i] == 0) { brk; }
+        i     = i + 1;
+        start = i;
+    }
+    if (spelled.failed || output.offset(?spelled) != f.name_len) { ret false; }
+    var k: usize = 0;
+    for (k < f.name_len) {
+        if (output.data(?spelled)[k] != f.name[k]) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
 # draw a text field's value into its appearance, vertically centred
 fun draw(a: *allocator.Allocator, face: Face, fd: *Field, b: *content.Builder, width: f64, height: f64) err[error.Error] {
     content.begin_marked(b, "Tx");
@@ -484,7 +695,8 @@ pub fun widget(doc: *document.Document, f: *Form, fd: *Field, p: *page.Page, rec
     val shaped: err[error.Error] = error.first(
         object.set_name(s.ok.dict, "Type", "XObject"),
         object.set_name(s.ok.dict, "Subtype", "Form"),
-        object.set(s.ok.dict, "BBox", bbox.ok));
+        object.set(s.ok.dict, "BBox", bbox.ok),
+        object.filter_with(s.ok, filter.flate(), object.null()));
     if (sel shaped.err) { ret failure[object.Ref](shaped.err); }
     if (sel fd.kind.text) {
         val r: res[*object.Dict, error.Error] = resources(a, f.face);

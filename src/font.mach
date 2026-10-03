@@ -20,6 +20,7 @@ use std.types.string.str_len;
 use pdf.content;
 use pdf.document;
 use pdf.error;
+use pdf.filter;
 use pdf.object;
 use pdf.output;
 
@@ -421,7 +422,10 @@ fun cid_system_info(a: *allocator.Allocator) res[object.Object, error.Error] {
     ret res[object.Object, error.Error].ok{object.Object.dict{d.ok}};
 }
 
+# add one of the font's streams, compressed
 fun stream_ref(t: *TrueType, s: *object.Stream) res[object.Ref, error.Error] {
+    val flated: err[error.Error] = object.filter_with(s, filter.flate(), object.null());
+    if (sel flated.err) { ret res[object.Ref, error.Error].err{flated.err}; }
     ret document.add(t.doc, object.Object.stream{s});
 }
 

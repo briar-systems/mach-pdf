@@ -1,0 +1,959 @@
+# the pdf lexer and object parser (iso 32000-2 sections 7.2, 7.3 and 7.5.3)
+#
+# a parser reads objects from bytes into the object model, building them in
+# its allocator. it is strict unless told otherwise: what the standard
+# requires is refused when it is missing, and lenient mode accepts the common
+# breakage a strict parser refuses, such as a stream whose /Length is wrong. it
+# is bounded either way: nesting past max_depth is `limit`, and every scan is
+# bounded by the bytes it was given, so hostile input ends in an answer.
+
+use std.allocator;
+use std.collections.vector;
+use std.memory;
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use pdf.error;
+use pdf.filter;
+use pdf.object;
+
+# the nesting a parser accepts unless told otherwise
+pub val DEPTH: usize = 64;
+
+# an indirect object as a file defines it
+# ---
+# target: its number and generation
+# value:  its object
+pub rec Indirect {
+    target: object.Ref;
+    value:  object.Object;
+}
+
+# how a parser finds a stream's indirect /Length
+# ---
+# ctx:    state passed to length
+# length: the integer the object a reference names holds, none when it names
+#         no integer
+pub rec Lengths {
+    ctx:    ptr;
+    length: fun(ptr, object.Ref) res[opt[i64], error.Error];
+}
+
+# a position in bytes being parsed
+# ---
+# data:        the bytes
+# len:         the count of bytes
+# pos:         the offset of the next byte to read
+# a:           the allocator objects are built in
+# strict:      refuse what the standard requires and the bytes lack
+# max_depth:   the most arrays and dictionaries one object nests
+# depth:       the nesting at pos
+# inside:      the bytes are not the file, such as an object stream's decoded
+#              data, so failures report origin rather than pos
+# origin:      the file offset failures report when inside
+# filters:     filters to name streams with before the built-in ones, nil for
+#              none
+# filters_len: the count of filters
+# lengths:     how to find an indirect /Length, none to refuse one
+pub rec Parser {
+    data:        *u8;
+    len:         usize;
+    pos:         usize;
+    a:           *allocator.Allocator;
+    strict:      bool;
+    max_depth:   usize;
+    depth:       usize;
+    inside:      bool;
+    origin:      usize;
+    filters:     *object.Filter;
+    filters_len: usize;
+    lengths:     opt[Lengths];
+}
+
+# a strict parser at the start of len bytes at data
+# ---
+# data: the bytes
+# len:  the count of bytes
+# a:    the allocator objects are built in
+# ret:  the parser
+pub fun init(data: *u8, len: usize, a: *allocator.Allocator) Parser {
+    var p: Parser;
+    p.data      = data;
+    p.len       = len;
+    p.a         = a;
+    p.strict    = true;
+    p.max_depth = DEPTH;
+    p.lengths   = opt[Lengths].none{};
+    ret p;
+}
+
+# whether a byte is pdf whitespace
+# ---
+# c:   the byte
+# ret: true for nul, tab, line feed, form feed, carriage return and space
+pub fun space(c: u8) bool {
+    ret c == 0 || c == '\t' || c == '\n' || c == 0x0c || c == '\r' || c == ' ';
+}
+
+fun delimiter(c: u8) bool {
+    ret c == '(' || c == ')' || c == '<' || c == '>' || c == '[' || c == ']'
+        || c == '{' || c == '}' || c == '/' || c == '%';
+}
+
+fun regular(c: u8) bool {
+    ret !space(c) && !delimiter(c);
+}
+
+fun hex_digit(c: u8) i32 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::i32; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A')::i32 + 10; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a')::i32 + 10; }
+    ret -1;
+}
+
+# the failure for bytes that break the syntax at the parser's position
+# ---
+# p:   the parser
+# ret: `malformed` naming the file offset
+pub fun failure(p: *Parser) error.Error {
+    if (p.inside) { ret error.Error.malformed{p.origin}; }
+    ret error.Error.malformed{p.pos};
+}
+
+fun broken[T](p: *Parser) res[T, error.Error] {
+    ret res[T, error.Error].err{failure(p)};
+}
+
+fun refused[T](cause: allocator.Error) res[T, error.Error] {
+    ret res[T, error.Error].err{error.from_allocator(cause)};
+}
+
+# skip whitespace and comments
+# ---
+# p: the parser
+pub fun skip(p: *Parser) {
+    for (p.pos < p.len) {
+        val c: u8 = p.data[p.pos];
+        if (space(c)) {
+            p.pos = p.pos + 1;
+            cnt;
+        }
+        if (c != '%') { ret; }
+        for (p.pos < p.len && p.data[p.pos] != '\n' && p.data[p.pos] != '\r') { p.pos = p.pos + 1; }
+    }
+}
+
+# whether the parser is at the end of its bytes
+# ---
+# p:   the parser
+# ret: true when no byte is left
+pub fun done(p: *Parser) bool {
+    ret p.pos >= p.len;
+}
+
+# consume a keyword standing alone at the position
+# ---
+# p:   the parser
+# kw:  the keyword
+# ret: true, past it, when the bytes at the position spell it and no regular
+#      byte follows; false, unmoved, otherwise
+pub fun keyword(p: *Parser, kw: str) bool {
+    val n: usize = str_len(kw);
+    if (p.pos > p.len || p.len - p.pos < n)                   { ret false; }
+    if (!memory.raw_equal((?p.data[p.pos])::ptr, kw::ptr, n)) { ret false; }
+    if (p.pos + n < p.len && regular(p.data[p.pos + n]))      { ret false; }
+    p.pos = p.pos + n;
+    ret true;
+}
+
+# consume an unsigned decimal integer at the position
+# ---
+# p:     the parser
+# value: where the integer goes
+# ret:   true, past it, for one or more digits whose value fits 63 bits;
+#        false, unmoved, otherwise
+pub fun unsigned(p: *Parser, value: *u64) bool {
+    var at:    usize = p.pos;
+    var total: u64   = 0;
+    for (at < p.len && p.data[at] >= '0' && p.data[at] <= '9') {
+        val d: u64 = (p.data[at] - '0')::u64;
+        if (total > (0x7fffffffffffffff - d) / 10) { ret false; }
+        total = total * 10 + d;
+        at    = at + 1;
+    }
+    if (at == p.pos) { ret false; }
+    p.pos  = at;
+    @value = total;
+    ret true;
+}
+
+fun copy(p: *Parser, len: usize) res[*u8, error.Error] {
+    if (len == 0) { ret res[*u8, error.Error].ok{nil}; }
+    val got: res[*u8, allocator.Error] = allocator.allocate[u8](p.a, len);
+    if (sel got.err) { ret refused[*u8](got.err); }
+    ret res[*u8, error.Error].ok{got.ok};
+}
+
+# a number: an integer, a real, or the first of the three tokens of a reference
+fun number(p: *Parser) res[object.Object, error.Error] {
+    val start:    usize = p.pos;
+    var negative: bool  = false;
+    if (p.data[p.pos] == '+' || p.data[p.pos] == '-') {
+        negative = p.data[p.pos] == '-';
+        p.pos    = p.pos + 1;
+    }
+    var mantissa: i64   = 0;
+    var places:   usize = 0;
+    var digits:   usize = 0;
+    var point:    bool  = false;
+    var full:     bool  = false;
+    for (p.pos < p.len) {
+        val c: u8 = p.data[p.pos];
+        if (c == '.' && !point) {
+            point = true;
+            p.pos = p.pos + 1;
+            cnt;
+        }
+        if (c < '0' || c > '9') { brk; }
+        p.pos  = p.pos + 1;
+        digits = digits + 1;
+        val d: i64 = (c - '0')::i64;
+        if (full || mantissa > (0x7fffffffffffffff - d) / 10) {
+            # a real keeps the digits it can hold; an integer part past them has no spelling here
+            if (!point) {
+                p.pos = start;
+                ret broken[object.Object](p);
+            }
+            full = true;
+            cnt;
+        }
+        mantissa = mantissa * 10 + d;
+        if (point && places < 255) { places = places + 1; }
+    }
+    if (digits == 0) {
+        p.pos = start;
+        ret broken[object.Object](p);
+    }
+    if (p.strict && p.pos < p.len && regular(p.data[p.pos])) { ret broken[object.Object](p); }
+    if (negative)                                            { mantissa = -mantissa; }
+    if (point) {
+        ret res[object.Object, error.Error].ok{object.real(object.Real{mantissa: mantissa, places: places::u8})};
+    }
+    if (p.data[start] != '+' && p.data[start] != '-') {
+        val after: usize = p.pos;
+        skip(p);
+        var generation: u64 = 0;
+        if (unsigned(p, ?generation)) {
+            skip(p);
+            if (p.pos < p.len && p.data[p.pos] == 'R' && (p.pos + 1 == p.len || !regular(p.data[p.pos + 1]))) {
+                if (mantissa > 0xffffffff || generation > 0xffff) {
+                    p.pos = start;
+                    ret broken[object.Object](p);
+                }
+                p.pos = p.pos + 1;
+                ret res[object.Object, error.Error].ok{object.reference(object.Ref{number: mantissa::u32,
+                    generation: generation::u16})};
+            }
+        }
+        p.pos = after;
+    }
+    ret res[object.Object, error.Error].ok{object.integer(mantissa)};
+}
+
+fun literal(p: *Parser) res[object.Object, error.Error] {
+    val start: usize = p.pos;
+    var at:    usize = p.pos + 1;
+    var nest:  usize = 1;
+    for {
+        if (at >= p.len) { ret broken[object.Object](p); }
+        val c: u8 = p.data[at];
+        if (c == '\\') {
+            at = at + 2;
+            cnt;
+        }
+        if (c == '(') { nest = nest + 1; }
+        if (c == ')') {
+            nest = nest - 1;
+            if (nest == 0) { brk; }
+        }
+        at = at + 1;
+    }
+    val end:  usize                 = at;
+    val made: res[*u8, error.Error] = copy(p, end - start - 1);
+    if (sel made.err) { ret res[object.Object, error.Error].err{made.err}; }
+    val bytes: *u8   = made.ok;
+    var len:   usize = 0;
+    var i:     usize = start + 1;
+    for (i < end) {
+        var c: u8 = p.data[i];
+        i = i + 1;
+        if (c == '\r') {
+            if (i < end && p.data[i] == '\n') { i = i + 1; }
+            c = '\n';
+        }
+        or (c == '\\') {
+            c = p.data[i];
+            i = i + 1;
+            if (c == 'n') { c = '\n'; }
+            or (c == 'r') { c = '\r'; }
+            or (c == 't') { c = '\t'; }
+            or (c == 'b') { c = 0x08; }
+            or (c == 'f') { c = 0x0c; }
+            or (c >= '0' && c <= '7') {
+                var value: u32   = (c - '0')::u32;
+                var count: usize = 1;
+                for (count < 3 && i < end && p.data[i] >= '0' && p.data[i] <= '7') {
+                    value = value * 8 + (p.data[i] - '0')::u32;
+                    i     = i + 1;
+                    count = count + 1;
+                }
+                c = (value & 0xff)::u8;
+            }
+            or (c == '\r' || c == '\n') {
+                # a backslash before an end of line continues the string on the next line
+                if (c == '\r' && i < end && p.data[i] == '\n') { i = i + 1; }
+                cnt;
+            }
+        }
+        bytes[len] = c;
+        len        = len + 1;
+    }
+    p.pos = end + 1;
+    ret res[object.Object, error.Error].ok{object.Object.string{object.String{data: bytes, len: len, hex: false}}};
+}
+
+fun hex(p: *Parser) res[object.Object, error.Error] {
+    var at:     usize = p.pos + 1;
+    var digits: usize = 0;
+    for {
+        if (at >= p.len) { ret broken[object.Object](p); }
+        val c: u8 = p.data[at];
+        if (c == '>') { brk; }
+        if (hex_digit(c) >= 0) {
+            digits = digits + 1;
+        }
+        or (!space(c)) {
+            p.pos = at;
+            ret broken[object.Object](p);
+        }
+        at = at + 1;
+    }
+    val end:  usize                 = at;
+    val made: res[*u8, error.Error] = copy(p, (digits + 1) / 2);
+    if (sel made.err) { ret res[object.Object, error.Error].err{made.err}; }
+    val bytes: *u8   = made.ok;
+    var count: usize = 0;
+    var i:     usize = p.pos + 1;
+    for (i < end) {
+        val d: i32 = hex_digit(p.data[i]);
+        i = i + 1;
+        if (d < 0) { cnt; }
+        if (count % 2 == 0) {
+            bytes[count / 2] = (d << 4)::u8;
+        }
+        or {
+            bytes[count / 2] = bytes[count / 2] | d::u8;
+        }
+        count = count + 1;
+    }
+    p.pos = end + 1;
+    ret res[object.Object, error.Error].ok{object.Object.string{object.String{data: bytes, len: (digits + 1) / 2,
+        hex: true}}};
+}
+
+# a name at the position, which holds its slash
+fun name(p: *Parser) res[object.Name, error.Error] {
+    val start: usize = p.pos + 1;
+    var end:   usize = start;
+    for (end < p.len && regular(p.data[end])) { end = end + 1; }
+    val made: res[*u8, error.Error] = copy(p, end - start);
+    if (sel made.err) { ret res[object.Name, error.Error].err{made.err}; }
+    val bytes: *u8   = made.ok;
+    var len:   usize = 0;
+    var i:     usize = start;
+    for (i < end) {
+        var c: u8 = p.data[i];
+        if (c == '#') {
+            var high: i32 = -1;
+            var low:  i32 = -1;
+            if (i + 2 < end) {
+                high = hex_digit(p.data[i + 1]);
+                low  = hex_digit(p.data[i + 2]);
+            }
+            if (high >= 0 && low >= 0 && (high | low) != 0) {
+                c = ((high << 4) | low)::u8;
+                i = i + 2;
+            }
+            or (p.strict) {
+                p.pos = i;
+                ret broken[object.Name](p);
+            }
+        }
+        bytes[len] = c;
+        len        = len + 1;
+        i          = i + 1;
+    }
+    p.pos = end;
+    ret res[object.Name, error.Error].ok{object.Name{data: bytes, len: len}};
+}
+
+fun nested(p: *Parser) err[error.Error] {
+    if (p.depth >= p.max_depth) { ret err[error.Error].err{error.Error.limit{}}; }
+    p.depth = p.depth + 1;
+    ret err[error.Error].ok{};
+}
+
+fun array(p: *Parser) res[object.Object, error.Error] {
+    val deeper: err[error.Error] = nested(p);
+    if (sel deeper.err) { ret res[object.Object, error.Error].err{deeper.err}; }
+    p.pos = p.pos + 1;
+    val made: res[*object.Array, error.Error] = object.array(p.a);
+    if (sel made.err) { ret res[object.Object, error.Error].err{made.err}; }
+    for {
+        skip(p);
+        if (p.pos >= p.len)       { ret broken[object.Object](p); }
+        if (p.data[p.pos] == ']') { brk; }
+        val item: res[object.Object, error.Error] = value(p);
+        if (sel item.err) { ret item; }
+        val pushed: err[error.Error] = object.push(made.ok, item.ok);
+        if (sel pushed.err) { ret res[object.Object, error.Error].err{pushed.err}; }
+    }
+    p.pos   = p.pos + 1;
+    p.depth = p.depth - 1;
+    ret res[object.Object, error.Error].ok{object.Object.array{made.ok}};
+}
+
+fun before(a: object.Name, b: object.Name) i32 {
+    var i: usize = 0;
+    for (i < a.len && i < b.len) {
+        if (a.data[i] != b.data[i]) {
+            if (a.data[i] < b.data[i]) { ret -1; }
+            ret 1;
+        }
+        i = i + 1;
+    }
+    if (a.len == b.len) { ret 0; }
+    if (a.len < b.len)  { ret -1; }
+    ret 1;
+}
+
+# the order of a dictionary's keys, by a stable merge sort, so finding a key
+# held twice is o(n log n) and a hostile dictionary cannot make it quadratic
+fun sorted(p: *Parser, d: *object.Dict) res[*usize, error.Error] {
+    val n:   usize                        = d.entries.len;
+    val got: res[*usize, allocator.Error] = allocator.allocate[usize](p.a, n * 2);
+    if (sel got.err) { ret refused[*usize](got.err); }
+    var order: *usize = got.ok;
+    var spare: *usize = ?got.ok[n];
+    var i:     usize  = 0;
+    for (i < n) {
+        order[i] = i;
+        i        = i + 1;
+    }
+    var width: usize = 1;
+    for (width < n) {
+        var lo: usize = 0;
+        for (lo < n) {
+            var mid: usize = lo + width;
+            var hi:  usize = lo + width * 2;
+            if (mid > n) { mid = n; }
+            if (hi > n)  { hi = n; }
+            var l: usize = lo;
+            var r: usize = mid;
+            var k: usize = lo;
+            for (k < hi) {
+                if (r >= hi || (l < mid && before(d.entries.data[order[l]].key, d.entries.data[order[r]].key) <= 0)) {
+                    spare[k] = order[l];
+                    l        = l + 1;
+                }
+                or {
+                    spare[k] = order[r];
+                    r        = r + 1;
+                }
+                k = k + 1;
+            }
+            lo = hi;
+        }
+        val swap: *usize = order;
+        order = spare;
+        spare = swap;
+        width = width * 2;
+    }
+    ret res[*usize, error.Error].ok{order};
+}
+
+val SMALL: usize = 16;
+
+# whether a dictionary holds a key twice; when not strict, every entry but a
+# key's last is dropped
+fun repeated(p: *Parser, d: *object.Dict) res[bool, error.Error] {
+    val n: usize = d.entries.len;
+    if (n < 2) { ret res[bool, error.Error].ok{false}; }
+    var small: [SMALL]u8;
+    var drop:  *u8  = ?small[0];
+    var found: bool = false;
+    if (n <= SMALL) {
+        memory.zero[u8](drop, SMALL);
+        var i: usize = 0;
+        for (i < n) {
+            var j: usize = i + 1;
+            for (j < n) {
+                if (before(d.entries.data[i].key, d.entries.data[j].key) == 0) {
+                    drop[i] = 1;
+                    found   = true;
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+    or {
+        val order: res[*usize, error.Error] = sorted(p, d);
+        if (sel order.err) { ret res[bool, error.Error].err{order.err}; }
+        val marks: res[*u8, allocator.Error] = allocator.zallocate[u8](p.a, n);
+        if (sel marks.err) { ret refused[bool](marks.err); }
+        drop = marks.ok;
+        # the sort is stable, so equal keys sit in file order and the last is kept
+        var i: usize = 1;
+        for (i < n) {
+            if (before(d.entries.data[order.ok[i - 1]].key, d.entries.data[order.ok[i]].key) == 0) {
+                drop[order.ok[i - 1]] = 1;
+                found                 = true;
+            }
+            i = i + 1;
+        }
+    }
+    if (!found || p.strict) { ret res[bool, error.Error].ok{found}; }
+    var kept: usize = 0;
+    var k:    usize = 0;
+    for (k < n) {
+        if (drop[k] == 0) {
+            d.entries.data[kept] = d.entries.data[k];
+            kept                 = kept + 1;
+        }
+        k = k + 1;
+    }
+    d.entries.len = kept;
+    ret res[bool, error.Error].ok{true};
+}
+
+fun remove(d: *object.Dict, index: usize) {
+    var i: usize = index;
+    for (i + 1 < d.entries.len) {
+        d.entries.data[i] = d.entries.data[i + 1];
+        i                 = i + 1;
+    }
+    d.entries.len = d.entries.len - 1;
+}
+
+fun dict(p: *Parser) res[*object.Dict, error.Error] {
+    val deeper: err[error.Error] = nested(p);
+    if (sel deeper.err) { ret res[*object.Dict, error.Error].err{deeper.err}; }
+    val start: usize = p.pos;
+    p.pos = p.pos + 2;
+    val made: res[*object.Dict, error.Error] = object.dict(p.a);
+    if (sel made.err) { ret made; }
+    for {
+        skip(p);
+        if (p.pos >= p.len) { ret broken[*object.Dict](p); }
+        if (p.data[p.pos] == '>') {
+            if (p.pos + 1 < p.len && p.data[p.pos + 1] == '>') { brk; }
+            ret broken[*object.Dict](p);
+        }
+        if (p.data[p.pos] != '/') { ret broken[*object.Dict](p); }
+        val key: res[object.Name, error.Error] = name(p);
+        if (sel key.err) { ret res[*object.Dict, error.Error].err{key.err}; }
+        skip(p);
+        val item: res[object.Object, error.Error] = value(p);
+        if (sel item.err) { ret res[*object.Dict, error.Error].err{item.err}; }
+        val pushed: res[usize, allocator.Error] = vector.push[object.Entry](?made.ok.entries,
+            object.Entry{key: key.ok, value: item.ok});
+        if (sel pushed.err) { ret refused[*object.Dict](pushed.err); }
+    }
+    p.pos   = p.pos + 2;
+    p.depth = p.depth - 1;
+    # a key held twice is refused when strict and keeps its last value when not
+    val twice: res[bool, error.Error] = repeated(p, made.ok);
+    if (sel twice.err) { ret res[*object.Dict, error.Error].err{twice.err}; }
+    if (twice.ok && p.strict) {
+        p.pos = start;
+        ret broken[*object.Dict](p);
+    }
+    ret made;
+}
+
+# parse one direct object at the position, after any whitespace
+#
+# a stream is only an indirect object's value: `indirect` parses streams.
+# ---
+# p:   the parser
+# ret: the object, `malformed` at the offending byte, `limit` past max_depth,
+#      or the allocator's refusal
+pub fun value(p: *Parser) res[object.Object, error.Error] {
+    skip(p);
+    if (p.pos >= p.len) { ret broken[object.Object](p); }
+    val c: u8 = p.data[p.pos];
+    if (c == '/') {
+        val n: res[object.Name, error.Error] = name(p);
+        if (sel n.err) { ret res[object.Object, error.Error].err{n.err}; }
+        ret res[object.Object, error.Error].ok{object.Object.name{n.ok}};
+    }
+    if (c == '(') { ret literal(p); }
+    if (c == '<') {
+        if (p.pos + 1 < p.len && p.data[p.pos + 1] == '<') {
+            val d: res[*object.Dict, error.Error] = dict(p);
+            if (sel d.err) { ret res[object.Object, error.Error].err{d.err}; }
+            ret res[object.Object, error.Error].ok{object.Object.dict{d.ok}};
+        }
+        ret hex(p);
+    }
+    if (c == '[')                                                   { ret array(p); }
+    if ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.') { ret number(p); }
+    if (keyword(p, "true"))                                         { ret res[object.Object, error.Error].ok{object.boolean(true)}; }
+    if (keyword(p, "false"))                                        { ret res[object.Object, error.Error].ok{object.boolean(false)}; }
+    if (keyword(p, "null"))                                         { ret res[object.Object, error.Error].ok{object.null()}; }
+    ret broken[object.Object](p);
+}
+
+fun named(p: *Parser, n: object.Name) res[object.Filter, error.Error] {
+    var i: usize = 0;
+    for (i < p.filters_len) {
+        val f: object.Filter = p.filters[i];
+        if (object.name_is(n, f.name)) { ret res[object.Filter, error.Error].ok{f}; }
+        i = i + 1;
+    }
+    val built: opt[object.Filter] = filter.known(n);
+    if (sel built.some) { ret res[object.Filter, error.Error].ok{built.some}; }
+    # a filter this library cannot run keeps its name so the stream stays encoded under it
+    val text: res[*u8, allocator.Error] = allocator.allocate[u8](p.a, n.len + 1);
+    if (sel text.err) { ret refused[object.Filter](text.err); }
+    if (n.len > 0)    { memory.copy[u8](text.ok, n.data, n.len); }
+    text.ok[n.len] = 0;
+    ret res[object.Filter, error.Error].ok{object.Filter{name: text.ok, ctx: nil, encode: nil, decode: nil}};
+}
+
+fun parm(value: object.Object) bool {
+    ret sel value.null || sel value.dict || sel value.reference;
+}
+
+# the filters a stream dictionary names, moved out of it into the stream
+fun filters(p: *Parser, s: *object.Stream) err[error.Error] {
+    val listed: opt[*object.Object] = object.get(s.dict, "Filter");
+    var names:  object.Object       = object.null();
+    if (sel listed.some) { names = @listed.some; }
+    val given: opt[*object.Object] = object.get(s.dict, "DecodeParms");
+    var parms: object.Object       = object.null();
+    if (sel given.some) { parms = @given.some; }
+    var count: usize = 0;
+    if (sel names.name) {
+        count = 1;
+    }
+    or (sel names.array) {
+        count = names.array.items.len;
+    }
+    or (!sel names.null) {
+        ret err[error.Error].err{failure(p)};
+    }
+    var i: usize = 0;
+    for (i < count) {
+        var n: object.Object = names;
+        if (sel names.array) { n = names.array.items.data[i]; }
+        if (!sel n.name)     { ret err[error.Error].err{failure(p)}; }
+        var with: object.Object = object.null();
+        if (sel parms.array) {
+            if (i < parms.array.items.len) {
+                with = parms.array.items.data[i];
+            }
+            or (p.strict) {
+                ret err[error.Error].err{failure(p)};
+            }
+        }
+        or (count == 1) {
+            with = parms;
+        }
+        or (p.strict && !sel parms.null) {
+            ret err[error.Error].err{failure(p)};
+        }
+        if (!parm(with)) {
+            if (p.strict) { ret err[error.Error].err{failure(p)}; }
+            with = object.null();
+        }
+        val f: res[object.Filter, error.Error] = named(p, n.name);
+        if (sel f.err) { ret err[error.Error].err{f.err}; }
+        val pushed: err[error.Error] = object.filter_with(s, f.ok, with);
+        if (sel pushed.err) { ret pushed; }
+        i = i + 1;
+    }
+    if (sel parms.array) {
+        if (p.strict && parms.array.items.len != count) { ret err[error.Error].err{failure(p)}; }
+    }
+    var k: usize = 0;
+    for (k < s.dict.entries.len) {
+        val key: object.Name = s.dict.entries.data[k].key;
+        if (object.name_is(key, "Length") || object.name_is(key, "Filter") || object.name_is(key, "DecodeParms")) {
+            remove(s.dict, k);
+            cnt;
+        }
+        k = k + 1;
+    }
+    ret err[error.Error].ok{};
+}
+
+fun endstream_at(p: *Parser, from: usize) opt[usize] {
+    var at: usize = from;
+    for (at < p.len && space(p.data[at])) { at = at + 1; }
+    val n: usize = 9;
+    if (p.len - at < n)                                             { ret opt[usize].none{}; }
+    if (!memory.raw_equal((?p.data[at])::ptr, "endstream"::ptr, n)) { ret opt[usize].none{}; }
+    ret opt[usize].some{at + n};
+}
+
+# the end of a stream's data found by its endstream keyword, for a /Length
+# lenient mode does not trust
+fun scan(p: *Parser, start: usize) opt[usize] {
+    var at: usize = start;
+    for (at + 9 <= p.len) {
+        if (p.data[at] == 'e' && memory.raw_equal((?p.data[at])::ptr, "endstream"::ptr, 9)) {
+            var end: usize = at;
+            if (end > start && p.data[end - 1] == '\n') { end = end - 1; }
+            if (end > start && p.data[end - 1] == '\r') { end = end - 1; }
+            ret opt[usize].some{end};
+        }
+        at = at + 1;
+    }
+    ret opt[usize].none{};
+}
+
+fun length(p: *Parser, d: *object.Dict) res[opt[i64], error.Error] {
+    val found: opt[*object.Object] = object.get(d, "Length");
+    if (!sel found.some) { ret res[opt[i64], error.Error].ok{opt[i64].none{}}; }
+    val held: object.Object = @found.some;
+    if (sel held.integer) { ret res[opt[i64], error.Error].ok{opt[i64].some{held.integer}}; }
+    if (sel held.reference) {
+        if (sel p.lengths.some) {
+            val via: Lengths = p.lengths.some;
+            ret via.length(via.ctx, held.reference);
+        }
+    }
+    ret res[opt[i64], error.Error].ok{opt[i64].none{}};
+}
+
+fun stream(p: *Parser, d: *object.Dict) res[object.Object, error.Error] {
+    if (p.pos + 1 < p.len && p.data[p.pos] == '\r' && p.data[p.pos + 1] == '\n') {
+        p.pos = p.pos + 2;
+    }
+    or (p.pos < p.len && p.data[p.pos] == '\n') {
+        p.pos = p.pos + 1;
+    }
+    or (p.strict) {
+        ret broken[object.Object](p);
+    }
+    or (p.pos < p.len && p.data[p.pos] == '\r') {
+        p.pos = p.pos + 1;
+    }
+    val start: usize                      = p.pos;
+    val told:  res[opt[i64], error.Error] = length(p, d);
+    if (sel told.err) { ret res[object.Object, error.Error].err{told.err}; }
+    var end:   opt[usize] = opt[usize].none{};
+    var after: usize      = 0;
+    if (sel told.ok.some) {
+        val n: i64 = told.ok.some;
+        if (n >= 0 && n::u64 <= (p.len - start)::u64) {
+            val closed: opt[usize] = endstream_at(p, start + n::usize);
+            if (sel closed.some) {
+                end   = opt[usize].some{start + n::usize};
+                after = closed.some;
+            }
+        }
+    }
+    if (!sel end.some) {
+        if (p.strict) { ret broken[object.Object](p); }
+        val found: opt[usize] = scan(p, start);
+        if (!sel found.some) { ret broken[object.Object](p); }
+        val closed: opt[usize] = endstream_at(p, found.some);
+        if (!sel closed.some) { ret broken[object.Object](p); }
+        end   = found;
+        after = closed.some;
+    }
+    var stop: usize = 0;
+    if (sel end.some) { stop = end.some; }
+    val made: res[*object.Stream, allocator.Error] = allocator.zallocate[object.Stream](p.a, 1);
+    if (sel made.err) { ret refused[object.Object](made.err); }
+    val s: *object.Stream = made.ok;
+    s.dict    = d;
+    s.data    = vector.init[u8](p.a);
+    s.filters = vector.init[object.Applied](p.a);
+    s.encoded = true;
+    val room: res[usize, allocator.Error] = vector.reserve[u8](?s.data, stop - start);
+    if (sel room.err) { ret refused[object.Object](room.err); }
+    if (stop > start) { memory.copy[u8](s.data.data, ?p.data[start], stop - start); }
+    s.data.len = stop - start;
+    val listed: err[error.Error] = filters(p, s);
+    if (sel listed.err) { ret res[object.Object, error.Error].err{listed.err}; }
+    p.pos = after;
+    ret res[object.Object, error.Error].ok{object.Object.stream{s}};
+}
+
+# parse an indirect object definition at the position, after any whitespace,
+# `number generation obj ... endobj`, with a stream when its value is one
+# ---
+# p:   the parser
+# ret: the object and the reference the file gives it, `malformed` at the
+#      offending byte, `limit` past max_depth, why an indirect /Length could
+#      not be found, or the allocator's refusal
+pub fun indirect(p: *Parser) res[Indirect, error.Error] {
+    skip(p);
+    var number:     u64 = 0;
+    var generation: u64 = 0;
+    if (!unsigned(p, ?number)) { ret broken[Indirect](p); }
+    skip(p);
+    if (!unsigned(p, ?generation)) { ret broken[Indirect](p); }
+    skip(p);
+    if (number > 0xffffffff || generation > 0xffff || !keyword(p, "obj")) { ret broken[Indirect](p); }
+    val target: object.Ref                      = object.Ref{number: number::u32, generation: generation::u16};
+    val held:   res[object.Object, error.Error] = value(p);
+    if (sel held.err) { ret res[Indirect, error.Error].err{held.err}; }
+    val parsed: object.Object = held.ok;
+    var result: object.Object = parsed;
+    skip(p);
+    if (sel parsed.dict) {
+        if (keyword(p, "stream")) {
+            val s: res[object.Object, error.Error] = stream(p, parsed.dict);
+            if (sel s.err) { ret res[Indirect, error.Error].err{s.err}; }
+            result = s.ok;
+            skip(p);
+        }
+    }
+    if (!keyword(p, "endobj") && p.strict) { ret broken[Indirect](p); }
+    ret res[Indirect, error.Error].ok{Indirect{target: target, value: result}};
+}
+
+$if (capability.HOSTED) {
+    use std.allocator.page;
+
+    fun parsed(a: *allocator.Allocator, text: str) res[object.Object, error.Error] {
+        var p: Parser = init(text, str_len(text), a);
+        ret value(?p);
+    }
+
+    fun malformed_at(outcome: res[object.Object, error.Error], offset: usize) bool {
+        if (!sel outcome.err) { ret false; }
+        val cause: error.Error = outcome.err;
+        ret sel cause.malformed && cause.malformed == offset;
+    }
+
+    fun real_is(o: object.Object, mantissa: i64, places: u8) bool {
+        if (!sel o.real) { ret false; }
+        ret o.real.mantissa == mantissa && o.real.places == places;
+    }
+
+    fun bytes_are(s: object.String, expected: str, len: usize) bool {
+        if (s.len != len) { ret false; }
+        if (len == 0)     { ret true; }
+        ret memory.raw_equal(s.data::ptr, expected::ptr, len);
+    }
+
+    test value__reads_each_kind {
+        var a: allocator.Allocator;
+        page.make(?a);
+        val got: res[object.Object, error.Error] = parsed(?a,
+            "<< /A [1 -2 +3 4. -.5 0.125 12 0 R 7 true false null] /B#20c (x\\(y\\)\\n\\101\\\n) /H <4a 4> %c\n/E <<>> >>");
+        if (sel got.err) { ret 1; }
+        val top: object.Object = got.ok;
+        if (!sel top.dict)             { ret 2; }
+        if (top.dict.entries.len != 4) { ret 3; }
+        val list: object.Object = top.dict.entries.data[0].value;
+        if (!sel list.array)            { ret 4; }
+        if (list.array.items.len != 11) { ret 4; }
+        val items: *object.Object = list.array.items.data;
+        if (!(sel items[0].integer && items[0].integer == 1))             { ret 5; }
+        if (!(sel items[1].integer && items[1].integer == -2))            { ret 6; }
+        if (!(sel items[2].integer && items[2].integer == 3))             { ret 7; }
+        if (!real_is(items[3], 4, 0))                                     { ret 8; }
+        if (!real_is(items[4], -5, 1))                                    { ret 9; }
+        if (!real_is(items[5], 125, 3))                                   { ret 10; }
+        if (!(sel items[6].reference && items[6].reference.number == 12)) { ret 11; }
+        if (!(sel items[7].integer && items[7].integer == 7))             { ret 12; }
+        if (!(sel items[8].boolean && items[8].boolean == true))          { ret 13; }
+        if (!(sel items[9].boolean && items[9].boolean == false))         { ret 14; }
+        if (!sel items[10].null)                                          { ret 14; }
+        if (!object.name_is(top.dict.entries.data[1].key, "B c"))         { ret 15; }
+        val text: object.Object = top.dict.entries.data[1].value;
+        if (!(sel text.string && bytes_are(text.string, "x(y)\nA", 6))) { ret 16; }
+        val h: object.Object = top.dict.entries.data[2].value;
+        if (!sel h.string)                                   { ret 17; }
+        if (!(h.string.hex && bytes_are(h.string, "J@", 2))) { ret 17; }
+        ret 0;
+    }
+
+    test value__refuses_malformed_input_where_it_breaks {
+        var a: allocator.Allocator;
+        page.make(?a);
+        if (!malformed_at(parsed(?a, "[1 2"), 4))                 { ret 1; }
+        if (!malformed_at(parsed(?a, "<< 1 2 >>"), 3))            { ret 2; }
+        if (!malformed_at(parsed(?a, "(open"), 0))                { ret 3; }
+        if (!malformed_at(parsed(?a, "<4g>"), 2))                 { ret 4; }
+        if (!malformed_at(parsed(?a, "/a#2"), 2))                 { ret 5; }
+        if (!malformed_at(parsed(?a, "<< /A 1 /A 2 >>"), 0))      { ret 6; }
+        if (!malformed_at(parsed(?a, "99999999999999999999"), 0)) { ret 7; }
+        if (!malformed_at(parsed(?a, "nope"), 0))                 { ret 8; }
+        if (!malformed_at(parsed(?a, "1x"), 1))                   { ret 9; }
+        ret 0;
+    }
+
+    test value__bounds_nesting {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var deep: [130]u8;
+        var i:    usize = 0;
+        for (i < 129) {
+            deep[i] = '[';
+            i       = i + 1;
+        }
+        deep[129] = 0;
+        var p:   Parser                          = init(?deep[0], 129, ?a);
+        val got: res[object.Object, error.Error] = value(?p);
+        if (!(sel got.err && sel got.err.limit)) { ret 1; }
+        ret 0;
+    }
+
+    test indirect__reads_a_stream_by_its_length_and_names_its_filters {
+        var a: allocator.Allocator;
+        page.make(?a);
+        val text: str                        = "4 1 obj\n<< /Length 5 /Filter [/ASCIIHexDecode /JBIG2Decode] /DecodeParms [null << /K 1 >>] /T /X >>\nstream\r\n6869>\nendstream\nendobj\n";
+        var p:    Parser                     = init(text, str_len(text), ?a);
+        val got:  res[Indirect, error.Error] = indirect(?p);
+        if (sel got.err)                                                { ret 1; }
+        if (got.ok.target.number != 4 || got.ok.target.generation != 1) { ret 2; }
+        val held: object.Object = got.ok.value;
+        if (!sel held.stream) { ret 3; }
+        val s: *object.Stream = held.stream;
+        if (s.data.len != 5 || !s.encoded)          { ret 4; }
+        if (s.dict.entries.len != 1)                { ret 5; }
+        if (s.filters.len != 2)                     { ret 6; }
+        if (s.filters.data[0].filter.decode == nil) { ret 7; }
+        if (s.filters.data[1].filter.decode != nil) { ret 8; }
+        if (!sel s.filters.data[1].parms.dict)      { ret 9; }
+        if (p.pos != str_len(text) - 1)             { ret 10; }
+
+        val wrong:  str                        = "1 0 obj\n<< /Length 9 >>\nstream\nabc\nendstream\nendobj";
+        var q:      Parser                     = init(wrong, str_len(wrong), ?a);
+        val strict: res[Indirect, error.Error] = indirect(?q);
+        if (!(sel strict.err && sel strict.err.malformed)) { ret 11; }
+        var r: Parser = init(wrong, str_len(wrong), ?a);
+        r.strict = false;
+        val lenient: res[Indirect, error.Error] = indirect(?r);
+        if (sel lenient.err) { ret 12; }
+        val kept: object.Object = lenient.ok.value;
+        if (!(sel kept.stream && kept.stream.data.len == 3)) { ret 13; }
+        ret 0;
+    }
+}

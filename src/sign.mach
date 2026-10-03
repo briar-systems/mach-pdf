@@ -1,0 +1,246 @@
+# signing a signature field as an incremental update (pades baseline b-b,
+# etsi en 319 142-1)
+#
+# `sign` gives an unsigned signature field a signature dictionary as its /V in
+# an update appended after the file's bytes. the dictionary's /ByteRange and
+# /Contents are reservations: once the update is written the byte range is
+# filled from where /Contents landed, the two ranges either side of it are
+# hashed, and the detached cms signed data mach-pki builds over that digest is
+# filled into /Contents as a hexadecimal string padded with zero bytes. the
+# signed attributes carry signing-certificate-v2 and no signing-time, as pades
+# asks: the claimed time is the dictionary's /M, and only when the caller
+# gives one. nothing reads a clock, so the same file, field, time and a
+# deterministic signer give the same bytes.
+#
+# the later levels extend this path without changing it. b-t adds an rfc 3161
+# time-stamp token over the signature as an unsigned attribute through
+# `cms.attach_unsigned` before /Contents is filled, so its reservation grows
+# by the token's size. b-lt is a further update that adds the catalog's /DSS
+# with the certificates, ocsp responses and crls, and a document time-stamp
+# is one more signature dictionary of /Type /DocTimeStamp over the same kind
+# of byte range. verification already allows both kinds of update.
+
+use crypto.contracts;
+use pki.cms;
+use contract: pki.signer;
+use pki.x509;
+use std.allocator;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use pdf.date;
+use pdf.document;
+use pdf.error;
+use pdf.form;
+use pdf.object;
+use pdf.output;
+use pdf.syntax;
+
+# the signature handler pades names
+pub val FILTER: str = "Adobe.PPKLite";
+
+# the signature encoding pades names: detached cades signed data
+pub val SUBFILTER: str = "ETSI.CAdES.detached";
+
+# the bytes a /ByteRange reservation holds: four offsets of up to 20 digits
+val RANGE_WIDTH: usize = 85;
+
+# the /SigFlags of a signed document: signatures exist, and the file is only
+# ever appended to (iso 32000-2 table 225)
+val SIGNED_FLAGS: i64 = 3;
+
+# what to sign and how
+# ---
+# field:     the signature field's fully qualified name, such as "signature"
+# signer:    the key that signs, which mach-pki's signer contract hides
+# algorithm: the signature algorithm, x509.SIGNATURE_NONE for the signer's
+#            first
+# time:      the claimed signing time written as /M, none to leave it out
+pub rec Spec {
+    field:     str;
+    signer:    *contract.Signer;
+    algorithm: x509.SignatureAlgorithm;
+    time:      opt[date.Date];
+}
+
+fun refusal(made: cms.Result) error.Error {
+    ret error.Error.signing{error.Signing{cms: made.error, signer: made.signer}};
+}
+
+fun refused(made: cms.Result) err[error.Error] {
+    ret err[error.Error].err{refusal(made)};
+}
+
+fun digested(failed: contracts.Error) err[error.Error] {
+    if (failed == contracts.OK) { ret err[error.Error].ok{}; }
+    ret err[error.Error].err{error.Error.signing{error.Signing{cms: cms.INVALID_INPUT, signer: contract.OK}}};
+}
+
+# the cms options for a digest under the spec's algorithm
+fun options(algorithm: x509.SignatureAlgorithm, digest: *u8, len: usize) cms.Options {
+    var o: cms.Options;
+    o.algorithm      = algorithm;
+    o.form           = cms.DETACHED_DIGEST;
+    o.content_digest = contracts.Bytes{data: digest, len: len};
+    ret o;
+}
+
+# the size of the signed data the signer can make, measured without signing
+fun measure(spec: *Spec, algorithm: x509.SignatureAlgorithm) res[usize, error.Error] {
+    var zeros: [cms.MAX_DIGEST_SIZE]u8;
+    val len:   usize       = cms.digest_size(cms.digest_algorithm(algorithm));
+    var o:     cms.Options = options(algorithm, ?zeros[0], len);
+    val made:  cms.Result  = cms.build(spec.signer, ?o, contracts.Buffer{data: nil, capacity: 0});
+    if (made.error != cms.OUTPUT_TOO_SMALL) {
+        ret res[usize, error.Error].err{refusal(made)};
+    }
+    ret res[usize, error.Error].ok{made.written};
+}
+
+# the claimed time as a pdf date string
+fun when(a: *allocator.Allocator, d: date.Date) res[object.Object, error.Error] {
+    var spelled: output.Output = output.init(a);
+    fin { output.dnit(?spelled); }
+    val wrote: err[error.Error] = date.pdf(?spelled, d);
+    if (sel wrote.err) { ret res[object.Object, error.Error].err{wrote.err}; }
+    val status: err[error.Error] = output.status(?spelled);
+    if (sel status.err) { ret res[object.Object, error.Error].err{status.err}; }
+    ret object.string(a, output.data(?spelled), output.offset(?spelled));
+}
+
+# mark the form append-only, as a signed document is
+fun flag(doc: *document.Document) err[error.Error] {
+    val root: res[*object.Dict, error.Error] = document.catalog(doc);
+    if (sel root.err) { ret err[error.Error].err{root.err}; }
+    val held: opt[*object.Object] = object.get(root.ok, "AcroForm");
+    if (!sel held.some) { ret err[error.Error].err{error.Error.invalid{}}; }
+    val link:  object.Object                   = @held.some;
+    val found: res[object.Object, error.Error] = document.deref(doc, link);
+    if (sel found.err) { ret err[error.Error].err{found.err}; }
+    val acroform: object.Object = found.ok;
+    if (!sel acroform.dict) { ret err[error.Error].err{error.Error.invalid{}}; }
+    val flags: opt[*object.Object] = object.get(acroform.dict, "SigFlags");
+    if (sel flags.some) {
+        val value: object.Object = @flags.some;
+        if (sel value.integer && value.integer == SIGNED_FLAGS) { ret err[error.Error].ok{}; }
+    }
+    val set: err[error.Error] = object.set(acroform.dict, "SigFlags", object.integer(SIGNED_FLAGS));
+    if (sel set.err)        { ret set; }
+    if (sel link.reference) { ret document.touch(doc, link.reference); }
+    if (sel doc.root.some)  { ret document.touch(doc, doc.root.some); }
+    ret err[error.Error].err{error.Error.invalid{}};
+}
+
+fun hash(digest: *cms.Digest, bytes: *u8, len: usize) err[error.Error] {
+    ret digested(cms.digest_update(digest, contracts.Bytes{data: bytes, len: len}));
+}
+
+# sign a document's unsigned signature field in an update appended to out
+#
+# the document is one read from the file whose bytes out holds, unchanged
+# since. on failure out may hold a partial update, so the caller starts over
+# from the file.
+# ---
+# doc:  the document, read from the file
+# out:  the output holding the file's bytes, which the update is appended to
+# spec: what to sign and how
+# ret:  ok, `invalid` for a name that names no signature field or one already
+#       signed, `signing` with mach-pki's reasons, a writing failure, or the
+#       allocator's refusal
+pub fun sign(doc: *document.Document, out: *output.Output, spec: *Spec) err[error.Error] {
+    val a: *allocator.Allocator = document.objects(doc);
+    if (spec == nil || spec.signer == nil) { ret err[error.Error].err{error.Error.invalid{}}; }
+    val found: res[form.Found, error.Error] = form.find(doc, a, spec.field);
+    if (sel found.err) { ret err[error.Error].err{found.err}; }
+    val field: form.Found = found.ok;
+    if (!object.name_is(field.type, "Sig")) { ret err[error.Error].err{error.Error.invalid{}}; }
+    val signed: opt[*object.Object] = object.get(field.dict, "V");
+    if (sel signed.some) { ret err[error.Error].err{error.Error.invalid{}}; }
+
+    var algorithm: x509.SignatureAlgorithm = spec.algorithm;
+    if (algorithm == x509.SIGNATURE_NONE) { algorithm = contract.algorithm(spec.signer, 0); }
+    val sized: res[usize, error.Error] = measure(spec, algorithm);
+    if (sel sized.err) { ret err[error.Error].err{sized.err}; }
+    val size: usize = sized.ok;
+
+    # the reservation's initial value is the zeros the signed data is padded with
+    val blank: res[*u8, allocator.Error] = allocator.zallocate[u8](a, size);
+    if (sel blank.err) { ret err[error.Error].err{error.from_allocator(blank.err)}; }
+    val zeros: res[object.Object, error.Error] = object.hex_string(a, blank.ok, size);
+    if (sel zeros.err) { ret err[error.Error].err{zeros.err}; }
+    val contents: res[*object.Reserved, error.Error] = object.reserve(a, size * 2 + 2, zeros.ok);
+    if (sel contents.err) { ret err[error.Error].err{contents.err}; }
+    val empty: res[*object.Array, error.Error] = object.array(a);
+    if (sel empty.err) { ret err[error.Error].err{empty.err}; }
+    val range: res[*object.Reserved, error.Error] = object.reserve(a, RANGE_WIDTH, object.Object.array{empty.ok});
+    if (sel range.err) { ret err[error.Error].err{range.err}; }
+
+    val d: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel d.err) { ret err[error.Error].err{d.err}; }
+    val shaped: err[error.Error] = error.first(
+        object.set_name(d.ok, "Type", "Sig"),
+        object.set_name(d.ok, "Filter", FILTER),
+        object.set_name(d.ok, "SubFilter", SUBFILTER));
+    if (sel shaped.err) { ret shaped; }
+    if (sel spec.time.some) {
+        val m: res[object.Object, error.Error] = when(a, spec.time.some);
+        if (sel m.err) { ret err[error.Error].err{m.err}; }
+        val dated: err[error.Error] = object.set(d.ok, "M", m.ok);
+        if (sel dated.err) { ret dated; }
+    }
+    val spans: err[error.Error] = error.first(
+        object.set(d.ok, "ByteRange", object.Object.reserved{range.ok}),
+        object.set(d.ok, "Contents", object.Object.reserved{contents.ok}));
+    if (sel spans.err) { ret spans; }
+    val node: res[object.Ref, error.Error] = document.add(doc, object.Object.dict{d.ok});
+    if (sel node.err) { ret err[error.Error].err{node.err}; }
+    val linked: err[error.Error] = error.first(
+        object.set(field.dict, "V", object.reference(node.ok)),
+        document.touch(doc, field.node),
+        flag(doc));
+    if (sel linked.err) { ret linked; }
+
+    val appended: err[error.Error] = document.append(doc, out);
+    if (sel appended.err) { ret appended; }
+
+    # the range covers every byte but the /Contents string, its delimiters included
+    val gap:   usize                           = contents.ok.offset;
+    val after: usize                           = gap + contents.ok.width;
+    val end:   usize                           = output.offset(out);
+    val list:  res[*object.Array, error.Error] = object.array(a);
+    if (sel list.err) { ret err[error.Error].err{list.err}; }
+    val listed: err[error.Error] = error.first(
+        object.push(list.ok, object.integer(0)),
+        object.push(list.ok, object.integer(gap::i64)),
+        object.push(list.ok, object.integer(after::i64)),
+        object.push(list.ok, object.integer((end - after)::i64)));
+    if (sel listed.err) { ret listed; }
+    val ranged: err[error.Error] = syntax.fill(out, range.ok, object.Object.array{list.ok});
+    if (sel ranged.err) { ret ranged; }
+
+    var digest: cms.Digest;
+    val kind:   cms.DigestAlgorithm = cms.digest_algorithm(algorithm);
+    val bytes:  *u8                 = output.data(out);
+    val hashed: err[error.Error]    = error.first(
+        digested(cms.digest_init(?digest, kind)),
+        hash(?digest, bytes, gap),
+        hash(?digest, ?bytes[after], end - after));
+    if (sel hashed.err) { ret hashed; }
+    var value:    [cms.MAX_DIGEST_SIZE]u8;
+    val finished: contracts.Operation = cms.digest_final(?digest,
+        contracts.Buffer{data: ?value[0], capacity: cms.MAX_DIGEST_SIZE});
+    val closed: err[error.Error] = digested(finished.error);
+    if (sel closed.err) { ret closed; }
+
+    val held: res[*u8, allocator.Error] = allocator.zallocate[u8](document.objects(doc), size);
+    if (sel held.err) { ret err[error.Error].err{error.from_allocator(held.err)}; }
+    var o:    cms.Options = options(algorithm, ?value[0], finished.written);
+    val made: cms.Result  = cms.build(spec.signer, ?o, contracts.Buffer{data: held.ok, capacity: size});
+    if (made.error != cms.OK) { ret refused(made); }
+    val signature: res[object.Object, error.Error] = object.hex_string(a, held.ok, size);
+    if (sel signature.err) { ret err[error.Error].err{signature.err}; }
+    ret syntax.fill(out, contents.ok, signature.ok);
+}

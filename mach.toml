@@ -1,6 +1,6 @@
 [project]
 id = "pdf"
-version = "0.2.0"
+version = "0.3.0"
 mach = "^6.8"
 src = "src"
 out = "out/{target.name}/{profile.name}"
@@ -70,4 +70,8 @@ version = "^0.10"
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^9.0"
+version = "^9.5"
+
+[dep.pki]
+git = "https://github.com/briar-systems/mach-pki"
+version = "^0.2"

@@ -1,9 +1,9 @@
 # mach-pdf
 
-PDF for Mach (ISO 32000-2): an object model and a deterministic writer, with
-incremental updates and reserved spans for values written after the fact. It
-is a spec implementation with no knowledge of any document format above it,
-and it depends on mach-std only.
+PDF for Mach (ISO 32000-2): an object model, a deterministic writer and a
+reader, with incremental updates and reserved spans for values written after
+the fact, and PAdES signatures. It is a spec implementation with no knowledge of any document format above it,
+and it depends on mach-std, mach-font and mach-pki.
 
 ## Modules
 
@@ -12,13 +12,20 @@ and it depends on mach-std only.
   `Reserved` spans. Objects live in the allocator they were built with and copy
   what they are given.
 - `pdf.filter` is the stream filter contract. A stream lists its filters in
-  decode order and the writer encodes through them. `ascii_hex` is the one
-  encoder so far; FlateDecode drops in as another `Filter` once std has a
-  deflate compressor.
+  decode order, the writer encodes through them and `document.decoded` decodes
+  through them. `ascii_hex` encodes and decodes. `flate` encodes a zlib stream
+  through `std.compress.deflate` at `filter.FLATE_LEVEL` (6) with no
+  predictor, and decodes zlib data through `std.compress.zlib`, undoing PNG and
+  TIFF predictors. A decoder is given its decode
+  parameters with their references resolved and a limit on what it may
+  produce.
 - `pdf.document` numbers indirect objects, owns them in an arena, and saves
   the whole file (`save`) or an incremental update of what changed since
   (`append`), with a cross-reference table or stream. `rebase` starts from a
-  revision read from a file.
+  revision read from a file, and a `Source` loads that revision's objects the
+  first time `resolve` or `load` meets them.
+- `pdf.parse` reads objects from bytes into the object model.
+- `pdf.reader` reads a file into a document (see below).
 - `pdf.syntax` spells objects as bytes and fills a written reservation in
   place.
 - `pdf.output` is the file image the writer produces, kept in memory so every
@@ -39,6 +46,10 @@ and it depends on mach-std only.
   specification with its `/AFRelationship`, the catalog's `/EmbeddedFiles`
   name tree and its `/AF` array.
 - `pdf.pdfa` makes a document pdf/a-3b (see below).
+- `pdf.sign` signs a signature field as an incremental update, PAdES B-B
+  (see below).
+- `pdf.verify` verifies every signature in a file and judges each later
+  update (see below).
 - `pdf.error` is the failure every module reports.
 
 `use pdf;` binds `pdf.lib.pdf`, which re-exports these modules.
@@ -98,6 +109,16 @@ sample document in `src/test/sample.mach` byte for byte against the files in
 `src/test/golden/`, in both cross-reference forms, and the pdf/a-3b sample in
 `src/test/archive.mach` likewise.
 
+Streams the library builds are compressed with FlateDecode: content streams
+and appearance streams, font programs, `/CIDToGIDMap` and `/ToUnicode`
+streams, the icc profile, embedded files and cross-reference streams
+(`doc.xref_filters` starts with it). The compressor's output depends only on
+its input, the level and the zlib container, and the level is the one fixed
+`filter.FLATE_LEVEL`, so compression keeps every file byte for byte the same.
+The xmp metadata stream stays uncompressed, so a tool that does not read pdf
+can still find the packet, as the xmp specification (part 3) recommends. ISO 19005-3 allows a filter there but pdf/a-1 forbade one, and
+`pdfa.check` keeps requiring none.
+
 ## PDF/A-3b
 
 `pdfa.conform` writes the metadata once, the caller's description and its extra
@@ -150,6 +171,9 @@ which PDF/A forbids, so a date field puts its expected format in its tooltip
 
 A signature field is written unsigned, with no `/V`. Signing it is an
 incremental update that gives the field's dictionary (`Field.node`) a `/V`.
+`form.terminals` reads every terminal field of a document's field tree, such
+as one read from a file, with its fully qualified name and inherited `/FT`, and
+`form.find` the one a name names.
 
 `form.standard` is a face over a standard 14 font, which needs no embedding but
 is not allowed in PDF/A. `form.embedded` is a face over an embedded TrueType
@@ -188,9 +212,108 @@ sample sets its text and form field in it too.
 
 A `Reserved` object writes a fixed-width placeholder and records its byte
 offset when it is saved. Once the file is written, `syntax.fill` puts the real
-value in its place, padded with spaces. A signature reserves its `/Contents`
-and `/ByteRange` this way, computes the byte range from the recorded offsets,
-and fills both after hashing.
+value in its place, padded with spaces.
+
+`sign.sign` signs an unsigned signature field of a document read from a file,
+PAdES baseline B-B (ETSI EN 319 142-1). It appends an update giving the field
+a signature dictionary as its `/V` (`/Filter /Adobe.PPKLite`, `/SubFilter
+/ETSI.CAdES.detached`, `/M` when the caller gives a time) and marks the form
+append-only. The dictionary's `/ByteRange` and `/Contents` are reservations,
+`/Contents` sized to the signed data the signer can make, measured before it
+signs. Once the update is written the byte range is filled, the bytes either
+side of `/Contents` are hashed, and the detached CMS signed data mach-pki builds
+over that digest, with signing-certificate-v2 and no signing-time, is filled
+into `/Contents`. The signer is mach-pki's signer contract, so a key in memory,
+a token or a remote service signs the same way. Nothing reads a clock, so the
+same file, field, time and a deterministic signer give the same bytes.
+
+```mach
+var doc: document.Document;
+document.init(?doc, a);
+reader.read(?doc, data, len, reader.defaults());
+var out: output.Output = output.init(a);
+output.put(?out, data, len);
+# value is an open signer.Signer, such as key_signer.signer(?keyed)
+var spec: sign.Spec = sign.Spec{field: "owner.signature", signer: ?value,
+    algorithm: x509.SIGNATURE_NONE, time: opt[date.Date].some{now}};
+val signed: err[error.Error] = sign.sign(?doc, ?out, ?spec);
+```
+
+B-T and B-LT build on the same path. B-T attaches an RFC 3161 time-stamp
+token over the signature with `cms.attach_unsigned` before `/Contents` is
+filled, with the reservation grown by the token's size. B-LT is a later update
+adding the catalog's `/DSS` with certificates, OCSP responses and CRLs, and a
+document time-stamp is one more signature dictionary of `/Type
+/DocTimeStamp`. Verification already allows both kinds of update.
+
+`verify.verify` reads a file's revisions (`reader.history`) and judges every
+signed signature field: its byte range starts the file, leaves out exactly its
+`/Contents` string and ends where a revision ends, its signed data verifies
+over that range with its certificate path validated against the caller's trust
+store, and every later update changes only what the document permits. An
+update may add objects, and may change the catalog's `/DSS` and
+`/Extensions`, the security store, the form's `/SigFlags`, `/DR` and new
+signature fields, a field's or widget's `/V`, `/AP` and `/AS` (a signature's
+`/V` only from absent), a page's `/Annots` and the annotations on it. A
+certifying signature's `/DocMDP` permission narrows that: 1 allows only the
+security store, 2 adds form filling and signing, and 3 or no `/DocMDP` adds
+annotations. Field locks are not read. `verify.valid` says whether a signature
+passed every check, and the report keeps each check and each update's verdict.
+
+`src/test/signatures.mach` signs the sample form, and a form with two
+signature fields by two signers in turn, compares both with the golden files,
+verifies them, and checks that a byte changed after signing and an update
+changing the catalog are caught. The signers are the P-256 test keys in
+`src/test/fixtures/sign` (`generate.sh` remakes them), whose RFC 6979
+signatures are deterministic.
+
+## Reading
+
+`reader.read` parses the header, the cross-reference tables and streams back
+through the `/Prev` chain, hybrid files' `/XRefStm`, and the last trailer's
+`/Root`, `/Info` and `/ID`. It rebases the document on the file, so objects
+load from the file the first time they are resolved, object streams decode the
+first time one of their objects is, and the next save appends an incremental
+update after the file's bytes:
+
+```mach
+var doc: document.Document;
+document.init(?doc, a);
+val read: err[error.Error] = reader.read(?doc, data, len, reader.defaults());
+val root: res[*object.Dict, error.Error] = document.catalog(?doc);
+object.set(root.ok, "Lang", lang);
+document.touch(?doc, doc.root.some);
+# out starts with the file's len bytes at data
+val updated: err[error.Error] = document.append(?doc, ?out);
+```
+
+The file's bytes stay the caller's, and stay put until the document is done.
+`document.resolve` gives the object a reference names, `document.deref`
+follows a value that may be a reference, `document.load` gives the object a
+number holds whatever its generation, and `document.decoded` gives a stream's
+data with its filters undone. A stream read from a file keeps its data encoded
+under its filters, so an update that rewrites it copies it as it was. A filter
+this library has no decoder for keeps its name, and decoding through it is
+`decoder`. A caller adds decoders through `reader.Options.filters`.
+
+Reading is strict unless `reader.Options.strict` is false, which accepts a
+header after leading bytes, a missing `%%EOF`, a stream whose `/Length` is
+wrong, a key a dictionary holds twice (the last value wins), and loose
+cross-reference table rows. Either way the reader is bounded for hostile files:
+`max_depth` bounds nesting and loads inside loads, `max_objects` the highest
+`/Size`, `max_decoded` what a cross-reference or object stream decodes to, and
+`max_revisions` the `/Prev` chain. A file past a bound is `limit`, broken
+syntax is `malformed` with its byte offset, an object whose loading needs its
+own value is `cycle`, and an encrypted file is `encrypted`.
+
+`src/test/read.mach` reads every file the writer produces and the files in
+`src/test/fixtures/read` that Chrome's print to PDF, LibreOffice and pdfTeX
+wrote, plus a hand-built hybrid file, walks every object and stream, appends an
+update and reads it back.
+
+The fuzz lane in `test/fuzz` mutates a retained corpus of files and reads
+each, looking for a fault, a hang, or an accepted file that does not read back
+once updated. It runs locally, not in CI (see `test/fuzz/README.md`).
 
 ## Build
 
@@ -201,8 +324,8 @@ mach test . --all --timeout 5m
 ```
 
 `demo/sample` writes the sample document to two files, the pdf/a-3b sample to
-a third and the embedded font sample to a fourth, and `demo/fields` the sample form to one, the golden files the
-tests compare against. Check them with `qpdf --check` and a renderer
+a third and the embedded font sample to a fourth, `demo/fields` the sample form to one, and
+`demo/sign` the signed samples to two, the golden files the tests compare against. Check them with `qpdf --check` and a renderer
 (`pdftoppm`, `mutool`, pdf.js) after any change to the output:
 
 ```sh
@@ -214,6 +337,10 @@ mach build .
 
 The sample form should also fill in a viewer with a form API, such as MuPDF
 (`pymupdf`) or pdf.js: entering `owner.name` in one widget shows it in both.
+
+Check the signed samples with poppler's `pdfsig`, pyHanko
+(`pyhanko sign validate --trust src/test/fixtures/sign/root.pem`), EU DSS and
+Acrobat Reader with the test root trusted. These are local checks, not CI ones.
 
 ## Workflow
 

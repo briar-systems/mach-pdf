@@ -1,0 +1,141 @@
+# reading an untrusted file: the header, the cross-reference chain, every
+# object and every stream a built-in filter decodes, then an update appended
+# and read back
+#
+# the bounds are tighter than the reader's defaults so a mutated /Size or a
+# decompression bomb is answered with `limit` quickly; the reader's bounds are
+# what is under test, not their default values.
+
+use std.allocator;
+use std.allocator.page;
+use std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use pdf.document;
+use pdf.error;
+use pdf.object;
+use pdf.output;
+use pdf.reader;
+
+use fuzz.verdict;
+
+val OBJECTS: u32   = 65536;
+val DECODED: usize = 1048576;
+
+# the case of a failure, so outcomes tell failures apart but not their offsets
+fun code(e: error.Error) u64 {
+    if (sel e.exhausted)     { ret 1; }
+    if (sel e.invalid)       { ret 2; }
+    if (sel e.unset)         { ret 3; }
+    if (sel e.reservation)   { ret 4; }
+    if (sel e.encoder)       { ret 5; }
+    if (sel e.codec)         { ret 16 + (e.codec & 0xf)::u64; }
+    if (sel e.base)          { ret 6; }
+    if (sel e.nonconforming) { ret 7; }
+    if (sel e.font)          { ret 8; }
+    if (sel e.glyph)         { ret 9; }
+    if (sel e.malformed)     { ret 10; }
+    if (sel e.limit)         { ret 11; }
+    if (sel e.cycle)         { ret 12; }
+    if (sel e.encrypted)     { ret 13; }
+    if (sel e.decoder)       { ret 14; }
+    ret 15;
+}
+
+fun options() reader.Options {
+    var opts: reader.Options = reader.defaults();
+    opts.max_objects = OBJECTS;
+    opts.max_decoded = DECODED;
+    ret opts;
+}
+
+fun decodable(s: *object.Stream) bool {
+    var i: usize = 0;
+    for (i < s.filters.len) {
+        if (s.filters.data[i].filter.decode == nil) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# resolve every number and decode every stream, the outcome the set of
+# failures they met and how many of each succeeded
+fun walk(doc: *document.Document, a: *allocator.Allocator) u64 {
+    var failed:  u64   = 0;
+    var objects: usize = 0;
+    var streams: usize = 0;
+    var n:       u32   = 1;
+    for (n < document.size(doc)) {
+        val got: res[opt[document.Held], error.Error] = document.load(doc, n);
+        n = n + 1;
+        if (sel got.err) {
+            failed = failed | (1::u64 << (code(got.err) & 31));
+            cnt;
+        }
+        if (!sel got.ok.some) { cnt; }
+        objects = objects + 1;
+        val value: object.Object = got.ok.some.value;
+        if (!sel value.stream)        { cnt; }
+        if (!decodable(value.stream)) { cnt; }
+        val bytes: res[vector.Vector[u8], error.Error] = document.decoded(doc, value.stream, a, DECODED);
+        if (sel bytes.err) {
+            failed = failed | (1::u64 << (32 + (code(bytes.err) & 31)));
+            cnt;
+        }
+        var held: vector.Vector[u8] = bytes.ok;
+        vector.dnit[u8](?held);
+        streams = streams + 1;
+    }
+    val outcome: u64 = verdict.mix(failed, verdict.bucket(objects));
+    ret verdict.mix(outcome, verdict.bucket(streams) << 2);
+}
+
+# give the catalog a key and append the update, which must read back
+fun update(doc: *document.Document, a: *allocator.Allocator, data: *u8, len: usize) verdict.Verdict {
+    val root: res[*object.Dict, error.Error] = document.catalog(doc);
+    if (sel root.err)       { ret verdict.answered(verdict.mix(1 << 32, code(root.err))); }
+    if (!sel doc.root.some) { ret verdict.answered(2 << 32); }
+    val target: object.Ref       = doc.root.some;
+    val set:    err[error.Error] = object.set(root.ok, "MachFuzz", object.integer(1));
+    if (sel set.err) { ret verdict.answered(3 << 32); }
+    document.touch(doc, target);
+    var out: output.Output = output.init(a);
+    fin { output.dnit(?out); }
+    output.put(?out, data, len);
+    val appended: err[error.Error] = document.append(doc, ?out);
+    if (sel appended.err) { ret verdict.answered(verdict.mix(4 << 32, code(appended.err))); }
+    var again:   document.Document;
+    val started: err[error.Error] = document.init(?again, a);
+    if (sel started.err) { ret verdict.violated("reader: a document would not start"); }
+    fin { document.dnit(?again); }
+    val reread: err[error.Error] = reader.read(?again, output.data(?out), output.offset(?out), options());
+    if (sel reread.err) { ret verdict.violated("reader: an accepted file, updated by the writer, does not read back"); }
+    val back: res[*object.Dict, error.Error] = document.catalog(?again);
+    if (sel back.err) { ret verdict.violated("reader: an updated file's catalog does not resolve"); }
+    val key: opt[*object.Object] = object.get(back.ok, "MachFuzz");
+    if (!sel key.some) { ret verdict.violated("reader: an updated file lost the update"); }
+    ret verdict.answered(5 << 32);
+}
+
+pub fun answer(data: *u8, len: usize) verdict.Verdict {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, ?a);
+    if (sel started.err) { ret verdict.violated("reader: a document would not start"); }
+    fin { document.dnit(?doc); }
+    val read: err[error.Error] = reader.read(?doc, data, len, options());
+    if (sel read.err) { ret verdict.answered(code(read.err)); }
+    verdict.accept();
+    var outcome: u64 = verdict.mix(1 << 40, walk(?doc, ?a));
+    if (doc.xref_stream) { outcome = verdict.mix(outcome, 1 << 44); }
+    val updated: verdict.Verdict = update(?doc, ?a, data, len);
+    if (updated.finding) { ret updated; }
+    ret verdict.answered(verdict.mix(outcome, updated.outcome));
+}
