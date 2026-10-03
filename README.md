@@ -13,9 +13,10 @@ and it depends on mach-std only.
   what they are given.
 - `pdf.filter` is the stream filter contract. A stream lists its filters in
   decode order, the writer encodes through them and `document.decoded` decodes
-  through them. `ascii_hex` encodes and decodes. `flate` decodes zlib data
-  through `std.compress.zlib` and undoes PNG and TIFF predictors, and gains an
-  encoder once std has a deflate compressor. A decoder is given its decode
+  through them. `ascii_hex` encodes and decodes. `flate` encodes a zlib stream
+  through `std.compress.deflate` at `filter.FLATE_LEVEL` (6) with no
+  predictor, and decodes zlib data through `std.compress.zlib`, undoing PNG and
+  TIFF predictors. A decoder is given its decode
   parameters with their references resolved and a limit on what it may
   produce.
 - `pdf.document` numbers indirect objects, owns them in an arena, and saves
@@ -103,6 +104,16 @@ from zero, and every object has exactly one spelling. The tests compare the
 sample document in `src/test/sample.mach` byte for byte against the files in
 `src/test/golden/`, in both cross-reference forms, and the pdf/a-3b sample in
 `src/test/archive.mach` likewise.
+
+Streams the library builds are compressed with FlateDecode: content streams
+and appearance streams, font programs, `/CIDToGIDMap` and `/ToUnicode`
+streams, the icc profile, embedded files and cross-reference streams
+(`doc.xref_filters` starts with it). The compressor's output depends only on
+its input, the level and the zlib container, and the level is the one fixed
+`filter.FLATE_LEVEL`, so compression keeps every file byte for byte the same.
+The xmp metadata stream stays uncompressed, so a tool that does not read pdf
+can still find the packet, as the xmp specification (part 3) recommends. ISO 19005-3 allows a filter there but pdf/a-1 forbade one, and
+`pdfa.check` keeps requiring none.
 
 ## PDF/A-3b
 
