@@ -27,6 +27,9 @@ and it depends on mach-std only.
   and stroke, text positioning, font selection, strings and glyph runs.
 - `pdf.page` builds the page tree, pages, their content and font resources.
 - `pdf.font` adds standard 14 font dictionaries.
+- `pdf.text` writes text strings: ascii as it is, anything else as utf-16be.
+- `pdf.form` builds an AcroForm: groups, text, date and unsigned signature
+  fields, and their widgets with appearance streams.
 - `pdf.error` is the failure every module reports.
 
 `use pdf;` binds `pdf.lib.pdf`, which re-exports these modules.
@@ -85,6 +88,31 @@ from zero, and every object has exactly one spelling. The tests compare the
 sample document in `src/test/sample.mach` byte for byte against the files in
 `src/test/golden/`, in both cross-reference forms.
 
+## Forms
+
+`form.init` gives the catalog an `/AcroForm` whose values are drawn in a
+`form.Face`. A group only names the fields under it, so `group(nil, "owner")`
+then `text_field(?owner, "name")` is the field `owner.name`. A terminal field
+keeps its widgets as kids, never merged into it: `form.widget` places another
+one on a page, and a value entered in any of them shows in all of them.
+
+Every widget is written the way PDF/A asks: a normal appearance stream, the
+print flag, and no `/NeedAppearances`, actions or JavaScript. An appearance
+draws only the value, with no background or border, so whatever the page draws
+beneath a widget, such as the dots of a blank, shows through.
+
+A date field is a text field. PDF formats dates through JavaScript actions,
+which PDF/A forbids, so a date field puts its expected format in its tooltip
+(`Date signed (YYYY-MM-DD)`) and leaves the entry to the viewer.
+
+A signature field is written unsigned, with no `/V`. Signing it is an
+incremental update that gives the field's dictionary (`Field.node`) a `/V`.
+
+`form.standard` is a face over a standard 14 font, which needs no embedding but
+is not allowed in PDF/A. An embedded font drops in as another `Face`: its
+`show` writes text in the font's own encoding, such as Identity-H glyph codes,
+and refuses a character the font has no glyph for.
+
 ## Signatures and other late values
 
 A `Reserved` object writes a fixed-width placeholder and records its byte
@@ -101,8 +129,8 @@ mach build .
 mach test . --all --timeout 5m
 ```
 
-`demo/sample` writes the sample document to two files, the golden files the
-tests compare against. Check them with `qpdf --check` and a renderer
+`demo/sample` writes the sample document to two files, and `demo/fields` the
+sample form to one, the golden files the tests compare against. Check them with `qpdf --check` and a renderer
 (`pdftoppm`, `mutool`, pdf.js) after any change to the output:
 
 ```sh
@@ -111,6 +139,9 @@ mach dep pull .
 mach build .
 ./out/linux-x86_64/debug/bin/sample ../../src/test/golden/table.pdf ../../src/test/golden/stream.pdf
 ```
+
+The sample form should also fill in a viewer with a form API, such as MuPDF
+(`pymupdf`) or pdf.js: entering `owner.name` in one widget shows it in both.
 
 ## Workflow
 
