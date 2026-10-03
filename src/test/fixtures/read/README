@@ -1,0 +1,20 @@
+Files other writers produced, which the reader tests read. Each was made from
+the source of the same name in source/, which is part of this repository under
+its MIT licence.
+
+- chrome.pdf: Google Chrome 153 headless, print to PDF (Skia/PDF m153), from
+  source/chrome.html. A cross-reference table and Flate streams.
+- libreoffice.pdf: LibreOffice 26.8 headless, convert to PDF, from
+  source/libreoffice.fodt. A cross-reference table, Flate streams and an /ID.
+- pdftex.pdf: pdfTeX 1.40.29 (TeX Live 2026), from source/pdftex.tex with
+  object compression on. A cross-reference stream and an object stream.
+- hybrid.pdf: written by source/hybrid.py. A hybrid file: a cross-reference
+  table whose trailer names a cross-reference stream (/XRefStm) with a png
+  predictor, the information dictionary and a stream's indirect /Length in an
+  object stream.
+
+The documents embed subsets of fonts under the SIL Open Font License 1.1,
+whose text is in ../liberation/LICENSE: Liberation Sans (chrome.pdf) and
+Liberation Serif (libreoffice.pdf), copyright Google and Red Hat, Inc., and
+CMR10 (pdftex.pdf) from the AMS Type 1 Computer Modern fonts, copyright the
+American Mathematical Society. The OFL lets a document embed them.
