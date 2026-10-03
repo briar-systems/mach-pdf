@@ -1,0 +1,94 @@
+# the stream filter contract and the filters this library implements
+#
+# a filter is named in a stream's /Filter entry and, when it can encode,
+# turns the bytes a caller gave into the bytes the file holds. a stream lists
+# its filters in decode order, as /Filter does, so the writer encodes through
+# them last to first. a filter with no encoder can still be named over data the
+# caller encoded itself, such as a jpeg under DCTDecode. FlateDecode drops in
+# here as one more `Filter` once std has a deflate compressor.
+
+use std.allocator;
+use std.collections.vector;
+use std.system.capability;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use pdf.error;
+
+# encode len bytes at input, appending the result to output
+#
+# the encoder must be deterministic: the same ctx and input give the same
+# bytes on every host. a codec failure is reported as `codec` with the
+# filter's own code.
+# ---
+# ctx:    the filter's state
+# input:  the bytes to encode
+# len:    the count of input bytes
+# output: the vector to append the encoded bytes to
+# ret:    ok, or why encoding failed
+pub def Encode: fun(ptr, *u8, usize, *vector.Vector[u8]) err[error.Error];
+
+# a stream filter
+# ---
+# name:   the filter's pdf name without the slash, such as "FlateDecode"
+# ctx:    state passed to encode
+# encode: the encoder, nil when the filter only names data already encoded
+pub rec Filter {
+    name:   str;
+    ctx:    ptr;
+    encode: Encode;
+}
+
+fun append(output: *vector.Vector[u8], byte: u8) err[error.Error] {
+    val pushed: res[usize, error.Error] = res_of(vector.push[u8](output, byte));
+    if (sel pushed.err) { ret err[error.Error].err{pushed.err}; }
+    ret err[error.Error].ok{};
+}
+
+fun res_of(outcome: res[usize, allocator.Error]) res[usize, error.Error] {
+    if (sel outcome.err) { ret res[usize, error.Error].err{error.from_allocator(outcome.err)}; }
+    ret res[usize, error.Error].ok{outcome.ok};
+}
+
+val HEX: str = "0123456789ABCDEF";
+
+fun ascii_hex_encode(ctx: ptr, input: *u8, len: usize, output: *vector.Vector[u8]) err[error.Error] {
+    val room: res[usize, allocator.Error] = vector.reserve[u8](output, len * 2 + 1);
+    if (sel room.err) { ret err[error.Error].err{error.from_allocator(room.err)}; }
+    var i: usize = 0;
+    for (i < len) {
+        output.data[output.len]     = HEX[(input[i] >> 4)::usize];
+        output.data[output.len + 1] = HEX[(input[i] & 0x0f)::usize];
+        output.len                  = output.len + 2;
+        i                           = i + 1;
+    }
+    ret append(output, '>');
+}
+
+# the ASCIIHexDecode filter, uppercase digits with no whitespace
+# ---
+# ret: the filter
+pub fun ascii_hex() Filter {
+    ret Filter{name: "ASCIIHexDecode", ctx: nil, encode: ascii_hex_encode};
+}
+
+$if (capability.HOSTED) {
+    use std.allocator.page;
+    use std.memory;
+
+    test ascii_hex__encodes_uppercase_pairs_and_terminates {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var output: vector.Vector[u8] = vector.init[u8](?a);
+        fin { vector.dnit[u8](?output); }
+        var input:   [3]u8            = [3]u8{0x00, 0x9f, 'z'};
+        val filter:  Filter           = ascii_hex();
+        val encoded: err[error.Error] = filter.encode(filter.ctx, ?input[0], 3, ?output);
+        if (sel encoded.err)                                        { ret 1; }
+        if (output.len != 7)                                        { ret 2; }
+        if (!memory.raw_equal(output.data::ptr, "009F7A>"::ptr, 7)) { ret 3; }
+        ret 0;
+    }
+}
