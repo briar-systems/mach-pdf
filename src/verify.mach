@@ -7,27 +7,51 @@
 # cms signed data in /Contents must verify over the digest of those bytes,
 # with its certificate path validated against the caller's trust store. and
 # every update after the revision it signs must change only what the document
-# permits.
+# and the signature permit.
 #
-# an update is judged object by object against the revision before it. a new
-# object is allowed, since only a changed object can make it part of the
-# document. a changed object is allowed when it is one of these and changes
-# only what is named:
+# an update is judged object by object against the revision before it, for
+# the least /DocMDP permission (iso 32000-2 section 12.8.2.2) that allows it:
+# 1 for long term validation, 2 for form filling and signing, 3 for
+# annotations. a new object is allowed, since only a changed object can make
+# it part of the document. a changed object is allowed when it is one of these
+# and changes only what is named:
 #
-# - the catalog: /DSS and /Extensions, for long term validation
-# - the document security store itself
-# - the form: /SigFlags, /DR, and /Fields gaining signature fields
-# - a field or widget: /V, /AP and /AS, and a signature field's /V only from
-#   absent, which fills a form and signs a field
-# - a page: /Annots, any change when annotations are permitted, else only
-#   gaining widgets
-# - an annotation that is not a widget, when annotations are permitted
+# - the catalog, at 1: /DSS and /Extensions, /Version to a name, and
+#   /Metadata to a metadata stream the update adds. at 2, /Perms when it had
+#   none, holding only a /DocMDP that names a signature the update adds, in a
+#   document no signature had signed, which certifies it (section 12.8.2.2:
+#   the certifying signature is the first)
+# - the document security store itself, at 1
+# - the catalog's metadata stream, rewritten in place, at 1, when nothing but
+#   the catalog refers to it. its xmp is not judged, since no page renders it
+# - the trailer's /Info dictionary, changed in place or replaced by one the
+#   update adds, at 1, when no object refers to it
+# - the form, at 2: /SigFlags, /DR, and /Fields gaining signature fields
+# - a field or widget, at 2: /V, /AP and /AS, and a signature field's /V only
+#   from absent, which fills a form and signs a field. a signature field that
+#   holds a signature does not change
+# - a widget's appearance stream, its /AP /N, /R or /D, rewritten in place, at
+#   2, when only that widget refers to it, the widget has no /AS, and its field
+#   is not a signed signature field
+# - a page, /Annots only: at 2 when it only gains widgets, else at 3. an
+#   /Annots array held as its own object changes the same way, when only its
+#   page refers to it
+# - an annotation that is not a widget, at 3
 #
-# the certifying signature's /DocMDP permission (iso 32000-2 section 12.8.2.2)
-# narrows this: 1 permits only the security store, 2 adds form filling and
-# signing, and 3 adds annotations. a document with no /DocMDP permits what 3
-# does. an update that frees an object, changes /Root or /Info, or changes
-# anything else is not allowed. field locks (/Lock and /FieldMDP) are not read.
+# an update that frees an object, changes /Root, drops /Info or points it at
+# an older object, or changes anything else is allowed at no permission. the
+# fields an update changes are the ones whose dictionary, widget or appearance
+# stream it changes, and every signature field it adds.
+#
+# each signature is judged under the certifying signature's /DocMDP /P, or 3
+# for a document with none, narrowed by the /P of its own field's /Lock
+# (iso 32000-2 section 12.7.5.5), and under its own field lock: the /Lock of
+# its field and every /FieldMDP transform in its /Reference (section
+# 12.8.2.4). a lock's /Action is /All, or /Include or /Exclude with the
+# fully qualified names in /Fields, compared as text, a name covering the
+# fields beneath it as pyhanko does. a lock that cannot be read locks every
+# field. a signature is followed only by allowed updates when each needs no
+# more than its permission and none changes a field it locks.
 
 use crypto.contracts;
 use pki.cert;
@@ -36,6 +60,7 @@ use path: pki.verify;
 use std.allocator;
 use std.collections.vector;
 use std.memory;
+use std.text.utf8;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -66,46 +91,75 @@ pub rec Options {
     read:  reader.Options;
 }
 
+# the permission an update needs when no /DocMDP permission allows it
+pub val NEVER: u8 = 4;
+
 # an incremental update after a file's first revision, and whether the
 # document permits what it changed
 # ---
-# xref:     the byte offset of its cross-reference section
-# end:      one past its %%EOF line
-# allowed:  every change it makes is one the document permits
-# offender: the first object whose change is not permitted, 0 when allowed or
-#           when the trailer's /Root or /Info changed
+# xref:        the byte offset of its cross-reference section
+# end:         one past its %%EOF line
+# allowed:     every change it makes is one the document's /DocMDP permits
+# offender:    the first object whose change the document's /DocMDP does not
+#              permit, 0 when allowed or when the trailer's /Root or /Info
+#              changed
+# needs:       the least /DocMDP permission that allows every change it
+#              makes, 1 to 3, or NEVER
+# changes_at:  the index in the report's changes of the first field it changed
+# changes_len: the count of fields it changed
 pub rec Update {
-    xref:     usize;
-    end:      usize;
-    allowed:  bool;
-    offender: u32;
+    xref:        usize;
+    end:         usize;
+    allowed:     bool;
+    offender:    u32;
+    needs:       u8;
+    changes_at:  usize;
+    changes_len: usize;
+}
+
+# a form field an update changed
+# ---
+# name_at:  where its fully qualified name starts in the report's names, as
+#           utf-8
+# name_len: the count of bytes in the name
+pub rec Change {
+    name_at:  usize;
+    name_len: usize;
 }
 
 # one signature's verdict
 # ---
-# name_at:   where its field's fully qualified name starts in the report's
-#            names
-# name_len:  the count of bytes in the name
-# node:      the signature dictionary
-# range:     its /ByteRange
-# covered:   the range starts the file, leaves out exactly the /Contents
-#            string, and ends where a revision ends
-# revision:  the index of the revision the range ends with, 0 for the first
-# whole:     that revision is the file's last
-# supported: its /SubFilter is ETSI.CAdES.detached or adbe.pkcs7.detached
-# cms:       the signed data's verdict over the range, its path included
-# allowed:   every update after its revision is allowed
+# name_at:    where its field's fully qualified name starts in the report's
+#             names
+# name_len:   the count of bytes in the name
+# node:       the signature dictionary
+# range:      its /ByteRange
+# covered:    the range starts the file, leaves out exactly the /Contents
+#             string, and ends where a revision ends
+# revision:   the index of the revision the range ends with, 0 for the first
+# whole:      that revision is the file's last
+# supported:  its /SubFilter is ETSI.CAdES.detached or adbe.pkcs7.detached
+# cms:        the signed data's verdict over the range, its path included
+# permission: the most a later update may need: the document's /DocMDP /P,
+#             or 3 for none, narrowed by its field lock's /P
+# locked:     it locks fields, by its field's /Lock or a /FieldMDP transform
+# lock_kept:  no update after its revision changes a field it locks
+# allowed:    every update after its revision needs no more than permission
+#             and keeps its lock
 pub rec Signature {
-    name_at:   usize;
-    name_len:  usize;
-    node:      object.Ref;
-    range:     [4]usize;
-    covered:   bool;
-    revision:  usize;
-    whole:     bool;
-    supported: bool;
-    cms:       cms.Verdict;
-    allowed:   bool;
+    name_at:    usize;
+    name_len:   usize;
+    node:       object.Ref;
+    range:      [4]usize;
+    covered:    bool;
+    revision:   usize;
+    whole:      bool;
+    supported:  bool;
+    cms:        cms.Verdict;
+    permission: u8;
+    locked:     bool;
+    lock_kept:  bool;
+    allowed:    bool;
 }
 
 # every signature of a file and every update after its first revision
@@ -114,11 +168,13 @@ pub rec Signature {
 # updates:    the revisions after the first, oldest first, so updates[i] is
 #             revision i + 1
 # permission: the certifying signature's /DocMDP /P, 0 for none
+# changes:    the fields each update changed, update by update
 # names:      the fields' names, end to end
 pub rec Report {
     signatures: vector.Vector[Signature];
     updates:    vector.Vector[Update];
     permission: u8;
+    changes:    vector.Vector[Change];
     names:      vector.Vector[u8];
 }
 
@@ -146,7 +202,18 @@ pub fun name(report: *Report, s: *Signature) *u8 {
 pub fun release(report: *Report) {
     vector.dnit[Signature](?report.signatures);
     vector.dnit[Update](?report.updates);
+    vector.dnit[Change](?report.changes);
     vector.dnit[u8](?report.names);
+}
+
+# a changed field's name
+# ---
+# report: the report
+# c:      one of its changes
+# ret:    the name's first byte as utf-8, c.name_len of them, valid until
+#         release
+pub fun change_name(report: *Report, c: *Change) *u8 {
+    ret ?report.names.data[c.name_at];
 }
 
 fun failed(cause: allocator.Error) err[error.Error] {
@@ -334,29 +401,405 @@ fun str_is(s: str, t: str) bool {
     ret false;
 }
 
-# whether a changed object is one the permission allows to change as it did
-fun judged(before: *document.Document, after: *document.Document, number: u32, old: object.Object, new: object.Object, permission: u8) bool {
-    if (!sel old.dict) { ret false; }
-    if (!sel new.dict) { ret false; }
-    val x:        *object.Dict = old.dict;
-    val y:        *object.Dict = new.dict;
-    val forms:    bool         = permission != 1;
-    val annotate: bool         = permission == 0 || permission == 3;
-    var root:     u32          = 0;
-    if (sel before.root.some) { root = before.root.some.number; }
+# the lesser of two permissions
+fun least(x: u8, y: u8) u8 {
+    if (x < y) { ret x; }
+    ret y;
+}
 
-    if (number == root) {
-        var keys: [2]str = [2]str{"DSS", "Extensions"};
-        ret only(x, y, ?keys[0], 2);
+# the permission a /DocMDP /P grants, 3 for none
+fun granted(permission: u8) u8 {
+    if (permission == 0) { ret 3; }
+    ret permission;
+}
+
+# the value of a dictionary's key followed when it is a reference
+fun resolved(doc: *document.Document, d: *object.Dict, key: str) object.Object {
+    val held: res[object.Object, error.Error] = document.deref(doc, get(d, key));
+    if (sel held.err) { ret object.null(); }
+    ret held.ok;
+}
+
+# whether a value names an object the document holds
+fun present(doc: *document.Document, value: object.Object) bool {
+    if (!sel value.reference) { ret false; }
+    val held: res[opt[document.Held], error.Error] = document.load(doc, value.reference.number);
+    if (sel held.err) { ret true; }
+    val got: opt[document.Held] = held.ok;
+    ret sel got.some;
+}
+
+# a field holds a signature: it or an ancestor has a /V
+fun signed(doc: *document.Document, d: *object.Dict) bool {
+    var at:    *object.Dict = d;
+    var depth: usize        = 0;
+    for (at != nil && depth < DEPTH) {
+        val value: object.Object = get(at, "V");
+        if (!sel value.null) { ret true; }
+        at    = dict_of(doc, get(at, "Parent"));
+        depth = depth + 1;
     }
-    val catalog: *object.Dict = dict_of(before, object.reference(object.Ref{number: root, generation: 0}));
+    ret false;
+}
+
+fun pushed_byte(out: *vector.Vector[u8], b: u8) err[error.Error] {
+    val pushed: res[usize, allocator.Error] = vector.push[u8](out, b);
+    if (sel pushed.err) { ret failed(pushed.err); }
+    ret err[error.Error].ok{};
+}
+
+fun pushed_codepoint(out: *vector.Vector[u8], cp: utf8.Codepoint) err[error.Error] {
+    var buf:  [4]u8;
+    var used: usize = utf8.encode(cp, ?buf[0], 4);
+    if (used == 0) { used = utf8.encode(utf8.REPLACEMENT, ?buf[0], 4); }
+    var i: usize = 0;
+    for (i < used) {
+        val one: err[error.Error] = pushed_byte(out, buf[i]);
+        if (sel one.err) { ret one; }
+        i = i + 1;
+    }
+    ret err[error.Error].ok{};
+}
+
+# the unicode value of a PDFDocEncoding byte (iso 32000-2 annex d), the
+# replacement character for an undefined one
+fun pdf_doc(b: u8) utf8.Codepoint {
+    var high: [33]u16 = [33]u16{0x2022, 0x2020, 0x2021, 0x2026, 0x2014, 0x2013, 0x0192, 0x2044, 0x2039, 0x203a,
+        0x2212, 0x2030, 0x201e, 0x201c, 0x201d, 0x2018, 0x2019, 0x201a, 0x2122, 0xfb01, 0xfb02, 0x0141, 0x0152,
+        0x0160, 0x0178, 0x017d, 0x0131, 0x0142, 0x0153, 0x0161, 0x017e, 0xfffd, 0x20ac};
+    var low: [8]u16 = [8]u16{0x02d8, 0x02c7, 0x02c6, 0x02d9, 0x02dd, 0x02db, 0x02da, 0x02dc};
+    if (b >= 0x18 && b <= 0x1f) { ret low[(b - 0x18)::usize]::utf8.Codepoint; }
+    if (b >= 0x80 && b <= 0xa0) { ret high[(b - 0x80)::usize]::utf8.Codepoint; }
+    if (b == 0x7f || b == 0xad) { ret utf8.REPLACEMENT; }
+    ret b::utf8.Codepoint;
+}
+
+# append a text string (iso 32000-2 section 7.9.2.2) as utf-8: utf-16be or
+# utf-8 behind a byte order mark, else PDFDocEncoding
+fun decoded_text(s: object.String, out: *vector.Vector[u8]) err[error.Error] {
+    val d: *u8 = s.data;
+    if (s.len >= 2 && d[0] == 0xfe && d[1] == 0xff) {
+        var i: usize = 2;
+        for (i + 1 < s.len) {
+            var cp: utf8.Codepoint = (d[i]::utf8.Codepoint << 8) | d[i + 1]::utf8.Codepoint;
+            i = i + 2;
+            if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < s.len) {
+                val next: utf8.Codepoint = (d[i]::utf8.Codepoint << 8) | d[i + 1]::utf8.Codepoint;
+                if (next >= 0xdc00 && next <= 0xdfff) {
+                    cp = 0x10000 + ((cp - 0xd800) << 10) + (next - 0xdc00);
+                    i  = i + 2;
+                }
+            }
+            val one: err[error.Error] = pushed_codepoint(out, cp);
+            if (sel one.err) { ret one; }
+        }
+        ret err[error.Error].ok{};
+    }
+    var from: usize = 0;
+    var bom:  bool  = s.len >= 3 && d[0] == 0xef && d[1] == 0xbb && d[2] == 0xbf;
+    if (bom) { from = 3; }
+    var i: usize = from;
+    for (i < s.len) {
+        var one: err[error.Error];
+        if (bom)         { one = pushed_byte(out, d[i]); }
+        or               { one = pushed_codepoint(out, pdf_doc(d[i])); }
+        if (sel one.err) { ret one; }
+        i = i + 1;
+    }
+    ret err[error.Error].ok{};
+}
+
+# how one update is judged: the revisions either side of it, and how often
+# each object of the revision before is referred to, counted on first need
+# ---
+# before:   the revision before the update
+# after:    the revision the update makes
+# report:   where the fields it changes are noted
+# first:    the index in the report's changes of the update's first
+# counted:  uses and users hold the counts
+# complete: every object of the revision before could be read and counted
+# uses:     how many references each object number has in the revision
+#           before, the trailer's left out
+# users:    the last object holding a reference to each number
+rec Judge {
+    before:   *document.Document;
+    after:    *document.Document;
+    report:   *Report;
+    first:    usize;
+    counted:  bool;
+    complete: bool;
+    uses:     vector.Vector[u32];
+    users:    vector.Vector[u32];
+}
+
+fun counted_in(j: *Judge, value: object.Object, owner: u32, depth: usize) bool {
+    if (depth > DEPTH) { ret false; }
+    if (sel value.reference) {
+        val n: usize = value.reference.number::usize;
+        if (n < j.uses.len) {
+            j.uses.data[n]  = j.uses.data[n] + 1;
+            j.users.data[n] = owner;
+        }
+        ret true;
+    }
+    if (sel value.array) {
+        var i: usize = 0;
+        for (i < value.array.items.len) {
+            if (!counted_in(j, value.array.items.data[i], owner, depth + 1)) { ret false; }
+            i = i + 1;
+        }
+        ret true;
+    }
+    var d: *object.Dict = nil;
+    if (sel value.dict)   { d = value.dict; }
+    if (sel value.stream) { d = value.stream.dict; }
+    if (d == nil)         { ret true; }
+    var i: usize = 0;
+    for (i < d.entries.len) {
+        if (!counted_in(j, d.entries.data[i].value, owner, depth + 1)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# count every reference the revision before holds
+fun count(j: *Judge) err[error.Error] {
+    if (j.counted) { ret err[error.Error].ok{}; }
+    j.counted  = true;
+    j.complete = true;
+    val size: usize = document.size(j.before)::usize;
+    var n:    usize = 0;
+    for (n < size) {
+        val one: res[usize, allocator.Error] = vector.push[u32](?j.uses, 0);
+        if (sel one.err) { ret failed(one.err); }
+        val two: res[usize, allocator.Error] = vector.push[u32](?j.users, 0);
+        if (sel two.err) { ret failed(two.err); }
+        n = n + 1;
+    }
+    n = 1;
+    for (n < size) {
+        val held: res[opt[document.Held], error.Error] = document.load(j.before, n::u32);
+        n = n + 1;
+        if (sel held.err) {
+            j.complete = false;
+            cnt;
+        }
+        val got: opt[document.Held] = held.ok;
+        if (!sel got.some)                                   { cnt; }
+        if (!counted_in(j, got.some.value, (n - 1)::u32, 0)) { j.complete = false; }
+    }
+    ret err[error.Error].ok{};
+}
+
+# the one object of the revision before that refers to number, and refers to
+# it once, 0 when none or more do
+fun sole_user(j: *Judge, number: u32) res[u32, error.Error] {
+    val counting: err[error.Error] = count(j);
+    if (sel counting.err) { ret res[u32, error.Error].err{counting.err}; }
+    val n: usize = number::usize;
+    if (!j.complete || n >= j.uses.len || j.uses.data[n] != 1) { ret res[u32, error.Error].ok{0}; }
+    ret res[u32, error.Error].ok{j.users.data[n]};
+}
+
+# whether no object of the revision before refers to number
+fun unused(j: *Judge, number: u32) res[bool, error.Error] {
+    val counting: err[error.Error] = count(j);
+    if (sel counting.err) { ret res[bool, error.Error].err{counting.err}; }
+    val n: usize = number::usize;
+    ret res[bool, error.Error].ok{j.complete && n < j.uses.len && j.uses.data[n] == 0};
+}
+
+# note that the update changed the field d belongs to in doc, once
+fun note(j: *Judge, doc: *document.Document, d: *object.Dict) err[error.Error] {
+    var parts:       [32]object.String;
+    var count_parts: usize        = 0;
+    var at:          *object.Dict = d;
+    var depth:       usize        = 0;
+    for (at != nil && depth < DEPTH) {
+        val part: object.Object = get(at, "T");
+        if (sel part.string) {
+            parts[count_parts] = part.string;
+            count_parts        = count_parts + 1;
+        }
+        at    = dict_of(doc, get(at, "Parent"));
+        depth = depth + 1;
+    }
+    val names: *vector.Vector[u8] = ?j.report.names;
+    val start: usize              = names.len;
+    var k:     usize              = count_parts;
+    for (k > 0) {
+        k = k - 1;
+        if (k + 1 < count_parts) {
+            val dot: err[error.Error] = pushed_byte(names, '.');
+            if (sel dot.err) { ret dot; }
+        }
+        val part: err[error.Error] = decoded_text(parts[k], names);
+        if (sel part.err) { ret part; }
+    }
+    val len: usize = names.len - start;
+    var i:   usize = j.first;
+    for (i < j.report.changes.len) {
+        val c: Change = j.report.changes.data[i];
+        i = i + 1;
+        if (c.name_len == len && bytes_same(?names.data[c.name_at], ?names.data[start], len)) {
+            names.len = start;
+            ret err[error.Error].ok{};
+        }
+    }
+    val pushed: res[usize, allocator.Error] = vector.push[Change](?j.report.changes, Change{name_at: start, name_len: len});
+    if (sel pushed.err) { ret failed(pushed.err); }
+    ret err[error.Error].ok{};
+}
+
+# a page's /Annots changing from old to new: 2 when it only gains widgets,
+# else 3
+fun annotations(j: *Judge, old: object.Object, new: object.Object) u8 {
+    if (grows(j.after, old, new, "Subtype", "Widget")) { ret 2; }
+    ret 3;
+}
+
+fun level(needs: u8) res[u8, error.Error] {
+    ret res[u8, error.Error].ok{needs};
+}
+
+# whether any signature field of a document holds a signature
+fun any_signed(doc: *document.Document) res[bool, error.Error] {
+    var fields: vector.Vector[form.Found] = vector.init[form.Found](doc.backing);
+    fin { vector.dnit[form.Found](?fields); }
+    val found: err[error.Error] = form.terminals(doc, document.objects(doc), ?fields);
+    if (sel found.err) { ret res[bool, error.Error].err{found.err}; }
+    var i: usize = 0;
+    for (i < fields.len) {
+        val field: form.Found = fields.data[i];
+        i = i + 1;
+        if (object.name_is(field.type, "Sig") && signed(doc, field.dict)) { ret res[bool, error.Error].ok{true}; }
+    }
+    ret res[bool, error.Error].ok{false};
+}
+
+# whether the catalog gains a /Perms whose /DocMDP names a signature the
+# update adds, certifying a document no signature has signed yet
+fun certified(j: *Judge, x: *object.Dict, y: *object.Dict) res[bool, error.Error] {
+    val had: object.Object = get(x, "Perms");
+    if (!sel had.null) { ret res[bool, error.Error].ok{false}; }
+    val perms: *object.Dict = dict_of(j.after, get(y, "Perms"));
+    if (perms == nil)           { ret res[bool, error.Error].ok{false}; }
+    if (perms.entries.len != 1) { ret res[bool, error.Error].ok{false}; }
+    val signature: object.Object = get(perms, "DocMDP");
+    if (!sel signature.reference || present(j.before, signature)) { ret res[bool, error.Error].ok{false}; }
+    val earlier: res[bool, error.Error] = any_signed(j.before);
+    if (sel earlier.err) { ret earlier; }
+    ret res[bool, error.Error].ok{!earlier.ok};
+}
+
+# the least permission that allows the catalog to change as it did
+fun catalog_change(j: *Judge, x: *object.Dict, y: *object.Dict) res[u8, error.Error] {
+    var keys: [5]str = [5]str{"DSS", "Extensions", "Version", "Metadata", "Perms"};
+    if (!only(x, y, ?keys[0], 5)) { ret level(NEVER); }
+    var needs: u8 = 1;
+    if (differs(x, y, "Version")) {
+        val version: object.Object = get(y, "Version");
+        if (!sel version.name) { ret level(NEVER); }
+    }
+    if (differs(x, y, "Metadata")) {
+        val metadata: object.Object = get(y, "Metadata");
+        if (!sel metadata.reference || present(j.before, metadata)) { ret level(NEVER); }
+        val stream: object.Object = resolved(j.after, y, "Metadata");
+        if (!sel stream.stream)                                    { ret level(NEVER); }
+        if (!is_name(get(stream.stream.dict, "Type"), "Metadata")) { ret level(NEVER); }
+    }
+    if (differs(x, y, "Perms")) {
+        val first: res[bool, error.Error] = certified(j, x, y);
+        if (sel first.err) { ret res[u8, error.Error].err{first.err}; }
+        if (!first.ok)     { ret level(NEVER); }
+        needs = 2;
+    }
+    ret level(needs);
+}
+
+# the least permission that allows a stream to be rewritten in place: the
+# catalog's metadata stream, or a widget's appearance stream
+fun stream_change(j: *Judge, number: u32, x: *object.Stream, y: *object.Stream, catalog: *object.Dict) res[u8, error.Error] {
+    val user: res[u32, error.Error] = sole_user(j, number);
+    if (sel user.err) { ret res[u8, error.Error].err{user.err}; }
+    if (user.ok == 0) { ret level(NEVER); }
+    if (catalog != nil && number == number_of(get(catalog, "Metadata"))) {
+        if (!sel j.before.root.some)                   { ret level(NEVER); }
+        if (user.ok != j.before.root.some.number)      { ret level(NEVER); }
+        if (!is_name(get(y.dict, "Type"), "Metadata")) { ret level(NEVER); }
+        if (!is_name(get(y.dict, "Subtype"), "XML"))   { ret level(NEVER); }
+        ret level(1);
+    }
+    val owner: *object.Dict = dict_of(j.before, object.reference(object.Ref{number: user.ok, generation: 0}));
+    if (owner == nil || !is_name(get(owner, "Subtype"), "Widget")) { ret level(NEVER); }
+    val shown: object.Object = get(owner, "AP");
+    val state: object.Object = get(owner, "AS");
+    if (!sel shown.dict) { ret level(NEVER); }
+    if (!sel state.null) { ret level(NEVER); }
+    val n: bool = number_of(get(shown.dict, "N")) == number;
+    val r: bool = number_of(get(shown.dict, "R")) == number;
+    val d: bool = number_of(get(shown.dict, "D")) == number;
+    if (!n && !r && !d)                           { ret level(NEVER); }
+    if (!is_name(get(y.dict, "Subtype"), "Form")) { ret level(NEVER); }
+    val type: object.Object = field_type(j.before, owner);
+    if (sel type.null)                                   { ret level(NEVER); }
+    if (is_name(type, "Sig") && signed(j.before, owner)) { ret level(NEVER); }
+    val noted: err[error.Error] = note(j, j.before, owner);
+    if (sel noted.err) { ret res[u8, error.Error].err{noted.err}; }
+    ret level(2);
+}
+
+# the least permission that allows a changed object to change as it did
+fun judged(j: *Judge, number: u32, old: object.Object, new: object.Object) res[u8, error.Error] {
+    var root: u32 = 0;
+    if (sel j.before.root.some) { root = j.before.root.some.number; }
+    val catalog: *object.Dict = dict_of(j.before, object.reference(object.Ref{number: root, generation: 0}));
+    if (sel old.stream) {
+        if (!sel new.stream) { ret level(NEVER); }
+        ret stream_change(j, number, old.stream, new.stream, catalog);
+    }
+    if (sel old.array) {
+        if (!sel new.array) { ret level(NEVER); }
+        val user: res[u32, error.Error] = sole_user(j, number);
+        if (sel user.err) { ret res[u8, error.Error].err{user.err}; }
+        if (user.ok == 0) { ret level(NEVER); }
+        val page: *object.Dict = dict_of(j.before, object.reference(object.Ref{number: user.ok, generation: 0}));
+        if (page == nil || !is_name(get(page, "Type"), "Page")) { ret level(NEVER); }
+        if (number_of(get(page, "Annots")) != number)           { ret level(NEVER); }
+        ret level(annotations(j, old, new));
+    }
+    if (!sel old.dict) { ret level(NEVER); }
+    if (!sel new.dict) { ret level(NEVER); }
+    val x: *object.Dict = old.dict;
+    val y: *object.Dict = new.dict;
+
+    if (number == root) { ret catalog_change(j, x, y); }
+    if (sel j.before.info.some && number == j.before.info.some.number) {
+        val free: res[bool, error.Error] = unused(j, number);
+        if (sel free.err) { ret res[u8, error.Error].err{free.err}; }
+        if (free.ok)      { ret level(1); }
+        ret level(NEVER);
+    }
     if (catalog != nil) {
-        if (number == number_of(get(catalog, "DSS"))) { ret true; }
+        if (number == number_of(get(catalog, "DSS"))) { ret level(1); }
         if (number == number_of(get(catalog, "AcroForm"))) {
-            if (!forms) { ret false; }
             var keys: [3]str = [3]str{"SigFlags", "DR", "Fields"};
-            if (!only(x, y, ?keys[0], 3)) { ret false; }
-            ret !differs(x, y, "Fields") || grows(after, get(x, "Fields"), get(y, "Fields"), "FT", "Sig");
+            if (!only(x, y, ?keys[0], 3)) { ret level(NEVER); }
+            if (!differs(x, y, "Fields")) { ret level(2); }
+            val was: object.Object = get(x, "Fields");
+            val now: object.Object = get(y, "Fields");
+            if (!grows(j.after, was, now, "FT", "Sig")) { ret level(NEVER); }
+            if (!sel now.array)                         { ret level(NEVER); }
+            # every signature field added is a change to it
+            var i: usize = 0;
+            if (sel was.array) { i = was.array.items.len; }
+            for (i < now.array.items.len) {
+                val added: *object.Dict = dict_of(j.after, now.array.items.data[i]);
+                i = i + 1;
+                val noted: err[error.Error] = note(j, j.after, added);
+                if (sel noted.err) { ret res[u8, error.Error].err{noted.err}; }
+            }
+            ret level(2);
         }
     }
     val subtype: object.Object = get(x, "Subtype");
@@ -365,26 +808,21 @@ fun judged(before: *document.Document, after: *document.Document, number: u32, o
     val rect:    object.Object = get(x, "Rect");
     val field:   bool          = !sel typed.null || !sel titled.null;
     if (field || is_name(subtype, "Widget")) {
-        if (!forms) { ret false; }
         var keys: [3]str = [3]str{"V", "AP", "AS"};
-        if (!only(x, y, ?keys[0], 3)) { ret false; }
-        # a signature's value is set once, by signing
-        val value: object.Object = get(x, "V");
-        if (differs(x, y, "V") && is_name(field_type(before, x), "Sig")) { ret sel value.null; }
-        ret true;
+        if (!only(x, y, ?keys[0], 3)) { ret level(NEVER); }
+        # a signature's value is set once, by signing, and then stays as signed
+        if (is_name(field_type(j.before, x), "Sig") && signed(j.before, x)) { ret level(NEVER); }
+        val noted: err[error.Error] = note(j, j.before, x);
+        if (sel noted.err) { ret res[u8, error.Error].err{noted.err}; }
+        ret level(2);
     }
     if (is_name(get(x, "Type"), "Page")) {
-        if (annotate) {
-            var keys: [1]str = [1]str{"Annots"};
-            ret only(x, y, ?keys[0], 1);
-        }
-        if (!forms) { ret false; }
         var keys: [1]str = [1]str{"Annots"};
-        if (!only(x, y, ?keys[0], 1)) { ret false; }
-        ret grows(after, get(x, "Annots"), get(y, "Annots"), "Subtype", "Widget");
+        if (!only(x, y, ?keys[0], 1)) { ret level(NEVER); }
+        ret level(annotations(j, get(x, "Annots"), get(y, "Annots")));
     }
-    if (sel subtype.name && !sel rect.null) { ret annotate; }
-    ret false;
+    if (sel subtype.name && !sel rect.null) { ret level(3); }
+    ret level(NEVER);
 }
 
 fun same_ref(x: opt[object.Ref], y: opt[object.Ref]) bool {
@@ -395,31 +833,60 @@ fun same_ref(x: opt[object.Ref], y: opt[object.Ref]) bool {
     ret !sel y.some;
 }
 
-# judge one update against the revision before it
-fun classify(before: *document.Document, after: *document.Document, revision: reader.Revision, permission: u8) Update {
-    var update: Update = Update{xref: revision.xref, end: revision.end, allowed: false, offender: 0};
-    if (!same_ref(before.root, after.root) || !same_ref(before.info, after.info)) { ret update; }
-    var i: usize = 0;
+# the least permission that allows the update's change to one object, 0 for
+# an object it adds or leaves as it was
+fun changed_by(j: *Judge, number: u32) res[u8, error.Error] {
+    val old: res[opt[document.Held], error.Error] = document.load(j.before, number);
+    if (sel old.err) { ret level(NEVER); }
+    val new: res[opt[document.Held], error.Error] = document.load(j.after, number);
+    if (sel new.err) { ret level(NEVER); }
+    val was: opt[document.Held] = old.ok;
+    val now: opt[document.Held] = new.ok;
+    if (!sel was.some) { ret level(0); }
+    if (!sel now.some) { ret level(NEVER); }
+    val x: object.Object = was.some.value;
+    val y: object.Object = now.some.value;
+    if (same(x, y, 0)) { ret level(0); }
+    ret judged(j, number, x, y);
+}
+
+# whether the trailer's /Info is kept, or replaced by an object the update adds
+fun info_kept(before: *document.Document, after: *document.Document) bool {
+    if (same_ref(before.info, after.info)) { ret true; }
+    if (!sel after.info.some)              { ret false; }
+    ret !present(before, object.reference(after.info.some));
+}
+
+# judge one update against the revision before it, noting the fields it
+# changes in the report
+fun classify(before: *document.Document, after: *document.Document, revision: reader.Revision, permission: u8, report: *Report, update: *Update) err[error.Error] {
+    @update = Update{xref: revision.xref, end: revision.end, allowed: false, offender: 0, needs: NEVER,
+        changes_at: report.changes.len, changes_len: 0};
+    val a: *allocator.Allocator = before.backing;
+    var j: Judge                = Judge{before: before, after: after, report: report, first: report.changes.len, counted: false,
+        complete: false, uses: vector.init[u32](a), users: vector.init[u32](a)};
+    fin {
+        vector.dnit[u32](?j.uses);
+        vector.dnit[u32](?j.users);
+    }
+    val most: u8 = granted(permission);
+    if (!same_ref(before.root, after.root) || !info_kept(before, after)) { ret err[error.Error].ok{}; }
+    var needs:    u8    = 1;
+    var offender: u32   = 0;
+    var i:        usize = 0;
     for (i < revision.count) {
         val number: u32 = revision.numbers[i];
-        i               = i + 1;
-        update.offender = number;
-        val old: res[opt[document.Held], error.Error] = document.load(before, number);
-        val new: res[opt[document.Held], error.Error] = document.load(after, number);
-        if (sel old.err) { ret update; }
-        if (sel new.err) { ret update; }
-        val was: opt[document.Held] = old.ok;
-        val now: opt[document.Held] = new.ok;
-        if (!sel was.some) { cnt; }
-        if (!sel now.some) { ret update; }
-        val x: object.Object = was.some.value;
-        val y: object.Object = now.some.value;
-        if (same(x, y, 0))                                    { cnt; }
-        if (!judged(before, after, number, x, y, permission)) { ret update; }
+        i = i + 1;
+        val got: res[u8, error.Error] = changed_by(?j, number);
+        if (sel got.err)                    { ret err[error.Error].err{got.err}; }
+        if (got.ok > needs)                 { needs = got.ok; }
+        if (got.ok > most && offender == 0) { offender = number; }
     }
-    update.allowed  = true;
-    update.offender = 0;
-    ret update;
+    update.needs       = needs;
+    update.allowed     = needs <= most;
+    update.offender    = offender;
+    update.changes_len = report.changes.len - update.changes_at;
+    ret err[error.Error].ok{};
 }
 
 # the certifying signature's /DocMDP /P, 0 for none and 1 for one that is
@@ -544,14 +1011,151 @@ fun range_of(d: *object.Dict, range: *usize) bool {
     ret true;
 }
 
+# a field lock's /Action
+val ALL:     u8 = 0;
+val INCLUDE: u8 = 1;
+val EXCLUDE: u8 = 2;
+
+# a field lock, read from a /Lock dictionary or /FieldMDP transform parameters
+# ---
+# action: ALL, INCLUDE or EXCLUDE
+# fields: the fully qualified names /Fields lists, nil for ALL
+rec Lock {
+    action: u8;
+    fields: *object.Array;
+}
+
+fun all_strings(list: *object.Array) bool {
+    var i: usize = 0;
+    for (i < list.items.len) {
+        val item: object.Object = list.items.data[i];
+        if (!sel item.string) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# read the lock d describes, locking every field when it cannot be read
+fun lock_from(doc: *document.Document, d: *object.Dict, locks: *vector.Vector[Lock]) err[error.Error] {
+    var lock: Lock = Lock{action: ALL, fields: nil};
+    if (d != nil) {
+        val action: object.Object = get(d, "Action");
+        var listed: u8            = ALL;
+        if (is_name(action, "Include")) { listed = INCLUDE; }
+        if (is_name(action, "Exclude")) { listed = EXCLUDE; }
+        val fields: object.Object = resolved(doc, d, "Fields");
+        if (sel fields.array) {
+            if (listed != ALL && all_strings(fields.array)) { lock = Lock{action: listed, fields: fields.array}; }
+        }
+    }
+    val pushed: res[usize, allocator.Error] = vector.push[Lock](locks, lock);
+    if (sel pushed.err) { ret failed(pushed.err); }
+    ret err[error.Error].ok{};
+}
+
+# read a signature's locks: its field's /Lock and the /FieldMDP transforms in
+# its signature dictionary, and the permission the /Lock grants, 3 for none
+fun locks_of(doc: *document.Document, field: *object.Dict, signature: *object.Dict, locks: *vector.Vector[Lock], permission: *u8) err[error.Error] {
+    @permission = 3;
+    val held: object.Object = get(field, "Lock");
+    if (!sel held.null) {
+        val lock:  *object.Dict     = dict_of(doc, held);
+        val added: err[error.Error] = lock_from(doc, lock, locks);
+        if (sel added.err) { ret added; }
+        if (lock != nil) {
+            val given: object.Object = resolved(doc, lock, "P");
+            if (sel given.integer) {
+                @permission = 1;
+                if (given.integer >= 1 && given.integer <= 3) { @permission = given.integer::u8; }
+            }
+            or (!sel given.null) {
+                @permission = 1;
+            }
+        }
+    }
+    val listed: object.Object = resolved(doc, signature, "Reference");
+    if (!sel listed.array) { ret err[error.Error].ok{}; }
+    var i: usize = 0;
+    for (i < listed.array.items.len) {
+        val reference: *object.Dict = dict_of(doc, listed.array.items.data[i]);
+        i = i + 1;
+        if (reference == nil)                                        { cnt; }
+        if (!is_name(get(reference, "TransformMethod"), "FieldMDP")) { cnt; }
+        val added: err[error.Error] = lock_from(doc, dict_of(doc, get(reference, "TransformParams")), locks);
+        if (sel added.err) { ret added; }
+    }
+    ret err[error.Error].ok{};
+}
+
+# whether a lock covers the field of a name, given as utf-8: a name it lists,
+# or one beneath it
+fun locks_field(lock: Lock, name: *u8, len: usize, scratch: *vector.Vector[u8]) res[bool, error.Error] {
+    if (lock.action == ALL) { ret res[bool, error.Error].ok{true}; }
+    var listed: bool  = false;
+    var i:      usize = 0;
+    for (!listed && i < lock.fields.items.len) {
+        val item: object.Object = lock.fields.items.data[i];
+        i = i + 1;
+        if (!sel item.string) { cnt; }
+        scratch.len = 0;
+        val read: err[error.Error] = decoded_text(item.string, scratch);
+        if (sel read.err) { ret res[bool, error.Error].err{read.err}; }
+        val n: usize = scratch.len;
+        if (n > len)                            { cnt; }
+        if (!bytes_same(scratch.data, name, n)) { cnt; }
+        listed = n == len || name[n] == '.';
+    }
+    ret res[bool, error.Error].ok{listed == (lock.action == INCLUDE)};
+}
+
+# judge a signature against every update after its revision, k the index of
+# the first, under its permission and its locks
+fun held_to(a: *allocator.Allocator, doc: *document.Document, field: *object.Dict, signature: *object.Dict, report: *Report, s: *Signature, k: usize) err[error.Error] {
+    var locks: vector.Vector[Lock] = vector.init[Lock](a);
+    fin { vector.dnit[Lock](?locks); }
+    var scratch: vector.Vector[u8] = vector.init[u8](a);
+    fin { vector.dnit[u8](?scratch); }
+    var granted_by_lock: u8               = 3;
+    val read:            err[error.Error] = locks_of(doc, field, signature, ?locks, ?granted_by_lock);
+    if (sel read.err) { ret read; }
+    s.permission = least(granted(report.permission), granted_by_lock);
+    s.locked     = locks.len > 0;
+    var fits: bool  = true;
+    var u:    usize = k;
+    for (u < report.updates.len) {
+        val update: Update = report.updates.data[u];
+        u = u + 1;
+        if (update.needs > s.permission) { fits = false; }
+        var c: usize = update.changes_at;
+        for (c < update.changes_at + update.changes_len) {
+            val change: Change = report.changes.data[c];
+            c = c + 1;
+            var l: usize = 0;
+            for (l < locks.len) {
+                val covered: res[bool, error.Error] = locks_field(locks.data[l], ?report.names.data[change.name_at],
+                    change.name_len, ?scratch);
+                if (sel covered.err) { ret err[error.Error].err{covered.err}; }
+                if (covered.ok)      { s.lock_kept = false; }
+                l = l + 1;
+            }
+        }
+    }
+    s.allowed = fits && s.lock_kept;
+    ret err[error.Error].ok{};
+}
+
 # judge one signed field
-fun judge(doc: *document.Document, data: *u8, len: usize, revisions: *vector.Vector[reader.Revision], options: *Options, report: *Report, field: form.Found) err[error.Error] {
+fun judge(a: *allocator.Allocator, doc: *document.Document, data: *u8, len: usize, revisions: *vector.Vector[reader.Revision], options: *Options, report: *Report, field: form.Found) err[error.Error] {
     val v: object.Object = get(field.dict, "V");
     if (sel v.null) { ret err[error.Error].ok{}; }
     var s: Signature;
-    s.node    = object.Ref{number: number_of(v), generation: 0};
-    s.cms     = refused(cms.MALFORMED);
-    s.name_at = report.names.len;
+    s.node       = object.Ref{number: number_of(v), generation: 0};
+    s.cms        = refused(cms.MALFORMED);
+    s.name_at    = report.names.len;
+    s.permission = granted(report.permission);
+    s.locked     = false;
+    s.lock_kept  = true;
+    s.allowed    = false;
     if (sel v.reference) { s.node = v.reference; }
     var i: usize = 0;
     for (i < field.name_len) {
@@ -591,11 +1195,9 @@ fun judge(doc: *document.Document, data: *u8, len: usize, revisions: *vector.Vec
                 s.whole    = at && k + 1 == revisions.len;
                 s.covered  = at && range[0] == 0 && gap_holds(data, range[1], range[2], held);
                 s.cms      = checked(data, range, held, options);
-                s.allowed  = at;
-                var u: usize = k;
-                for (at && u < report.updates.len) {
-                    if (!report.updates.data[u].allowed) { s.allowed = false; }
-                    u = u + 1;
+                if (at) {
+                    val held: err[error.Error] = held_to(a, doc, field.dict, d, report, ?s, k);
+                    if (sel held.err) { ret held; }
                 }
             }
         }
@@ -632,8 +1234,11 @@ fun updates(a: *allocator.Allocator, data: *u8, revisions: *vector.Vector[reader
         val after:  usize            = k % 2;
         val read:   err[error.Error] = prefix(?docs[after], ?live[after], a, data, revisions.data[k].end, options);
         if (sel read.err) { ret read; }
-        val judged_one: Update                      = classify(?docs[before], ?docs[after], revisions.data[k], report.permission);
-        val pushed:     res[usize, allocator.Error] = vector.push[Update](?report.updates, judged_one);
+        var judged_one: Update;
+        val classified: err[error.Error] = classify(?docs[before], ?docs[after], revisions.data[k], report.permission,
+            report, ?judged_one);
+        if (sel classified.err) { ret classified; }
+        val pushed: res[usize, allocator.Error] = vector.push[Update](?report.updates, judged_one);
         if (sel pushed.err) { ret failed(pushed.err); }
         document.dnit(?docs[before]);
         live[before] = false;
@@ -657,6 +1262,7 @@ fun updates(a: *allocator.Allocator, data: *u8, revisions: *vector.Vector[reader
 pub fun verify(a: *allocator.Allocator, data: *u8, len: usize, options: *Options, report: *Report) err[error.Error] {
     report.signatures = vector.init[Signature](a);
     report.updates    = vector.init[Update](a);
+    report.changes    = vector.init[Change](a);
     report.names      = vector.init[u8](a);
     report.permission = 0;
     if (options == nil || options.trust == nil) { ret err[error.Error].err{error.Error.invalid{}}; }
@@ -683,7 +1289,7 @@ pub fun verify(a: *allocator.Allocator, data: *u8, len: usize, options: *Options
         val field: form.Found = fields.data[i];
         i = i + 1;
         if (!object.name_is(field.type, "Sig")) { cnt; }
-        val one: err[error.Error] = judge(?doc, data, len, ?revisions, options, report, field);
+        val one: err[error.Error] = judge(a, ?doc, data, len, ?revisions, options, report, field);
         if (sel one.err) { ret one; }
     }
     ret err[error.Error].ok{};
