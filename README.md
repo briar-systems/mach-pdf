@@ -250,22 +250,45 @@ document time-stamp is one more signature dictionary of `/Type
 signed signature field: its byte range starts the file, leaves out exactly its
 `/Contents` string and ends where a revision ends, its signed data verifies
 over that range with its certificate path validated against the caller's trust
-store, and every later update changes only what the document permits. An
-update may add objects, and may change the catalog's `/DSS` and
-`/Extensions`, the security store, the form's `/SigFlags`, `/DR` and new
-signature fields, a field's or widget's `/V`, `/AP` and `/AS` (a signature's
-`/V` only from absent), a page's `/Annots` and the annotations on it. A
-certifying signature's `/DocMDP` permission narrows that: 1 allows only the
-security store, 2 adds form filling and signing, and 3 or no `/DocMDP` adds
-annotations. Field locks are not read. `verify.valid` says whether a signature
-passed every check, and the report keeps each check and each update's verdict.
+store, and every later update changes only what the document and the signature
+permit.
+
+Each update is judged object by object for the least `/DocMDP` permission
+that allows it (`Update.needs`): 1 for long term validation, 2 for form filling
+and signing, 3 for annotations, or `verify.NEVER`. An update may add objects.
+At 1 it may change the catalog's `/DSS`, `/Extensions`, `/Version` and
+`/Metadata` (to a metadata stream it adds), the security store, the metadata
+stream in place, and the `/Info` dictionary in place or for a new one, the last
+two only when nothing else refers to them. At 2 it may change the form's
+`/SigFlags`, `/DR` and new signature fields, a field's or widget's `/V`, `/AP`
+and `/AS` (a signature's `/V` only from absent, and nothing of a field already
+signed), a widget's appearance stream in place when only that widget refers to
+it and it has no `/AS`, a page's `/Annots` gaining widgets, and the catalog's
+`/Perms` when it certifies a document no signature has signed yet. At 3 it may
+change a page's `/Annots` otherwise, and the annotations on it. An `/Annots`
+array held as its own object changes as the page's would, when only that page
+refers to it. `Update.allowed` says whether the update fits the certifying
+signature's `/DocMDP` permission (3 without one), and `Report.changes` lists
+the fields each update changed: those whose dictionary, widget or appearance
+stream it changed, and the signature fields it added.
+
+Each signature is judged under its own permission, the document's narrowed by
+the `/P` of its field's `/Lock`, and under its own field lock: the `/Lock` of its
+field and every `/FieldMDP` transform in its `/Reference`, each `/All`, or
+`/Include` or `/Exclude` with fully qualified names compared as text, a name
+covering the fields beneath it. A lock that cannot be read locks every field.
+`Signature.allowed` says every later update fits its permission and changes no
+field it locks (`lock_kept`). `verify.valid` says whether a signature passed
+every check, and the report keeps each check and each update's verdict.
 
 `src/test/signatures.mach` signs the sample form, and a form with two
 signature fields by two signers in turn, compares both with the golden files,
 verifies them, and checks that a byte changed after signing and an update
 changing the catalog are caught. The signers are the P-256 test keys in
 `src/test/fixtures/sign` (`generate.sh` remakes them), whose RFC 6979
-signatures are deterministic.
+signatures are deterministic. It also verifies `src/test/fixtures/pyhanko/signed.pdf`,
+which pyHanko certified, filled and countersigned with field locks, and checks
+that filling its locked field again breaks only the signature that locks it.
 
 ## Reading
 
