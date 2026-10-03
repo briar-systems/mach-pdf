@@ -1,8 +1,9 @@
-# a pdf/a-3b sample: one page of paths with no text, metadata with non-ascii
-# text and dates, and an attached source file
+# a pdf/a-3b sample: one page of paths and text in an embedded liberation mono
+# subset, a text field drawn in the same face, metadata with non-ascii text and
+# dates, and an attached source file
 #
 # the golden test compares it byte for byte, demo/sample writes it to a file,
-# and verapdf validates that file as pdf/a-3b. text waits on embedded fonts.
+# and verapdf validates that file as pdf/a-3b.
 
 use std.types.error.err;
 use std.types.option.opt;
@@ -15,10 +16,13 @@ use pdf.date;
 use pdf.document;
 use pdf.embed;
 use pdf.error;
+use pdf.font;
+use pdf.form;
 use pdf.metadata;
 use pdf.object;
 use pdf.page;
 use pdf.pdfa;
+use pdf.test.fonts;
 
 val SOURCE: str = "The canonical text this document was rendered from.\n";
 
@@ -32,7 +36,11 @@ pub fun build(doc: *document.Document) err[error.Error] {
     var t:     page.Tree                   = tree.ok;
     val added: res[page.Page, error.Error] = page.add(doc, ?t, page.A4);
     if (sel added.err) { ret err[error.Error].err{added.err}; }
-    var p:       page.Page                         = added.ok;
+    var p:    page.Page                        = added.ok;
+    val mono: res[*font.TrueType, error.Error] = font.truetype(doc, ?fonts.REGULAR[0], $length_of(fonts.REGULAR));
+    if (sel mono.err) { ret err[error.Error].err{mono.err}; }
+    val used: err[error.Error] = page.use_font(doc, ?p, "F1", mono.ok.font);
+    if (sel used.err) { ret used; }
     val started: res[content.Builder, error.Error] = page.contents(doc, ?p);
     if (sel started.err) { ret err[error.Error].err{started.err}; }
     var b: content.Builder = started.ok;
@@ -44,8 +52,29 @@ pub fun build(doc: *document.Document) err[error.Error] {
     content.move_to(?b, 72.0, 660.0);
     content.curve_to(?b, 200.0, 740.0, 400.0, 580.0, 523.0, 660.0);
     content.stroke(?b);
+    content.begin_text(?b);
+    content.font(?b, "F1", 12.0);
+    content.fill_gray(?b, 0.0);
+    content.move_text(?b, 72.0, 540.0);
+    font.show(?b, mono.ok, "Archived text, Pr\xc3\xbcfung \xce\xb1\xce\xb2\xce\xb3 \xd0\x96.");
+    content.move_text(?b, 0.0, -40.0);
+    font.show(?b, mono.ok, "Reviewer:");
+    content.end_text(?b);
     val finished: err[error.Error] = content.finish(?b);
     if (sel finished.err) { ret finished; }
+
+    val made: res[form.Form, error.Error] = form.init(doc, form.embedded(mono.ok, "F1"));
+    if (sel made.err) { ret err[error.Error].err{made.err}; }
+    var f:        form.Form                    = made.ok;
+    val reviewer: res[form.Field, error.Error] = form.text_field(doc, ?f, nil,
+        form.Text{name: "reviewer", tooltip: "Reviewer", value: "Ren\xc3\xa9 Dupont", size: 12.0});
+    if (sel reviewer.err) { ret err[error.Error].err{reviewer.err}; }
+    var r:      form.Field                   = reviewer.ok;
+    val placed: res[object.Ref, error.Error] = form.widget(doc, ?f, ?r, ?p,
+        page.Rect{left: 150.0, bottom: 494.0, right: 360.0, top: 514.0});
+    if (sel placed.err) { ret err[error.Error].err{placed.err}; }
+    val embedded: err[error.Error] = font.embed(mono.ok);
+    if (sel embedded.err) { ret embedded; }
 
     val when: date.Date = date.Date{year: 2026, month: 10, day: 2, hour: 12, minute: 30, second: 0, offset: 120};
     var meta: metadata.Metadata;

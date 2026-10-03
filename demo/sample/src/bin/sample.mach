@@ -63,8 +63,8 @@ fun main(argc: i64, argv: **u8) i64 {
     }
     var a: allocator.Allocator;
     page.make(?a);
-    if (write(?a, 0, argv[1]) != 0) { ret 1; }
-    if (write(?a, 1, argv[2]) != 0) { ret 1; }
+    if (write(?a, 0, argv[1]) != 0)                   { ret 1; }
+    if (write(?a, 1, argv[2]) != 0)                   { ret 1; }
     if (write_built(?a, archive.build, argv[3]) != 0) { ret 1; }
     ret write_built(?a, fonts.build, argv[4]);
 }

@@ -20,8 +20,9 @@ use pdf.font;
 use pdf.output;
 use pdf.page;
 
+# liberation mono regular, which the archive sample also sets text in
 #[embed("fixtures/liberation/LiberationMono-Regular.ttf")]
-val REGULAR: [_]u8;
+pub val REGULAR: [_]u8;
 
 #[embed("fixtures/liberation/LiberationMono-Bold.ttf")]
 val BOLD: [_]u8;
