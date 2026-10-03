@@ -172,22 +172,66 @@ pub fun encode(t: *TrueType, text: *u8, len: usize, codes: *vector.Vector[u16]) 
     ret err[error.Error].ok{};
 }
 
-# show utf-8 text in a face, Tj
+# show len bytes of utf-8 text in a face, Tj
 #
 # the face must be the current font, selected by content.font under the name
-# page.use_font gave it. a failure is the builder's, reported by finish.
+# page.use_font gave it. nothing is written when the text cannot be encoded.
+# ---
+# b:    the builder
+# t:    the face
+# text: the utf-8 bytes
+# len:  their count
+# ret:  ok, or why the text could not be encoded, as encode reports it
+pub fun show_utf8(b: *content.Builder, t: *TrueType, text: *u8, len: usize) err[error.Error] {
+    vector.clear[u16](?t.run);
+    val encoded: err[error.Error] = encode(t, text, len, ?t.run);
+    if (sel encoded.err) { ret encoded; }
+    content.show_glyphs(b, t.run.data, nil, t.run.len);
+    ret err[error.Error].ok{};
+}
+
+# show utf-8 text in a face, Tj
+#
+# as show_utf8, with a failure the builder's, reported by finish.
 # ---
 # b:    the builder
 # t:    the face
 # text: the text
 pub fun show(b: *content.Builder, t: *TrueType, text: str) {
-    vector.clear[u16](?t.run);
-    val encoded: err[error.Error] = encode(t, text, str_len(text), ?t.run);
-    if (sel encoded.err) {
-        content.fail(b, encoded.err);
-        ret;
+    val shown: err[error.Error] = show_utf8(b, t, text, str_len(text));
+    if (sel shown.err) { content.fail(b, shown.err); }
+}
+
+# the face's ascent and descent in font units, from hhea or else head's box
+fun vertical(t: *TrueType, ascent: *i64, descent: *i64) {
+    @ascent  = t.face.head.y_max::i64;
+    @descent = t.face.head.y_min::i64;
+    if (sel t.face.hhea.some) {
+        @ascent  = t.face.hhea.some.ascent::i64;
+        @descent = t.face.hhea.some.descent::i64;
     }
-    content.show_glyphs(b, t.run.data, nil, t.run.len);
+}
+
+# the face's height above the baseline, as a fraction of the font size
+# ---
+# t:   the face
+# ret: the ascent
+pub fun ascent(t: *TrueType) f64 {
+    var up:   i64 = 0;
+    var down: i64 = 0;
+    vertical(t, ?up, ?down);
+    ret up::f64 / t.face.head.units_per_em::f64;
+}
+
+# the face's depth below the baseline, as a negative fraction of the font size
+# ---
+# t:   the face
+# ret: the descent
+pub fun descent(t: *TrueType) f64 {
+    var up:   i64 = 0;
+    var down: i64 = 0;
+    vertical(t, ?up, ?down);
+    ret down::f64 / t.face.head.units_per_em::f64;
 }
 
 # a length in font units as thousandths of an em, rounded half away from zero

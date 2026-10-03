@@ -62,8 +62,8 @@ val INSET: f64 = 2.0;
 # b:       the builder, inside a text object with the face's font selected
 # data:    the text as utf-8
 # len:     the count of bytes
-# ret:     ok, `invalid` for a character the font cannot show, or the
-#          allocator's refusal
+# ret:     ok, `invalid` or `glyph` for a character the font cannot show, or
+#          the allocator's refusal
 pub def Show: fun(ptr, *allocator.Allocator, *content.Builder, *u8, usize) err[error.Error];
 
 # the font a form draws its values in
@@ -600,6 +600,24 @@ pub fun standard(doc: *document.Document, base: str, name: str) res[Face, error.
     }
     ret res[Face, error.Error].ok{Face{font: made.ok, name: name, ascent: ascent, descent: descent,
         ctx: nil, show: show_win_ansi}};
+}
+
+fun show_embedded(ctx: ptr, scratch: *allocator.Allocator, b: *content.Builder, data: *u8, len: usize) err[error.Error] {
+    ret font.show_utf8(b, ctx::*font.TrueType, data, len);
+}
+
+# a face over an embedded truetype subset, which pdf/a allows
+#
+# a value draws as the face's glyph codes, so every value must be set before
+# font.embed writes the subset, and a value with a character the face has no
+# glyph for is refused naming it.
+# ---
+# t:    the face, from font.truetype
+# name: the resource name to select it by, which must outlive the form
+# ret:  the face
+pub fun embedded(t: *font.TrueType, name: str) Face {
+    ret Face{font: t.font, name: name, ascent: font.ascent(t), descent: font.descent(t),
+        ctx: t, show: show_embedded};
 }
 
 $if (capability.HOSTED) {
