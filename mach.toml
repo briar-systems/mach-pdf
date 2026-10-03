@@ -64,6 +64,10 @@ simd = "scalarize"
 vectorize = true
 float_reassoc = false
 
+[dep.font]
+git = "https://github.com/briar-systems/mach-font"
+ref = "commit/fde8e42c97e4d326c0a8c7fccfa3aebde4ff7150"
+
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
 version = "^9.0"
