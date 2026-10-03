@@ -7,6 +7,8 @@ fwd pdf.object;
 fwd pdf.filter;
 fwd pdf.output;
 fwd pdf.syntax;
+fwd pdf.parse;
+fwd pdf.reader;
 fwd pdf.document;
 fwd pdf.content;
 fwd pdf.page;
