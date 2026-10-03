@@ -11,3 +11,4 @@ fwd pdf.document;
 fwd pdf.content;
 fwd pdf.page;
 fwd pdf.font;
+fwd pdf.text;
