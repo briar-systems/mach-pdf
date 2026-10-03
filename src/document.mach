@@ -1,0 +1,688 @@
+# a pdf document: its indirect objects, its trailer, and how it is saved
+#
+# a document numbers its indirect objects from 1 in allocation order and owns
+# every object built in its arena. `save` writes the whole file and `append`
+# writes an incremental update (iso 32000-2 section 7.5.6) holding only the
+# objects defined or touched since the last save, after the bytes of the
+# revision before it. a document read from a file starts from `rebase`, which
+# records the prior revision's size and cross-reference offset, so its first
+# save is an update. both writers are deterministic: the same objects, in the
+# same order, give the same bytes, and nothing time or host dependent is
+# written unless the caller supplies it.
+
+use std.allocator;
+use std.allocator.arena;
+use std.collections.vector;
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use pdf.error;
+use pdf.filter;
+use pdf.object;
+use pdf.output;
+use pdf.syntax;
+
+val ARENA_CHUNK: usize = 65536;
+
+# the pdf version the header declares
+# ---
+# major: the major version
+# minor: the minor version
+pub rec Version {
+    major: u8;
+    minor: u8;
+}
+
+# the revision a save appends to
+# ---
+# xref_offset: the byte offset of its cross-reference table or stream
+# size:        its trailer /Size, one past its highest object number
+pub rec Base {
+    xref_offset: usize;
+    size:        u32;
+}
+
+# what an object number holds
+# ---
+# free:     the number holds no object
+# external: an object the prior revision holds that this document has not
+#           replaced
+# pending:  allocated but not yet given a value
+# defined:  the object this document holds for the number
+tag Slot: u8 {
+    free;
+    external;
+    pending;
+    defined: object.Object;
+}
+
+rec Entry {
+    slot:       Slot;
+    generation: u16;
+    dirty:      bool;
+}
+
+# a document under construction
+#
+# a document points into itself once initialized, so it stays where `init`
+# found it until `dnit`.
+# ---
+# arena:        the storage every object of the document lives in
+# objects:      the allocator over arena that object constructors take
+# backing:      the caller's allocator, for the object table and save scratch
+# entries:      the object table, indexed by object number
+# version:      the header version, 1.7 unless changed
+# xref_stream:  save cross-references as a stream (pdf 1.5) rather than a table
+# xref_filters: the filters the cross-reference stream is written through
+# root:         the catalog, the trailer's /Root
+# info:         the document information dictionary, the trailer's /Info
+# id:           the trailer's /ID, null for none
+# base:         the revision the next save appends to, none before the first
+pub rec Document {
+    arena:        arena.Arena;
+    objects:      allocator.Allocator;
+    backing:      *allocator.Allocator;
+    entries:      vector.Vector[Entry];
+    version:      Version;
+    xref_stream:  bool;
+    xref_filters: vector.Vector[object.Applied];
+    root:         opt[object.Ref];
+    info:         opt[object.Ref];
+    id:           object.Object;
+    base:         opt[Base];
+}
+
+fun failed(cause: allocator.Error) err[error.Error] {
+    ret err[error.Error].err{error.from_allocator(cause)};
+}
+
+fun invalid() err[error.Error] {
+    ret err[error.Error].err{error.Error.invalid{}};
+}
+
+# start an empty document
+# ---
+# doc:     the document, which must stay put until dnit
+# backing: the allocator its arena and object table draw from
+# ret:     ok, or the allocator's refusal
+pub fun init(doc: *Document, backing: *allocator.Allocator) err[error.Error] {
+    val started: err[allocator.Error] = arena.init(?doc.arena, backing, ARENA_CHUNK);
+    if (sel started.err) { ret failed(started.err); }
+    arena.make(?doc.objects, ?doc.arena);
+    doc.backing      = backing;
+    doc.entries      = vector.init[Entry](backing);
+    doc.version      = Version{major: 1, minor: 7};
+    doc.xref_stream  = false;
+    doc.xref_filters = vector.init[object.Applied](?doc.objects);
+    doc.root         = opt[object.Ref].none{};
+    doc.info         = opt[object.Ref].none{};
+    doc.id           = object.null();
+    doc.base         = opt[Base].none{};
+    # object number 0 heads the free list
+    val pushed: res[usize, allocator.Error] = vector.push[Entry](?doc.entries,
+        Entry{slot: Slot.free{}, generation: 65535, dirty: false});
+    if (sel pushed.err) {
+        arena.dnit(?doc.arena);
+        ret failed(pushed.err);
+    }
+    ret err[error.Error].ok{};
+}
+
+# release a document and every object built in it
+# ---
+# doc: the document
+pub fun dnit(doc: *Document) {
+    vector.dnit[Entry](?doc.entries);
+    arena.dnit(?doc.arena);
+}
+
+# the allocator object constructors take to build objects in the document
+# ---
+# doc: the document
+# ret: its object allocator, valid until dnit
+pub fun objects(doc: *Document) *allocator.Allocator {
+    ret ?doc.objects;
+}
+
+# take the next object number, to be given a value with define
+# ---
+# doc: the document
+# ret: the reference, or the allocator's refusal
+pub fun allocate(doc: *Document) res[object.Ref, error.Error] {
+    val number: usize                       = doc.entries.len;
+    val pushed: res[usize, allocator.Error] = vector.push[Entry](?doc.entries,
+        Entry{slot: Slot.pending{}, generation: 0, dirty: false});
+    if (sel pushed.err) { ret res[object.Ref, error.Error].err{error.from_allocator(pushed.err)}; }
+    ret res[object.Ref, error.Error].ok{object.Ref{number: number::u32, generation: 0}};
+}
+
+fun entry(doc: *Document, target: object.Ref) opt[*Entry] {
+    if (target.number == 0 || target.number::usize >= doc.entries.len) { ret opt[*Entry].none{}; }
+    val found: *Entry = ?doc.entries.data[target.number::usize];
+    if (sel found.slot.free) { ret opt[*Entry].none{}; }
+    # the prior revision's generations are the reader's to know, so its numbers take any
+    if (sel found.slot.external)               { ret opt[*Entry].some{found}; }
+    if (found.generation != target.generation) { ret opt[*Entry].none{}; }
+    ret opt[*Entry].some{found};
+}
+
+# give an object number its value, replacing any it had
+#
+# a number the prior revision holds is replaced in the next update, under the
+# generation target carries.
+# ---
+# doc:    the document
+# target: a reference allocate returned, or one the prior revision holds
+# value:  the object
+# ret:    ok, or `invalid` for a number the document does not hold
+pub fun define(doc: *Document, target: object.Ref, value: object.Object) err[error.Error] {
+    val found: opt[*Entry] = entry(doc, target);
+    if (!sel found.some) { ret invalid(); }
+    found.some.slot       = Slot.defined{value};
+    found.some.generation = target.generation;
+    found.some.dirty      = true;
+    ret err[error.Error].ok{};
+}
+
+# allocate an object number and give it value
+# ---
+# doc:   the document
+# value: the object
+# ret:   its reference, or the allocator's refusal
+pub fun add(doc: *Document, value: object.Object) res[object.Ref, error.Error] {
+    val made: res[object.Ref, error.Error] = allocate(doc);
+    if (sel made.err) { ret made; }
+    define(doc, made.ok, value);
+    ret made;
+}
+
+# the object a reference names, when the document holds it
+# ---
+# doc:    the document
+# target: the reference
+# ret:    the object, or none for a free, pending or external number
+pub fun lookup(doc: *Document, target: object.Ref) opt[object.Object] {
+    val found: opt[*Entry] = entry(doc, target);
+    if (!sel found.some)              { ret opt[object.Object].none{}; }
+    if (!sel found.some.slot.defined) { ret opt[object.Object].none{}; }
+    ret opt[object.Object].some{found.some.slot.defined};
+}
+
+# mark an object changed in place, so the next update rewrites it
+# ---
+# doc:    the document
+# target: the reference of a defined object
+# ret:    ok, or `invalid` for a number that holds no defined object
+pub fun touch(doc: *Document, target: object.Ref) err[error.Error] {
+    val found: opt[*Entry] = entry(doc, target);
+    if (sel found.some) {
+        if (sel found.some.slot.defined) {
+            found.some.dirty = true;
+            ret err[error.Error].ok{};
+        }
+    }
+    ret invalid();
+}
+
+# set the trailer's /ID to two byte strings
+#
+# pdf/a and signatures require an /ID, and nothing derives one, so output stays
+# deterministic: the caller supplies both.
+# ---
+# doc:        the document
+# first:      the permanent identifier
+# first_len:  its count of bytes
+# second:     the identifier of this revision
+# second_len: its count of bytes
+# ret:        ok, or the allocator's refusal
+pub fun set_id(doc: *Document, first: *u8, first_len: usize, second: *u8, second_len: usize) err[error.Error] {
+    val pair: res[*object.Array, error.Error] = object.array(?doc.objects);
+    if (sel pair.err) { ret err[error.Error].err{pair.err}; }
+    val a: res[object.Object, error.Error] = object.hex_string(?doc.objects, first, first_len);
+    if (sel a.err) { ret err[error.Error].err{a.err}; }
+    val b: res[object.Object, error.Error] = object.hex_string(?doc.objects, second, second_len);
+    if (sel b.err) { ret err[error.Error].err{b.err}; }
+    val pushed_a: err[error.Error] = object.push(pair.ok, a.ok);
+    if (sel pushed_a.err) { ret pushed_a; }
+    val pushed_b: err[error.Error] = object.push(pair.ok, b.ok);
+    if (sel pushed_b.err) { ret pushed_b; }
+    doc.id = object.Object.array{pair.ok};
+    ret err[error.Error].ok{};
+}
+
+# list a filter after the cross-reference stream's others
+# ---
+# doc:   the document
+# f:     the filter
+# parms: its decode parameters, null for none
+# ret:   ok, or the allocator's refusal
+pub fun xref_filter_with(doc: *Document, f: filter.Filter, parms: object.Object) err[error.Error] {
+    val pushed: res[usize, allocator.Error] = vector.push[object.Applied](?doc.xref_filters,
+        object.Applied{filter: f, parms: parms});
+    if (sel pushed.err) { ret failed(pushed.err); }
+    ret err[error.Error].ok{};
+}
+
+# set the trailer's /Root
+# ---
+# doc:    the document
+# target: the catalog
+pub fun set_root(doc: *Document, target: object.Ref) {
+    doc.root = opt[object.Ref].some{target};
+}
+
+# set the trailer's /Info
+# ---
+# doc:    the document
+# target: the document information dictionary
+pub fun set_info(doc: *Document, target: object.Ref) {
+    doc.info = opt[object.Ref].some{target};
+}
+
+fun held(doc: *Document, target: object.Ref) res[*object.Dict, error.Error] {
+    val found: opt[object.Object] = lookup(doc, target);
+    if (sel found.some) {
+        val value: object.Object = found.some;
+        if (sel value.dict) { ret res[*object.Dict, error.Error].ok{value.dict}; }
+    }
+    ret res[*object.Dict, error.Error].err{error.Error.invalid{}};
+}
+
+fun added(doc: *Document, kind: str) res[object.Ref, error.Error] {
+    val made: res[*object.Dict, error.Error] = object.dict(?doc.objects);
+    if (sel made.err) { ret res[object.Ref, error.Error].err{made.err}; }
+    if (kind != nil) {
+        val typed: err[error.Error] = object.set_name(made.ok, "Type", kind);
+        if (sel typed.err) { ret res[object.Ref, error.Error].err{typed.err}; }
+    }
+    ret add(doc, object.Object.dict{made.ok});
+}
+
+# the catalog, made and set as /Root on first use
+# ---
+# doc: the document
+# ret: the catalog dictionary, `invalid` when /Root names no dictionary the
+#      document holds, or the allocator's refusal
+pub fun catalog(doc: *Document) res[*object.Dict, error.Error] {
+    if (sel doc.root.some) { ret held(doc, doc.root.some); }
+    val made: res[object.Ref, error.Error] = added(doc, "Catalog");
+    if (sel made.err) { ret res[*object.Dict, error.Error].err{made.err}; }
+    set_root(doc, made.ok);
+    ret held(doc, made.ok);
+}
+
+# the document information dictionary, made and set as /Info on first use
+# ---
+# doc: the document
+# ret: the dictionary, `invalid` when /Info names no dictionary the document
+#      holds, or the allocator's refusal
+pub fun info(doc: *Document) res[*object.Dict, error.Error] {
+    if (sel doc.info.some) { ret held(doc, doc.info.some); }
+    val made: res[object.Ref, error.Error] = added(doc, nil);
+    if (sel made.err) { ret res[*object.Dict, error.Error].err{made.err}; }
+    set_info(doc, made.ok);
+    ret held(doc, made.ok);
+}
+
+# start from a revision read from a file, so the next save is an update
+#
+# every number below base.size becomes one the prior revision holds, and new
+# objects number from base.size. the reader sets /Root, /Info and /ID from the
+# prior trailer after this.
+# ---
+# doc:  a document with no objects yet
+# base: the prior revision
+# ret:  ok, `invalid` for a document that already holds objects, or the
+#       allocator's refusal
+pub fun rebase(doc: *Document, base: Base) err[error.Error] {
+    if (doc.entries.len != 1 || base.size == 0) { ret invalid(); }
+    for (doc.entries.len < base.size::usize) {
+        val pushed: res[usize, allocator.Error] = vector.push[Entry](?doc.entries,
+            Entry{slot: Slot.external{}, generation: 0, dirty: false});
+        if (sel pushed.err) { ret failed(pushed.err); }
+    }
+    doc.base = opt[Base].some{base};
+    ret err[error.Error].ok{};
+}
+
+# the bytes the widest offset needs in a cross-reference stream row
+fun width_of(value: usize) usize {
+    var width: usize = 1;
+    var rest:  usize = value >> 8;
+    for (rest != 0) {
+        width = width + 1;
+        rest  = rest >> 8;
+    }
+    ret width;
+}
+
+fun big_endian(out: *output.Output, value: u64, width: usize) {
+    var i: usize = width;
+    for (i > 0) {
+        i = i - 1;
+        output.byte(out, ((value >> (i * 8)::u64) & 0xff)::u8);
+    }
+}
+
+# write the trailer entries both cross-reference forms share
+fun trailer(doc: *Document, d: *object.Dict, size: usize) err[error.Error] {
+    val sized: err[error.Error] = object.set(d, "Size", object.integer(size::i64));
+    if (sel sized.err) { ret sized; }
+    if (sel doc.root.some) {
+        val root: err[error.Error] = object.set(d, "Root", object.reference(doc.root.some));
+        if (sel root.err) { ret root; }
+    }
+    if (sel doc.info.some) {
+        val info: err[error.Error] = object.set(d, "Info", object.reference(doc.info.some));
+        if (sel info.err) { ret info; }
+    }
+    if (!sel doc.id.null) {
+        val id: err[error.Error] = object.set(d, "ID", doc.id);
+        if (sel id.err) { ret id; }
+    }
+    if (sel doc.base.some) {
+        ret object.set(d, "Prev", object.integer(doc.base.some.xref_offset::i64));
+    }
+    ret err[error.Error].ok{};
+}
+
+# the first, count pairs of the runs of numbers an update carries, from 1
+fun run(runs: *vector.Vector[usize], first: usize, count: usize) err[error.Error] {
+    val pushed_first: res[usize, allocator.Error] = vector.push[usize](runs, first);
+    if (sel pushed_first.err) { ret failed(pushed_first.err); }
+    val pushed_count: res[usize, allocator.Error] = vector.push[usize](runs, count);
+    if (sel pushed_count.err) { ret failed(pushed_count.err); }
+    ret err[error.Error].ok{};
+}
+
+fun subsections(offsets: *vector.Vector[usize], runs: *vector.Vector[usize]) err[error.Error] {
+    var n: usize = 1;
+    for (n < offsets.len) {
+        if (offsets.data[n] == 0) {
+            n = n + 1;
+            cnt;
+        }
+        var end: usize = n;
+        for (end < offsets.len && offsets.data[end] != 0) { end = end + 1; }
+        val pushed: err[error.Error] = run(runs, n, end - n);
+        if (sel pushed.err) { ret pushed; }
+        n = end;
+    }
+    ret err[error.Error].ok{};
+}
+
+fun xref_table(doc: *Document, out: *output.Output, offsets: *vector.Vector[usize], runs: *vector.Vector[usize], scratch: *allocator.Allocator) err[error.Error] {
+    output.text(out, "xref\n");
+    var i: usize = 0;
+    for (i < runs.len) {
+        val first: usize = runs.data[i];
+        val count: usize = runs.data[i + 1];
+        output.integer(out, first::i64);
+        output.byte(out, ' ');
+        output.integer(out, count::i64);
+        output.byte(out, '\n');
+        var n: usize = first;
+        for (n < first + count) {
+            if (n == 0) {
+                output.text(out, "0000000000 65535 f\r\n");
+            }
+            or {
+                output.padded(out, offsets.data[n]::u64, 10);
+                output.byte(out, ' ');
+                output.padded(out, doc.entries.data[n].generation::u64, 5);
+                output.text(out, " n\r\n");
+            }
+            n = n + 1;
+        }
+        i = i + 2;
+    }
+    val d: res[*object.Dict, error.Error] = object.dict(scratch);
+    if (sel d.err) { ret err[error.Error].err{d.err}; }
+    val filled: err[error.Error] = trailer(doc, d.ok, doc.entries.len);
+    if (sel filled.err) { ret filled; }
+    output.text(out, "trailer\n");
+    val wrote: err[error.Error] = syntax.write(out, object.Object.dict{d.ok});
+    output.byte(out, '\n');
+    ret wrote;
+}
+
+fun xref_stream(doc: *Document, out: *output.Output, offsets: *vector.Vector[usize], runs: *vector.Vector[usize], number: usize, scratch: *allocator.Allocator) err[error.Error] {
+    val s: res[*object.Stream, error.Error] = object.stream(scratch);
+    if (sel s.err) { ret err[error.Error].err{s.err}; }
+    val widths: res[*object.Array, error.Error] = object.array(scratch);
+    if (sel widths.err) { ret err[error.Error].err{widths.err}; }
+    val index: res[*object.Array, error.Error] = object.array(scratch);
+    if (sel index.err) { ret err[error.Error].err{index.err}; }
+    var r: usize = 0;
+    for (r < runs.len) {
+        val pushed: err[error.Error] = object.push(index.ok, object.integer(runs.data[r]::i64));
+        if (sel pushed.err) { ret pushed; }
+        r = r + 1;
+    }
+    val wide: usize            = width_of(offsets.data[number]);
+    val set:  err[error.Error] = error.first(
+        object.push(widths.ok, object.integer(1)),
+        object.push(widths.ok, object.integer(wide::i64)),
+        object.push(widths.ok, object.integer(2)),
+        object.set_name(s.ok.dict, "Type", "XRef"),
+        trailer(doc, s.ok.dict, doc.entries.len),
+        object.set(s.ok.dict, "Index", object.Object.array{index.ok}),
+        object.set(s.ok.dict, "W", object.Object.array{widths.ok}));
+    if (sel set.err) { ret set; }
+
+    var rows: output.Output = output.init(scratch);
+    var i:    usize         = 0;
+    for (i < runs.len) {
+        val first: usize = runs.data[i];
+        val count: usize = runs.data[i + 1];
+        var n:     usize = first;
+        for (n < first + count) {
+            if (n == 0) {
+                output.byte(?rows, 0);
+                big_endian(?rows, 0, wide);
+                big_endian(?rows, 65535, 2);
+            }
+            or {
+                output.byte(?rows, 1);
+                big_endian(?rows, offsets.data[n]::u64, wide);
+                big_endian(?rows, doc.entries.data[n].generation::u64, 2);
+            }
+            n = n + 1;
+        }
+        i = i + 2;
+    }
+    val built: err[error.Error] = output.status(?rows);
+    if (sel built.err) { ret built; }
+    s.ok.data = rows.bytes;
+    var f: usize = 0;
+    for (f < doc.xref_filters.len) {
+        val listed: err[error.Error] = object.filter_with(s.ok, doc.xref_filters.data[f].filter,
+            doc.xref_filters.data[f].parms);
+        if (sel listed.err) { ret listed; }
+        f = f + 1;
+    }
+    ret syntax.indirect(out, object.Ref{number: number::u32, generation: 0}, object.Object.stream{s.ok});
+}
+
+# write one revision: the objects it carries, its cross-references and trailer
+fun revision(doc: *Document, out: *output.Output, full: bool) err[error.Error] {
+    if (!sel doc.root.some) { ret invalid(); }
+    # offsets[n] is where object n landed in this revision, zero when it is not in it
+    var offsets: vector.Vector[usize] = vector.init[usize](doc.backing);
+    fin { vector.dnit[usize](?offsets); }
+    var scratch: arena.Arena;
+    val started: err[allocator.Error] = arena.init(?scratch, doc.backing, 0);
+    if (sel started.err) { ret failed(started.err); }
+    fin { arena.dnit(?scratch); }
+    var temporary: allocator.Allocator;
+    arena.make(?temporary, ?scratch);
+
+    if (full) {
+        output.text(out, "%PDF-");
+        output.integer(out, doc.version.major::i64);
+        output.byte(out, '.');
+        output.integer(out, doc.version.minor::i64);
+        # a comment of high bytes marks the file binary to transfer tools
+        output.text(out, "\n%\xe2\xe3\xcf\xd3\n");
+    }
+    var n: usize = 0;
+    for (n < doc.entries.len) {
+        val e:  *Entry = ?doc.entries.data[n];
+        var at: usize  = 0;
+        if (sel e.slot.pending) { ret err[error.Error].err{error.Error.unset{n::u32}}; }
+        if (sel e.slot.defined) {
+            if (full || e.dirty) {
+                at = output.offset(out);
+                val wrote: err[error.Error] = syntax.indirect(out,
+                    object.Ref{number: n::u32, generation: e.generation}, e.slot.defined);
+                if (sel wrote.err) { ret wrote; }
+            }
+        }
+        val pushed: res[usize, allocator.Error] = vector.push[usize](?offsets, at);
+        if (sel pushed.err) { ret failed(pushed.err); }
+        n = n + 1;
+    }
+
+    # a cross-reference stream takes the next number and lists itself
+    var number:  usize = 0;
+    val xref_at: usize = output.offset(out);
+    if (doc.xref_stream) {
+        val made: res[object.Ref, error.Error] = allocate(doc);
+        if (sel made.err) { ret err[error.Error].err{made.err}; }
+        number                        = made.ok.number::usize;
+        doc.entries.data[number].slot = Slot.external{};
+        val pushed: res[usize, allocator.Error] = vector.push[usize](?offsets, xref_at);
+        if (sel pushed.err) { ret failed(pushed.err); }
+    }
+
+    var runs: vector.Vector[usize] = vector.init[usize](doc.backing);
+    fin { vector.dnit[usize](?runs); }
+    var listed: err[error.Error] = err[error.Error].ok{};
+    if (full) {
+        listed = run(?runs, 0, offsets.len);
+    }
+    or {
+        listed = subsections(?offsets, ?runs);
+    }
+    if (sel listed.err) { ret listed; }
+
+    var wrote: err[error.Error] = err[error.Error].ok{};
+    if (doc.xref_stream) {
+        wrote = xref_stream(doc, out, ?offsets, ?runs, number, ?temporary);
+    }
+    or {
+        wrote = xref_table(doc, out, ?offsets, ?runs, ?temporary);
+    }
+    if (sel wrote.err) { ret wrote; }
+    output.text(out, "startxref\n");
+    output.integer(out, xref_at::i64);
+    output.text(out, "\n%%EOF\n");
+    val status: err[error.Error] = output.status(out);
+    if (sel status.err) { ret status; }
+
+    doc.base = opt[Base].some{Base{xref_offset: xref_at, size: doc.entries.len::u32}};
+    n        = 0;
+    for (n < doc.entries.len) {
+        doc.entries.data[n].dirty = false;
+        n                         = n + 1;
+    }
+    ret err[error.Error].ok{};
+}
+
+# write the whole document as a new file
+#
+# a document saves whole once: a later revision is an update through append.
+# ---
+# doc: a document with a catalog that has not been saved or rebased
+# out: an empty output to write the file to
+# ret: ok, `invalid` for a document with no /Root or a prior revision,
+#      `unset` naming an allocated number with no value, a writing failure, or
+#      the allocator's refusal
+pub fun save(doc: *Document, out: *output.Output) err[error.Error] {
+    if (sel doc.base.some || output.offset(out) != 0) { ret invalid(); }
+    ret revision(doc, out, true);
+}
+
+# append an incremental update holding every object defined or touched since
+# the last save
+# ---
+# doc: a saved or rebased document
+# out: the output holding the bytes of the prior revision, unchanged since
+# ret: ok, `base` for a document with no prior revision, `invalid` for an
+#      output shorter than that revision, `unset`, a writing failure, or the
+#      allocator's refusal
+pub fun append(doc: *Document, out: *output.Output) err[error.Error] {
+    if (!sel doc.base.some)                              { ret err[error.Error].err{error.Error.base{}}; }
+    if (output.offset(out) <= doc.base.some.xref_offset) { ret invalid(); }
+    ret revision(doc, out, false);
+}
+
+$if (capability.HOSTED) {
+    use std.allocator.page;
+    use std.memory;
+    use std.types.string.str_len;
+
+    test save__refuses_unset_numbers_and_saves_once {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var doc:     Document;
+        val started: err[error.Error] = init(?doc, ?a);
+        if (sel started.err) { ret 1; }
+        fin { dnit(?doc); }
+        var out: output.Output = output.init(?a);
+        fin { output.dnit(?out); }
+        val root: res[*object.Dict, error.Error] = catalog(?doc);
+        if (sel root.err) { ret 2; }
+        val held: res[object.Ref, error.Error] = allocate(?doc);
+        if (sel held.err) { ret 3; }
+        val early: err[error.Error] = append(?doc, ?out);
+        if (!(sel early.err && sel early.err.base)) { ret 4; }
+        val unset: err[error.Error] = save(?doc, ?out);
+        if (!sel unset.err) { ret 5; }
+        val cause: error.Error = unset.err;
+        if (!(sel cause.unset && cause.unset == held.ok.number)) { ret 5; }
+        output.dnit(?out);
+        out = output.init(?a);
+        define(?doc, held.ok, object.integer(7));
+        val saved: err[error.Error] = save(?doc, ?out);
+        if (sel saved.err) { ret 6; }
+        val again: err[error.Error] = save(?doc, ?out);
+        if (!(sel again.err && sel again.err.invalid)) { ret 7; }
+        ret 0;
+    }
+
+    test rebase__numbers_new_objects_after_the_prior_revision {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var doc:     Document;
+        val started: err[error.Error] = init(?doc, ?a);
+        if (sel started.err) { ret 1; }
+        fin { dnit(?doc); }
+        val based: err[error.Error] = rebase(?doc, Base{xref_offset: 9, size: 5});
+        if (sel based.err) { ret 2; }
+        val foreign: err[error.Error] = define(?doc, object.Ref{number: 5, generation: 0}, object.null());
+        if (!sel foreign.err) { ret 3; }
+        val made: res[object.Ref, error.Error] = add(?doc, object.integer(1));
+        if (!(sel made.ok && made.ok.number == 5)) { ret 4; }
+        set_root(?doc, object.Ref{number: 1, generation: 0});
+        val prior: [10]u8        = [10]u8{'%', 'P', 'D', 'F', '-', '1', '.', '7', '\n', '\n'};
+        var out:   output.Output = output.init(?a);
+        fin { output.dnit(?out); }
+        output.put(?out, ?prior[0], 10);
+        val appended: err[error.Error] = append(?doc, ?out);
+        if (sel appended.err) { ret 5; }
+        val expected: str   = "5 0 obj\n1\nendobj\nxref\n5 1\n0000000010 00000 n\r\ntrailer\n<< /Size 6 /Root 1 0 R /Prev 9 >>\nstartxref\n27\n%%EOF\n";
+        val len:      usize = str_len(expected);
+        if (output.offset(?out) != 10 + len) { ret 6; }
+        val bytes: *u8 = output.data(?out);
+        if (!memory.raw_equal((?bytes[10])::ptr, expected::ptr, len)) { ret 7; }
+        ret 0;
+    }
+}

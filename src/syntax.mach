@@ -1,0 +1,412 @@
+# the byte spelling of pdf objects (iso 32000-2 section 7.3)
+#
+# every object has exactly one spelling, so equal objects give equal bytes on
+# every host: integers in decimal, reals as trimmed decimals, literal strings
+# with octal escapes for bytes outside printable ascii, uppercase hexadecimal,
+# names with #xx escapes, and single spaces between tokens.
+
+use std.collections.vector;
+use std.memory;
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+
+use pdf.error;
+use pdf.object;
+use pdf.output;
+
+val HEX: *u8 = "0123456789ABCDEF";
+
+fun real(out: *output.Output, value: object.Real) {
+    var digits: [20]u8;
+    var count:  usize = 0;
+    var rest:   i64   = value.mantissa;
+    if (rest < 0) { output.byte(out, '-'); }
+    for (rest != 0 || count == 0) {
+        var digit: i64 = rest % 10;
+        if (digit < 0) { digit = -digit; }
+        digits[count] = '0' + digit::u8;
+        count         = count + 1;
+        rest          = rest / 10;
+    }
+    val places: usize = value.places::usize;
+    # pad so at least one digit stands before the point
+    for (count <= places) {
+        digits[count] = '0';
+        count         = count + 1;
+    }
+    # digits holds the number least significant first, places of them after the point
+    var first: usize = 0;
+    for (first < places && digits[first] == '0') { first = first + 1; }
+    var i: usize = count;
+    for (i > places) {
+        i = i - 1;
+        output.byte(out, digits[i]);
+    }
+    if (first == places) { ret; }
+    output.byte(out, '.');
+    for (i > first) {
+        i = i - 1;
+        output.byte(out, digits[i]);
+    }
+}
+
+fun literal(out: *output.Output, value: object.String) {
+    output.byte(out, '(');
+    var i: usize = 0;
+    for (i < value.len) {
+        val c: u8 = value.data[i];
+        if (c == '(' || c == ')' || c == '\\') {
+            output.byte(out, '\\');
+            output.byte(out, c);
+        }
+        or (c < 0x20 || c > 0x7e) {
+            output.byte(out, '\\');
+            output.byte(out, '0' + (c >> 6));
+            output.byte(out, '0' + ((c >> 3) & 7));
+            output.byte(out, '0' + (c & 7));
+        }
+        or {
+            output.byte(out, c);
+        }
+        i = i + 1;
+    }
+    output.byte(out, ')');
+}
+
+fun hex(out: *output.Output, value: object.String) {
+    output.byte(out, '<');
+    var i: usize = 0;
+    for (i < value.len) {
+        output.byte(out, HEX[(value.data[i] >> 4)::usize]);
+        output.byte(out, HEX[(value.data[i] & 0x0f)::usize]);
+        i = i + 1;
+    }
+    output.byte(out, '>');
+}
+
+fun regular(c: u8) bool {
+    if (c < 0x21 || c > 0x7e) { ret false; }
+    if (c == '(' || c == ')' || c == '<' || c == '>' || c == '[' || c == ']'
+        || c == '{' || c == '}' || c == '/' || c == '%' || c == '#') { ret false; }
+    ret true;
+}
+
+fun name(out: *output.Output, value: object.Name) {
+    output.byte(out, '/');
+    var i: usize = 0;
+    for (i < value.len) {
+        val c: u8 = value.data[i];
+        if (regular(c)) {
+            output.byte(out, c);
+        }
+        or {
+            output.byte(out, '#');
+            output.byte(out, HEX[(c >> 4)::usize]);
+            output.byte(out, HEX[(c & 0x0f)::usize]);
+        }
+        i = i + 1;
+    }
+}
+
+fun reference(out: *output.Output, target: object.Ref) {
+    output.integer(out, target.number::i64);
+    output.byte(out, ' ');
+    output.integer(out, target.generation::i64);
+    output.text(out, " R");
+}
+
+fun entries(out: *output.Output, d: *object.Dict, skip_stream_keys: bool) err[error.Error] {
+    var i: usize = 0;
+    for (i < d.entries.len) {
+        val entry: *object.Entry = ?d.entries.data[i];
+        i = i + 1;
+        if (skip_stream_keys && (object.name_is(entry.key, "Length")
+            || object.name_is(entry.key, "Filter")
+            || object.name_is(entry.key, "DecodeParms"))) { cnt; }
+        name(out, entry.key);
+        output.byte(out, ' ');
+        val wrote: err[error.Error] = write(out, entry.value);
+        if (sel wrote.err) { ret wrote; }
+        output.byte(out, ' ');
+    }
+    ret err[error.Error].ok{};
+}
+
+fun reserved(out: *output.Output, span: *object.Reserved) err[error.Error] {
+    val start: usize            = output.offset(out);
+    val wrote: err[error.Error] = write(out, span.initial);
+    if (sel wrote.err) { ret wrote; }
+    val used: usize = output.offset(out) - start;
+    if (used > span.width) { ret err[error.Error].err{error.Error.reservation{}}; }
+    var pad: usize = used;
+    for (pad < span.width) {
+        output.byte(out, ' ');
+        pad = pad + 1;
+    }
+    span.offset  = start;
+    span.written = true;
+    ret err[error.Error].ok{};
+}
+
+# append the spelling of a direct object
+#
+# a stream is only an indirect object's value, so writing one here is
+# `invalid`; `indirect` writes streams.
+# ---
+# out:   the output
+# value: the object
+# ret:   ok, or why the object has no spelling; allocation refusals surface
+#        through `output.status`
+pub fun write(out: *output.Output, value: object.Object) err[error.Error] {
+    if (sel value.null) {
+        output.text(out, "null");
+    }
+    or (sel value.boolean) {
+        if (value.boolean) { output.text(out, "true"); }
+        or                 { output.text(out, "false"); }
+    }
+    or (sel value.integer) {
+        output.integer(out, value.integer);
+    }
+    or (sel value.real) {
+        real(out, value.real);
+    }
+    or (sel value.string) {
+        if (value.string.hex) { hex(out, value.string); }
+        or                    { literal(out, value.string); }
+    }
+    or (sel value.name) {
+        name(out, value.name);
+    }
+    or (sel value.reference) {
+        reference(out, value.reference);
+    }
+    or (sel value.array) {
+        output.byte(out, '[');
+        var i: usize = 0;
+        for (i < value.array.items.len) {
+            if (i > 0) { output.byte(out, ' '); }
+            val wrote: err[error.Error] = write(out, value.array.items.data[i]);
+            if (sel wrote.err) { ret wrote; }
+            i = i + 1;
+        }
+        output.byte(out, ']');
+    }
+    or (sel value.dict) {
+        output.text(out, "<< ");
+        val wrote: err[error.Error] = entries(out, value.dict, false);
+        if (sel wrote.err) { ret wrote; }
+        output.text(out, ">>");
+    }
+    or (sel value.reserved) {
+        ret reserved(out, value.reserved);
+    }
+    or {
+        ret err[error.Error].err{error.Error.invalid{}};
+    }
+    ret err[error.Error].ok{};
+}
+
+fun release(bytes: *vector.Vector[u8]) {
+    vector.dnit[u8](bytes);
+}
+
+# encode a stream's data through its filters, last listed first
+fun encode(out: *output.Output, s: *object.Stream, encoded: *vector.Vector[u8]) err[error.Error] {
+    var current: vector.Vector[u8] = vector.init[u8](out.bytes.a);
+    var owned:   bool              = false;
+    var i:       usize             = s.filters.len;
+    for (i > 0) {
+        i = i - 1;
+        val applied: *object.Applied = ?s.filters.data[i];
+        if (applied.filter.encode == nil) {
+            if (owned) { release(?current); }
+            ret err[error.Error].err{error.Error.encoder{}};
+        }
+        var next:  vector.Vector[u8] = vector.init[u8](out.bytes.a);
+        var input: *u8               = s.data.data;
+        var len:   usize             = s.data.len;
+        if (owned) {
+            input = current.data;
+            len   = current.len;
+        }
+        val ran: err[error.Error] = applied.filter.encode(applied.filter.ctx, input, len, ?next);
+        if (owned) { release(?current); }
+        if (sel ran.err) {
+            release(?next);
+            ret ran;
+        }
+        current = next;
+        owned   = true;
+    }
+    @encoded = current;
+    ret err[error.Error].ok{};
+}
+
+fun stream(out: *output.Output, s: *object.Stream) err[error.Error] {
+    var bytes: *u8               = s.data.data;
+    var len:   usize             = s.data.len;
+    var coded: vector.Vector[u8] = vector.init[u8](out.bytes.a);
+    fin { release(?coded); }
+    if (!s.encoded && s.filters.len > 0) {
+        val ran: err[error.Error] = encode(out, s, ?coded);
+        if (sel ran.err) { ret ran; }
+        bytes = coded.data;
+        len   = coded.len;
+    }
+    output.text(out, "<< ");
+    val wrote: err[error.Error] = entries(out, s.dict, true);
+    if (sel wrote.err) { ret wrote; }
+    if (s.filters.len > 0) {
+        var parms: bool  = false;
+        var i:     usize = 0;
+        output.text(out, "/Filter ");
+        if (s.filters.len > 1) { output.byte(out, '['); }
+        for (i < s.filters.len) {
+            if (i > 0) { output.byte(out, ' '); }
+            output.byte(out, '/');
+            output.text(out, s.filters.data[i].filter.name);
+            if (!sel s.filters.data[i].parms.null) { parms = true; }
+            i = i + 1;
+        }
+        if (s.filters.len > 1) { output.byte(out, ']'); }
+        output.byte(out, ' ');
+        if (parms) {
+            output.text(out, "/DecodeParms ");
+            if (s.filters.len > 1) { output.byte(out, '['); }
+            i = 0;
+            for (i < s.filters.len) {
+                if (i > 0) { output.byte(out, ' '); }
+                val parm: err[error.Error] = write(out, s.filters.data[i].parms);
+                if (sel parm.err) { ret parm; }
+                i = i + 1;
+            }
+            if (s.filters.len > 1) { output.byte(out, ']'); }
+            output.byte(out, ' ');
+        }
+    }
+    output.text(out, "/Length ");
+    output.integer(out, len::i64);
+    output.text(out, " >>\nstream\n");
+    output.put(out, bytes, len);
+    output.text(out, "\nendstream");
+    ret err[error.Error].ok{};
+}
+
+# append an indirect object definition, `number generation obj ... endobj`
+# ---
+# out:    the output
+# target: the object's number and generation
+# value:  the object, a stream or any direct object
+# ret:    ok, or why the object has no spelling
+pub fun indirect(out: *output.Output, target: object.Ref, value: object.Object) err[error.Error] {
+    output.integer(out, target.number::i64);
+    output.byte(out, ' ');
+    output.integer(out, target.generation::i64);
+    output.text(out, " obj\n");
+    var wrote: err[error.Error] = err[error.Error].ok{};
+    if (sel value.stream) {
+        wrote = stream(out, value.stream);
+    }
+    or {
+        wrote = write(out, value);
+    }
+    if (sel wrote.err) { ret wrote; }
+    output.text(out, "\nendobj\n");
+    ret err[error.Error].ok{};
+}
+
+# fill a written reservation with value, padded with spaces to its width
+# ---
+# out:   the output the reservation was written to
+# span:  the reservation
+# value: the value to put in it
+# ret:   ok, `invalid` for a reservation not yet written, `reservation` for a
+#        value wider than it, or the allocator's refusal
+pub fun fill(out: *output.Output, span: *object.Reserved, value: object.Object) err[error.Error] {
+    if (!span.written) { ret err[error.Error].err{error.Error.invalid{}}; }
+    var spelled: output.Output = output.init(out.bytes.a);
+    fin { output.dnit(?spelled); }
+    val wrote: err[error.Error] = write(?spelled, value);
+    if (sel wrote.err)                        { ret wrote; }
+    if (output.offset(?spelled) > span.width) { ret err[error.Error].err{error.Error.reservation{}}; }
+    for (output.offset(?spelled) < span.width && !spelled.failed) { output.byte(?spelled, ' '); }
+    val status: err[error.Error] = output.status(?spelled);
+    if (sel status.err) { ret status; }
+    ret output.patch(out, span.offset, output.data(?spelled), span.width);
+}
+
+$if (capability.HOSTED) {
+    use pdf.filter;
+    use std.allocator;
+    use std.allocator.page;
+    use std.types.result.res;
+    use std.types.string.str;
+    use std.types.string.str_len;
+
+    fun held(made: res[object.Object, error.Error]) object.Object {
+        if (sel made.ok) { ret made.ok; }
+        ret object.null();
+    }
+
+    fun spelled(out: *output.Output, expected: str) bool {
+        if (output.offset(out) != str_len(expected)) { ret false; }
+        ret memory.raw_equal(output.data(out)::ptr, expected::ptr, output.offset(out));
+    }
+
+    test write__spells_each_kind_canonically {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var out: output.Output = output.init(?a);
+        fin { output.dnit(?out); }
+        val list: res[*object.Array, error.Error] = object.array(?a);
+        if (sel list.err) { ret 1; }
+        object.push(list.ok, object.null());
+        object.push(list.ok, object.boolean(true));
+        object.push(list.ok, object.real(object.Real{mantissa: -5, places: 2}));
+        object.push(list.ok, object.real(object.Real{mantissa: 1200, places: 2}));
+        object.push(list.ok, object.real(object.Real{mantissa: 1250, places: 3}));
+        object.push(list.ok, held(object.text(?a, "a(b)\\\n")));
+        object.push(list.ok, held(object.hex_string(?a, "\x01\xab", 2)));
+        object.push(list.ok, held(object.name(?a, "A b#/")));
+        object.push(list.ok, object.reference(object.Ref{number: 12, generation: 0}));
+        val d: res[*object.Dict, error.Error] = object.dict(?a);
+        if (sel d.err) { ret 2; }
+        object.set(d.ok, "K", object.Object.array{list.ok});
+        write(?out, object.Object.dict{d.ok});
+        if (!spelled(?out, "<< /K [null true -0.05 12 1.25 (a\\(b\\)\\\\\\012) <01AB> /A#20b#23#2F 12 0 R] >>")) { ret 3; }
+        ret 0;
+    }
+
+    test indirect__writes_streams_through_their_filters_and_fills_reservations {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var out: output.Output = output.init(?a);
+        fin { output.dnit(?out); }
+        val s: res[*object.Stream, error.Error] = object.stream(?a);
+        if (sel s.err) { ret 1; }
+        object.write(s.ok, "hi", 2);
+        object.set(s.ok.dict, "Length", object.integer(99));
+        object.filter_with(s.ok, filter.ascii_hex(), object.null());
+        val wrote: err[error.Error] = indirect(?out, object.Ref{number: 3, generation: 0}, object.Object.stream{s.ok});
+        if (sel wrote.err)                                                                                          { ret 2; }
+        if (!spelled(?out, "3 0 obj\n<< /Filter /ASCIIHexDecode /Length 5 >>\nstream\n6869>\nendstream\nendobj\n")) { ret 3; }
+
+        val r: res[*object.Reserved, error.Error] = object.reserve(?a, 6, object.integer(0));
+        if (sel r.err) { ret 4; }
+        val at: usize = output.offset(?out);
+        write(?out, object.Object.reserved{r.ok});
+        if (r.ok.offset != at || output.offset(?out) != at + 6) { ret 5; }
+        val fits: err[error.Error] = fill(?out, r.ok, object.integer(1234));
+        if (sel fits.err) { ret 6; }
+        val wide: err[error.Error] = fill(?out, r.ok, object.integer(1234567));
+        if (!(sel wide.err && sel wide.err.reservation)) { ret 7; }
+        val bytes: *u8 = output.data(?out);
+        if (!memory.raw_equal((?bytes[at])::ptr, "1234  "::ptr, 6)) { ret 8; }
+        ret 0;
+    }
+}

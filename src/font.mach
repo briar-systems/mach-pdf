@@ -1,0 +1,30 @@
+# font dictionaries (iso 32000-2 section 9.6)
+
+use std.types.error.err;
+use std.types.result.res;
+use std.types.string.str;
+
+use pdf.document;
+use pdf.error;
+use pdf.object;
+
+# add a dictionary for one of the standard 14 type 1 fonts, encoded as
+# WinAnsiEncoding
+#
+# a viewer supplies the standard fonts, so nothing is embedded. pdf/a forbids
+# them: an archival document embeds its fonts instead.
+# ---
+# doc:  the document
+# base: the font's /BaseFont, such as "Helvetica" or "Times-Bold"
+# ret:  the font's reference, or the allocator's refusal
+pub fun standard(doc: *document.Document, base: str) res[object.Ref, error.Error] {
+    val d: res[*object.Dict, error.Error] = object.dict(document.objects(doc));
+    if (sel d.err) { ret res[object.Ref, error.Error].err{d.err}; }
+    val set: err[error.Error] = error.first(
+        object.set_name(d.ok, "Type", "Font"),
+        object.set_name(d.ok, "Subtype", "Type1"),
+        object.set_name(d.ok, "BaseFont", base),
+        object.set_name(d.ok, "Encoding", "WinAnsiEncoding"));
+    if (sel set.err) { ret res[object.Ref, error.Error].err{set.err}; }
+    ret document.add(doc, object.Object.dict{d.ok});
+}
