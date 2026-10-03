@@ -310,13 +310,13 @@ fun intent(doc: *document.Document, root: *object.Dict) err[error.Error] {
 
 # make a document pdf/a-3b
 #
-# writes the information dictionary and xmp metadata from meta with the
-# pdf/a-3b identification, adds the srgb output intent, and requires check of
+# writes the information dictionary and xmp metadata once, from meta and its
+# extra xmp properties with the pdf/a-3b identification added, adds the srgb output intent, and requires check of
 # every later save. the caller still sets the /ID with document.set_id, embeds
 # every font it uses, and attaches files through pdf.embed.
 # ---
 # doc:  the document
-# meta: its description
+# meta: its description, with any extra xmp properties in meta.props
 # ret:  ok, `invalid` for a document that already has output intents or for
 #       metadata write refuses, or the allocator's refusal
 pub fun conform(doc: *document.Document, meta: *metadata.Metadata) err[error.Error] {
