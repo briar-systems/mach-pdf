@@ -4,3 +4,9 @@
 [submodule "dep/font"]
 	path = dep/font
 	url = https://github.com/briar-systems/mach-font
+[submodule "dep/pki"]
+	path = dep/pki
+	url = https://github.com/briar-systems/mach-pki
+[submodule "dep/crypto"]
+	path = dep/crypto
+	url = https://github.com/briar-systems/mach-crypto
