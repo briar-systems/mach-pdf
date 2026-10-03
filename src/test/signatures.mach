@@ -2,7 +2,7 @@
 # byte changed after signing caught, an update the document does not permit
 # flagged, a file pyhanko signed, filled and countersigned verified, a p-384
 # key signing with sha-256 verified, and a change to a field a signature locks
-# flagged
+# flagged, and the update okular signs a second field with allowed
 
 use std.allocator;
 use std.allocator.page;
@@ -33,6 +33,9 @@ val COUNTERSIGNED: [_]u8;
 
 #[embed("fixtures/pyhanko/signed.pdf")]
 val PYHANKO: [_]u8;
+
+#[embed("fixtures/okular/signed.pdf")]
+val OKULAR: [_]u8;
 
 #[embed("fixtures/p384/signed.pdf")]
 val P384: [_]u8;
@@ -279,5 +282,52 @@ test verify__accepts_a_p384_key_signing_sha256 {
     if (changed.signatures.len != 1) { ret 7; }
     val t: *verify.Signature = ?changed.signatures.data[0];
     if (!t.covered || t.cms.error == 0 || verify.valid(t)) { ret 8; }
+    ret 0;
+}
+
+# the update okular signs a second field with rewrites the field's widget, which the first signature allows
+test verify__allows_the_update_that_signs_a_second_field {
+    var report: verify.Report;
+    fin { verify.release(?report); }
+    var a: allocator.Allocator;
+    page.make(?a);
+    if (!verified(?a, ?OKULAR[0], $length_of(OKULAR), ?report))                       { ret 1; }
+    if (report.signatures.len != 2 || report.updates.len != 2)                        { ret 2; }
+    if (!report.updates.data[0].allowed || !report.updates.data[1].allowed)           { ret 3; }
+    if (report.updates.data[1].needs != 2 || report.updates.data[1].changes_len != 1) { ret 4; }
+    val first: *verify.Signature = ?report.signatures.data[0];
+    if (!first.allowed || !first.lock_kept) { ret 5; }
+    if (!report.signatures.data[1].allowed) { ret 6; }
+    ret 0;
+}
+
+# page content rewritten after both signatures refuses both
+test verify__flags_page_content_changed_after_okular_signs_twice {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, ?a);
+    if (sel started.err) { ret 1; }
+    fin { document.dnit(?doc); }
+    val read: err[error.Error] = reader.read(?doc, ?OKULAR[0], $length_of(OKULAR), reader.defaults());
+    if (sel read.err) { ret 2; }
+    var out: output.Output = output.init(?a);
+    fin { output.dnit(?out); }
+    output.put(?out, ?OKULAR[0], $length_of(OKULAR));
+    val content: object.Ref                       = object.Ref{number: 4, generation: 0};
+    val made:    res[*object.Stream, error.Error] = object.stream(document.objects(?doc));
+    if (sel made.err) { ret 3; }
+    val drawn:   str              = "BT /F1 12 Tf 72 700 Td (Forged) Tj ET";
+    val changed: err[error.Error] = error.first(object.write(made.ok, drawn, 37),
+        document.define(?doc, content, object.Object.stream{made.ok}), document.touch(?doc, content), document.append(?doc, ?out));
+    if (sel changed.err) { ret 4; }
+
+    var report: verify.Report;
+    fin { verify.release(?report); }
+    if (!verified(?a, output.data(?out), output.offset(?out), ?report)) { ret 5; }
+    if (report.signatures.len != 2 || report.updates.len != 3)          { ret 6; }
+    val update: verify.Update = report.updates.data[2];
+    if (update.allowed || update.offender != content.number)                    { ret 7; }
+    if (report.signatures.data[0].allowed || report.signatures.data[1].allowed) { ret 8; }
     ret 0;
 }
