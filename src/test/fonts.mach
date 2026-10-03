@@ -4,11 +4,13 @@
 # after a deliberate change to the output, and check it with qpdf and the
 # renderers before committing.
 
+use ttf: font;
 use std.allocator;
 use pages: std.allocator.page;
 use std.collections.vector;
 use std.memory;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -17,6 +19,7 @@ use pdf.content;
 use pdf.document;
 use pdf.error;
 use pdf.font;
+use pdf.object;
 use pdf.output;
 use pdf.page;
 
@@ -129,5 +132,57 @@ test fonts__missing_glyph_names_its_code_point {
     if (!sel late.err) { ret 8; }
     val known: err[error.Error] = font.encode(face.ok, "ba", 2, ?codes);
     if (sel known.err) { ret 9; }
+    ret 0;
+}
+
+# the object a dictionary's key names, followed through a reference
+fun held(doc: *document.Document, d: *object.Dict, key: str) opt[object.Object] {
+    val value: opt[*object.Object] = object.get(d, key);
+    if (!sel value.some) { ret opt[object.Object].none{}; }
+    val at: object.Object = @value.some;
+    if (!sel at.reference) { ret opt[object.Object].some{at}; }
+    ret document.lookup(doc, at.reference);
+}
+
+test fonts__simple_holds_winansi_with_a_cmap_and_no_more {
+    var a: allocator.Allocator;
+    pages.make(?a);
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, ?a);
+    if (sel started.err) { ret 1; }
+    fin { document.dnit(?doc); }
+    val made: res[*font.Simple, error.Error] = font.simple(?doc, ?REGULAR[0], $length_of(REGULAR));
+    if (sel made.err) { ret 2; }
+    val s: *font.Simple = made.ok;
+    # the euro sign and an accented letter are reached, 0x81 and delete are not
+    if (s.present['A'] != 1 || s.present[0xe9] != 1 || s.present[0x80] != 1) { ret 3; }
+    if (s.present[0x81] != 0 || s.present[0x7f] != 0)                        { ret 4; }
+
+    val dict: opt[object.Object] = document.lookup(?doc, s.font);
+    if (!sel dict.some) { ret 5; }
+    val top: object.Object = dict.some;
+    if (!sel top.dict) { ret 6; }
+    val descriptor: opt[object.Object] = held(?doc, top.dict, "FontDescriptor");
+    if (!sel descriptor.some) { ret 7; }
+    val d: object.Object = descriptor.some;
+    if (!sel d.dict) { ret 8; }
+    val file: opt[object.Object] = held(?doc, d.dict, "FontFile2");
+    if (!sel file.some) { ret 9; }
+    val program: object.Object = file.some;
+    if (!sel program.stream) { ret 10; }
+
+    # the program's own cmap finds the glyphs, and only WinAnsi's are there
+    val face: res[ttf.Font, ttf.FontError] = ttf.init(program.stream.data.data, program.stream.data.len);
+    if (sel face.err) { ret 11; }
+    var f:      ttf.Font                = face.ok;
+    val letter: res[u16, ttf.FontError] = ttf.glyph_index(?f, 'A');
+    val euro:   res[u16, ttf.FontError] = ttf.glyph_index(?f, 0x20ac);
+    val cyril:  res[u16, ttf.FontError] = ttf.glyph_index(?f, 0x0416);
+    if (sel letter.err)                 { ret 12; }
+    if (sel euro.err)                   { ret 12; }
+    if (sel cyril.err)                  { ret 12; }
+    if (letter.ok == 0 || euro.ok == 0) { ret 13; }
+    if (letter.ok == euro.ok)           { ret 13; }
+    if (cyril.ok != 0)                  { ret 14; }
     ret 0;
 }

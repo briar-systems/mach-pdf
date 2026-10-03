@@ -63,7 +63,9 @@ pub fun build(doc: *document.Document) err[error.Error] {
     val finished: err[error.Error] = content.finish(?b);
     if (sel finished.err) { ret finished; }
 
-    val made: res[form.Form, error.Error] = form.init(doc, form.embedded(mono.ok, "F1"));
+    val face: res[form.Face, error.Error] = form.embedded(doc, ?fonts.REGULAR[0], $length_of(fonts.REGULAR), "Mono");
+    if (sel face.err) { ret err[error.Error].err{face.err}; }
+    val made: res[form.Form, error.Error] = form.init(doc, face.ok, 12.0);
     if (sel made.err) { ret err[error.Error].err{made.err}; }
     var f:        form.Form                    = made.ok;
     val reviewer: res[form.Field, error.Error] = form.text_field(doc, ?f, nil,
