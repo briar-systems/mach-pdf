@@ -1,0 +1,16 @@
+A file pyHanko 0.37 signed, which the signature tests verify. generate.py
+writes signed.pdf from ../../golden/archive.pdf and the keys in ../sign, and is
+part of this repository under its MIT licence. Its signatures are not
+deterministic, so each run writes different bytes.
+
+- signed.pdf: archive.pdf rewritten by pyHanko as one revision with its page's
+  /Annots in its own object, a text field "remark" that is its own widget, and
+  a signature field "author" locking every field but "remark" and "witness".
+  Then three updates: the author certifies it with /DocMDP permission 2, the
+  remark field is filled with its appearance stream rewritten in place, and
+  the witness signs a new invisible field locking "remark". Every pyHanko
+  update rewrites the XMP metadata stream and the information dictionary in
+  place, and the author's adds the catalog's /Version and /Extensions.
+
+The document embeds a subset of Liberation Mono, under the SIL Open Font
+License 1.1, whose text is in ../liberation/LICENSE.

@@ -1,6 +1,7 @@
 # signing and verifying: the signed samples byte for byte, each verified, a
-# byte changed after signing caught, and an update the document does not
-# permit flagged
+# byte changed after signing caught, an update the document does not permit
+# flagged, a file pyhanko signed, filled and countersigned verified, and a
+# change to a field a signature locks flagged
 
 use std.allocator;
 use std.allocator.page;
@@ -8,11 +9,14 @@ use std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
 
 use pdf.document;
 use pdf.error;
+use pdf.form;
 use pdf.object;
 use pdf.output;
 use pdf.reader;
@@ -25,6 +29,9 @@ val SIGNED: [_]u8;
 
 #[embed("golden/countersigned.pdf")]
 val COUNTERSIGNED: [_]u8;
+
+#[embed("fixtures/pyhanko/signed.pdf")]
+val PYHANKO: [_]u8;
 
 fun made_matches(a: *allocator.Allocator, make: fun(*allocator.Allocator, *output.Output) err[sign.Error], expected: *u8, len: usize) bool {
     var out: output.Output = output.init(a);
@@ -138,5 +145,98 @@ test verify__flags_an_update_the_document_does_not_permit {
     if (!s.covered || s.cms.error != 0 || s.allowed || verify.valid(s)) { ret 8; }
     val update: verify.Update = report.updates.data[1];
     if (update.allowed || update.offender != catalog.number) { ret 9; }
+    ret 0;
+}
+
+fun named(report: *verify.Report, s: *verify.Signature, name: str, len: usize) bool {
+    ret s.name_len == len && memory.raw_equal(verify.name(report, s)::ptr, name::ptr, len);
+}
+
+test pyhanko__signed_filled_and_countersigned_verifies {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var report: verify.Report;
+    fin { verify.release(?report); }
+    if (!verified(?a, ?PYHANKO[0], $length_of(PYHANKO), ?report)) { ret 1; }
+    if (report.signatures.len != 2 || report.updates.len != 3)    { ret 2; }
+    if (report.permission != 2)                                   { ret 3; }
+    val author:  *verify.Signature = ?report.signatures.data[0];
+    val witness: *verify.Signature = ?report.signatures.data[1];
+    if (!named(?report, author, "author", 6) || !named(?report, witness, "witness", 7)) { ret 4; }
+    if (!verify.valid(author) || author.revision != 1 || !author.locked)                { ret 5; }
+    if (!verify.valid(witness) || !witness.whole || !witness.locked)                    { ret 6; }
+    var u: usize = 0;
+    for (u < report.updates.len) {
+        if (!report.updates.data[u].allowed) { ret 7; }
+        u = u + 1;
+    }
+    # filling rewrote the remark field's value and appearance stream
+    val fill: verify.Update = report.updates.data[1];
+    if (fill.needs != 2 || fill.changes_len != 1) { ret 8; }
+    val change: *verify.Change = ?report.changes.data[fill.changes_at];
+    if (change.name_len != 6 || !memory.raw_equal(verify.change_name(?report, change)::ptr, "remark"::ptr, 6)) { ret 9; }
+    ret 0;
+}
+
+test verify__flags_a_change_to_a_locked_field {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, ?a);
+    if (sel started.err) { ret 1; }
+    fin { document.dnit(?doc); }
+    val read: err[error.Error] = reader.read(?doc, ?PYHANKO[0], $length_of(PYHANKO), reader.defaults());
+    if (sel read.err) { ret 2; }
+    var out: output.Output = output.init(?a);
+    fin { output.dnit(?out); }
+    output.put(?out, ?PYHANKO[0], $length_of(PYHANKO));
+
+    # the remark field, which the witness locks, filled again, its appearance stream rewritten in place
+    val remark: res[form.Found, error.Error] = form.find(?doc, document.objects(?doc), "remark");
+    if (sel remark.err) { ret 3; }
+    val shown: opt[*object.Object] = object.get(remark.ok.dict, "AP");
+    if (!sel shown.some) { ret 4; }
+    val held: object.Object = @shown.some;
+    if (!sel held.dict) { ret 4; }
+    val normal: opt[*object.Object] = object.get(held.dict, "N");
+    if (!sel normal.some) { ret 4; }
+    val target: object.Object = @normal.some;
+    if (!sel target.reference) { ret 4; }
+    val old: res[object.Object, error.Error] = document.deref(?doc, target);
+    if (sel old.err) { ret 5; }
+    val was: object.Object = old.ok;
+    if (!sel was.stream) { ret 5; }
+    val made: res[*object.Stream, error.Error] = object.stream(document.objects(?doc));
+    if (sel made.err) { ret 6; }
+    var keys: [4]str = [4]str{"Type", "Subtype", "BBox", "Resources"};
+    var k:    usize  = 0;
+    for (k < 4) {
+        val kept: opt[*object.Object] = object.get(was.stream.dict, keys[k]);
+        if (!sel kept.some) { ret 6; }
+        val set: err[error.Error] = object.set(made.ok.dict, keys[k], @kept.some);
+        if (sel set.err) { ret 6; }
+        k = k + 1;
+    }
+    val drawn: str                             = "/Tx BMC q BT /F1 12 Tf 0 g 2 6 Td (Rejected) Tj ET Q EMC";
+    val value: res[object.Object, error.Error] = object.text(document.objects(?doc), "Rejected");
+    if (sel value.err) { ret 7; }
+    val changed: err[error.Error] = error.first(object.write(made.ok, drawn, 56),
+        document.define(?doc, target.reference, object.Object.stream{made.ok}),
+        object.set(remark.ok.dict, "V", value.ok), document.touch(?doc, remark.ok.node));
+    if (sel changed.err) { ret 8; }
+    val appended: err[error.Error] = document.append(?doc, ?out);
+    if (sel appended.err) { ret 8; }
+
+    var report: verify.Report;
+    fin { verify.release(?report); }
+    if (!verified(?a, output.data(?out), output.offset(?out), ?report)) { ret 9; }
+    if (report.signatures.len != 2 || report.updates.len != 4)          { ret 10; }
+    # the document permits filling, and the author's lock leaves the remark field out
+    val update: verify.Update = report.updates.data[3];
+    if (!update.allowed || update.needs != 2 || update.changes_len != 1) { ret 11; }
+    val author: *verify.Signature = ?report.signatures.data[0];
+    if (!verify.valid(author) || !author.lock_kept) { ret 12; }
+    val witness: *verify.Signature = ?report.signatures.data[1];
+    if (witness.cms.error != 0 || witness.lock_kept || witness.allowed || verify.valid(witness)) { ret 13; }
     ret 0;
 }
