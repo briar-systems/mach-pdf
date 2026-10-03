@@ -41,17 +41,6 @@ pub rec Filter {
     encode: Encode;
 }
 
-fun append(output: *vector.Vector[u8], byte: u8) err[error.Error] {
-    val pushed: res[usize, error.Error] = res_of(vector.push[u8](output, byte));
-    if (sel pushed.err) { ret err[error.Error].err{pushed.err}; }
-    ret err[error.Error].ok{};
-}
-
-fun res_of(outcome: res[usize, allocator.Error]) res[usize, error.Error] {
-    if (sel outcome.err) { ret res[usize, error.Error].err{error.from_allocator(outcome.err)}; }
-    ret res[usize, error.Error].ok{outcome.ok};
-}
-
 val HEX: str = "0123456789ABCDEF";
 
 fun ascii_hex_encode(ctx: ptr, input: *u8, len: usize, output: *vector.Vector[u8]) err[error.Error] {
@@ -64,7 +53,9 @@ fun ascii_hex_encode(ctx: ptr, input: *u8, len: usize, output: *vector.Vector[u8
         output.len                  = output.len + 2;
         i                           = i + 1;
     }
-    ret append(output, '>');
+    output.data[output.len] = '>';
+    output.len              = output.len + 1;
+    ret err[error.Error].ok{};
 }
 
 # the ASCIIHexDecode filter, uppercase digits with no whitespace
