@@ -1,0 +1,242 @@
+# signed samples: the sample form signed, and a form signed by two signers in
+# turn, each signature an incremental update
+#
+# the signers are the p-256 keys in fixtures/sign, whose rfc 6979 signatures
+# are deterministic, so the golden test compares both files byte for byte and
+# demo/sign writes them for the outside validators.
+
+use crypto.contracts;
+use crypto.secret;
+use pki.cert;
+use pki.key_signer;
+use contract: pki.signer;
+use path:     pki.verify;
+use pki.x509;
+use std.allocator;
+use std.chrono.time;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use pdf.content;
+use pdf.date;
+use pdf.document;
+use pdf.error;
+use pdf.form;
+use pdf.object;
+use pdf.output;
+use pdf.page;
+use pdf.reader;
+use pdf.sign;
+use pdf.verify;
+
+#[embed("golden/fields.pdf")]
+val FIELDS: [_]u8;
+
+#[embed("fixtures/sign/signer-key.pem")]
+val SIGNER_KEY: [_]u8;
+
+#[embed("fixtures/sign/signer.pem")]
+val SIGNER: [_]u8;
+
+#[embed("fixtures/sign/witness-key.pem")]
+val WITNESS_KEY: [_]u8;
+
+#[embed("fixtures/sign/witness.pem")]
+val WITNESS: [_]u8;
+
+#[embed("fixtures/sign/root.der")]
+val ROOT: [_]u8;
+
+# the time the samples claim to be signed at
+val SIGNED_AT: date.Date = date.Date{year: 2026, month: 10, day: 2, hour: 12, minute: 0, second: 0, offset: 0};
+
+# an open key signer over a fixture key and its certificate
+# ---
+# der:    the certificate's der, which the signer borrows
+# owner:  the allocator the key lives in
+# keyed:  the key signer, which must stay put while signer is in use
+# signer: the contract over it
+pub rec Key {
+    der:    [4096]u8;
+    owner:  secret.Allocator;
+    keyed:  key_signer.KeySigner;
+    signer: contract.Signer;
+}
+
+fun open(key: *Key, key_pem: *u8, key_len: usize, chain_pem: *u8, chain_len: usize) bool {
+    var secret_pem: [2048]^u8;
+    if (key_len > 2048) { ret false; }
+    var i: usize = 0;
+    for (i < key_len) {
+        secret_pem[i] = key_pem[i];
+        i             = i + 1;
+    }
+    key.owner = secret.system_allocator();
+    val opened: contract.Error = key_signer.open_pem(?key.keyed,
+        contracts.SecretBytes{data: ?secret_pem[0], len: key_len},
+        contracts.Bytes{data: chain_pem, len: chain_len},
+        contracts.Buffer{data: ?key.der[0], capacity: 4096}, ?key.owner);
+    if (opened != contract.OK) { ret false; }
+    key.signer = key_signer.signer(?key.keyed);
+    ret true;
+}
+
+# open the first signer
+# ---
+# key: where the signer lives, closed with close
+# ret: whether it opened
+pub fun signer(key: *Key) bool {
+    ret open(key, ?SIGNER_KEY[0], $length_of(SIGNER_KEY), ?SIGNER[0], $length_of(SIGNER));
+}
+
+# open the second signer
+# ---
+# key: where the signer lives, closed with close
+# ret: whether it opened
+pub fun witness(key: *Key) bool {
+    ret open(key, ?WITNESS_KEY[0], $length_of(WITNESS_KEY), ?WITNESS[0], $length_of(WITNESS));
+}
+
+# close a signer
+# ---
+# key: the signer
+pub fun close(key: *Key) {
+    key_signer.close(?key.keyed);
+}
+
+# a trust store over the fixture root
+# ---
+# anchor: the root
+# store:  the store over it
+pub rec Trust {
+    anchor: cert.Certificate;
+    store:  cert.TrustStore;
+}
+
+# verification options trusting the fixture root at a time inside its validity
+# ---
+# trust: where the store lives, which must stay put while the options are used
+# ret:   the options
+pub fun options(trust: *Trust) verify.Options {
+    trust.anchor = cert.Certificate{der: ?ROOT[0], der_len: $length_of(ROOT)};
+    trust.store  = cert.TrustStore{anchors: ?trust.anchor, len: 1};
+    var o: verify.Options;
+    o.trust                      = ?trust.store;
+    o.chain.purpose              = path.document_signing();
+    o.chain.now                  = time.unix(1790000000, 0);
+    o.chain.max_depth            = path.MAX_CHAIN_DEPTH;
+    o.chain.max_signature_checks = path.MAX_SIGNATURE_CHECKS;
+    o.read                       = reader.defaults();
+    ret o;
+}
+
+# sign the named field of the file in data with key, appending to out
+# ---
+# a:     the allocator the document draws on
+# data:  the file
+# len:   its count of bytes
+# field: the field's fully qualified name
+# key:   the signer
+# out:   an empty output that receives the file and the update
+# ret:   ok, or why signing failed
+pub fun sign_file(a: *allocator.Allocator, data: *u8, len: usize, field: str, key: *Key, out: *output.Output) err[error.Error] {
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, a);
+    if (sel started.err) { ret started; }
+    fin { document.dnit(?doc); }
+    val read: err[error.Error] = reader.read(?doc, data, len, reader.defaults());
+    if (sel read.err) { ret read; }
+    output.put(out, data, len);
+    var spec: sign.Spec = sign.Spec{field: field, signer: ?key.signer, algorithm: x509.SIGNATURE_NONE,
+        time: opt[date.Date].some{SIGNED_AT}};
+    ret sign.sign(?doc, out, ?spec);
+}
+
+# the sample form with its signature field signed
+# ---
+# a:   the allocator the document draws on
+# out: an empty output that receives the signed file
+# ret: ok, or why signing failed
+pub fun signed(a: *allocator.Allocator, out: *output.Output) err[error.Error] {
+    var key: Key;
+    if (!signer(?key)) { ret err[error.Error].err{error.Error.invalid{}}; }
+    fin { close(?key); }
+    ret sign_file(a, ?FIELDS[0], $length_of(FIELDS), "signature", ?key, out);
+}
+
+fun pair(doc: *document.Document) err[error.Error] {
+    val tree: res[page.Tree, error.Error] = page.tree(doc);
+    if (sel tree.err) { ret err[error.Error].err{tree.err}; }
+    var t:     page.Tree                   = tree.ok;
+    val added: res[page.Page, error.Error] = page.add(doc, ?t, page.A4);
+    if (sel added.err) { ret err[error.Error].err{added.err}; }
+    var p:    page.Page                   = added.ok;
+    val face: res[form.Face, error.Error] = form.standard(doc, "Helvetica", "Helv");
+    if (sel face.err) { ret err[error.Error].err{face.err}; }
+    val used: err[error.Error] = page.use_font(doc, ?p, "F1", face.ok.font);
+    if (sel used.err) { ret used; }
+    val started: res[content.Builder, error.Error] = page.contents(doc, ?p);
+    if (sel started.err) { ret err[error.Error].err{started.err}; }
+    var b: content.Builder = started.ok;
+    content.begin_text(?b);
+    content.font(?b, "F1", 11.0);
+    content.move_text(?b, 72.0, 760.0);
+    content.show_text(?b, "Signed by the author, then witnessed.");
+    content.end_text(?b);
+    val finished: err[error.Error] = content.finish(?b);
+    if (sel finished.err) { ret finished; }
+    val made: res[form.Form, error.Error] = form.init(doc, face.ok);
+    if (sel made.err) { ret err[error.Error].err{made.err}; }
+    var f:      form.Form                    = made.ok;
+    val author: res[form.Field, error.Error] = form.signature_field(doc, ?f, nil,
+        form.Signature{name: "author", tooltip: "Author signature"});
+    if (sel author.err) { ret err[error.Error].err{author.err}; }
+    var first:   form.Field                   = author.ok;
+    val witness: res[form.Field, error.Error] = form.signature_field(doc, ?f, nil,
+        form.Signature{name: "witness", tooltip: "Witness signature"});
+    if (sel witness.err) { ret err[error.Error].err{witness.err}; }
+    var second: form.Field                   = witness.ok;
+    val one:    res[object.Ref, error.Error] = form.widget(doc, ?f, ?first, ?p,
+        page.Rect{left: 72.0, bottom: 640.0, right: 272.0, top: 700.0});
+    if (sel one.err) { ret err[error.Error].err{one.err}; }
+    val two: res[object.Ref, error.Error] = form.widget(doc, ?f, ?second, ?p,
+        page.Rect{left: 320.0, bottom: 640.0, right: 520.0, top: 700.0});
+    if (sel two.err) { ret err[error.Error].err{two.err}; }
+    val id: str = "mach-pdf signers";
+    ret document.set_id(doc, id, 16, id, 16);
+}
+
+# a form with two signature fields, signed by the author and then the witness
+# ---
+# a:   the allocator the documents draw on
+# out: an empty output that receives the file
+# ret: ok, or why building or signing failed
+pub fun countersigned(a: *allocator.Allocator, out: *output.Output) err[error.Error] {
+    var blank: output.Output = output.init(a);
+    fin { output.dnit(?blank); }
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, a);
+    if (sel started.err) { ret started; }
+    val built: err[error.Error] = error.first(pair(?doc), document.save(?doc, ?blank));
+    document.dnit(?doc);
+    if (sel built.err) { ret built; }
+
+    var once: output.Output = output.init(a);
+    fin { output.dnit(?once); }
+    var author: Key;
+    if (!signer(?author)) { ret err[error.Error].err{error.Error.invalid{}}; }
+    val first: err[error.Error] = sign_file(a, output.data(?blank), output.offset(?blank), "author", ?author, ?once);
+    close(?author);
+    if (sel first.err) { ret first; }
+
+    var witness_key: Key;
+    if (!witness(?witness_key)) { ret err[error.Error].err{error.Error.invalid{}}; }
+    fin { close(?witness_key); }
+    ret sign_file(a, output.data(?once), output.offset(?once), "witness", ?witness_key, out);
+}

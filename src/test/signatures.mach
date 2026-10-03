@@ -1,0 +1,137 @@
+# signing and verifying: the signed samples byte for byte, each verified, a
+# byte changed after signing caught, and an update the document does not
+# permit flagged
+
+use std.allocator;
+use std.allocator.page;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use pdf.document;
+use pdf.error;
+use pdf.object;
+use pdf.output;
+use pdf.reader;
+use pdf.test.signed;
+use pdf.verify;
+
+#[embed("golden/signed.pdf")]
+val SIGNED: [_]u8;
+
+#[embed("golden/countersigned.pdf")]
+val COUNTERSIGNED: [_]u8;
+
+fun made_matches(a: *allocator.Allocator, make: fun(*allocator.Allocator, *output.Output) err[error.Error], expected: *u8, len: usize) bool {
+    var out: output.Output = output.init(a);
+    fin { output.dnit(?out); }
+    val made: err[error.Error] = make(a, ?out);
+    if (sel made.err)               { ret false; }
+    if (output.offset(?out) != len) { ret false; }
+    ret memory.raw_equal(output.data(?out)::ptr, expected::ptr, len);
+}
+
+# verify data, expecting count signatures
+fun verified(a: *allocator.Allocator, data: *u8, len: usize, report: *verify.Report) bool {
+    var trust:   signed.Trust;
+    var options: verify.Options   = signed.options(?trust);
+    val checked: err[error.Error] = verify.verify(a, data, len, ?options, report);
+    ret !sel checked.err;
+}
+
+test signed__matches_golden_and_verifies {
+    var a: allocator.Allocator;
+    page.make(?a);
+    if (!made_matches(?a, signed.signed, ?SIGNED[0], $length_of(SIGNED))) { ret 1; }
+    var report: verify.Report;
+    fin { verify.release(?report); }
+    if (!verified(?a, ?SIGNED[0], $length_of(SIGNED), ?report)) { ret 2; }
+    if (report.signatures.len != 1 || report.updates.len != 1)  { ret 3; }
+    val s: *verify.Signature = ?report.signatures.data[0];
+    if (!verify.valid(s) || !s.whole || s.revision != 1)                                         { ret 4; }
+    if (s.name_len != 9 || !memory.raw_equal(verify.name(?report, s)::ptr, "signature"::ptr, 9)) { ret 5; }
+
+    # a signed field is not signed again
+    var key: signed.Key;
+    if (!signed.signer(?key)) { ret 6; }
+    fin { signed.close(?key); }
+    var out: output.Output = output.init(?a);
+    fin { output.dnit(?out); }
+    val again: err[error.Error] = signed.sign_file(?a, ?SIGNED[0], $length_of(SIGNED), "signature", ?key, ?out);
+    if (!(sel again.err && sel again.err.invalid)) { ret 7; }
+    ret 0;
+}
+
+test countersigned__both_signatures_verify {
+    var a: allocator.Allocator;
+    page.make(?a);
+    if (!made_matches(?a, signed.countersigned, ?COUNTERSIGNED[0], $length_of(COUNTERSIGNED))) { ret 1; }
+    var report: verify.Report;
+    fin { verify.release(?report); }
+    if (!verified(?a, ?COUNTERSIGNED[0], $length_of(COUNTERSIGNED), ?report)) { ret 2; }
+    if (report.signatures.len != 2 || report.updates.len != 2)                { ret 3; }
+    val author:  *verify.Signature = ?report.signatures.data[0];
+    val witness: *verify.Signature = ?report.signatures.data[1];
+    if (!verify.valid(author) || author.whole || author.revision != 1) { ret 4; }
+    if (!verify.valid(witness) || !witness.whole)                      { ret 5; }
+    if (!report.updates.data[1].allowed)                               { ret 6; }
+    ret 0;
+}
+
+test verify__flags_a_byte_changed_after_signing {
+    var a: allocator.Allocator;
+    page.make(?a);
+    val len:    usize                     = $length_of(SIGNED);
+    val copied: res[*u8, allocator.Error] = allocator.allocate[u8](?a, len);
+    if (sel copied.err) { ret 1; }
+    fin { allocator.deallocate[u8](?a, copied.ok, len); }
+    memory.copy[u8](copied.ok, ?SIGNED[0], len);
+    # a letter of the first tooltip, inside the signed range, so the file still reads
+    var at: usize = 0;
+    for (at + 7 < len && !memory.raw_equal((?copied.ok[at])::ptr, "(Owner "::ptr, 7)) { at = at + 1; }
+    if (at + 7 >= len) { ret 2; }
+    copied.ok[at + 1] = 'N';
+    var report: verify.Report;
+    fin { verify.release(?report); }
+    if (!verified(?a, copied.ok, len, ?report)) { ret 3; }
+    if (report.signatures.len != 1)             { ret 4; }
+    val s: *verify.Signature = ?report.signatures.data[0];
+    if (!s.covered || s.cms.error == 0 || verify.valid(s)) { ret 5; }
+    ret 0;
+}
+
+test verify__flags_an_update_the_document_does_not_permit {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, ?a);
+    if (sel started.err) { ret 1; }
+    fin { document.dnit(?doc); }
+    val read: err[error.Error] = reader.read(?doc, ?SIGNED[0], $length_of(SIGNED), reader.defaults());
+    if (sel read.err) { ret 2; }
+    var out: output.Output = output.init(?a);
+    fin { output.dnit(?out); }
+    output.put(?out, ?SIGNED[0], $length_of(SIGNED));
+    val root: res[*object.Dict, error.Error] = document.catalog(?doc);
+    if (sel root.err)       { ret 3; }
+    if (!sel doc.root.some) { ret 3; }
+    val catalog: object.Ref                      = doc.root.some;
+    val lang:    res[object.Object, error.Error] = object.text(document.objects(?doc), "fr");
+    if (sel lang.err) { ret 4; }
+    val changed: err[error.Error] = error.first(object.set(root.ok, "Lang", lang.ok),
+        document.touch(?doc, catalog), document.append(?doc, ?out));
+    if (sel changed.err) { ret 5; }
+
+    var report: verify.Report;
+    fin { verify.release(?report); }
+    if (!verified(?a, output.data(?out), output.offset(?out), ?report)) { ret 6; }
+    if (report.signatures.len != 1 || report.updates.len != 2)          { ret 7; }
+    val s: *verify.Signature = ?report.signatures.data[0];
+    if (!s.covered || s.cms.error != 0 || s.allowed || verify.valid(s)) { ret 8; }
+    val update: verify.Update = report.updates.data[1];
+    if (update.allowed || update.offender != catalog.number) { ret 9; }
+    ret 0;
+}
