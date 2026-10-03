@@ -145,13 +145,13 @@ pub fun options(trust: *Trust) verify.Options {
 # key:   the signer
 # out:   an empty output that receives the file and the update
 # ret:   ok, or why signing failed
-pub fun sign_file(a: *allocator.Allocator, data: *u8, len: usize, field: str, key: *Key, out: *output.Output) err[error.Error] {
+pub fun sign_file(a: *allocator.Allocator, data: *u8, len: usize, field: str, key: *Key, out: *output.Output) err[sign.Error] {
     var doc:     document.Document;
     val started: err[error.Error] = document.init(?doc, a);
-    if (sel started.err) { ret started; }
+    if (sel started.err) { ret sign.lifted(started); }
     fin { document.dnit(?doc); }
     val read: err[error.Error] = reader.read(?doc, data, len, reader.defaults());
-    if (sel read.err) { ret read; }
+    if (sel read.err) { ret sign.lifted(read); }
     output.put(out, data, len);
     var spec: sign.Spec = sign.Spec{field: field, signer: ?key.signer, algorithm: x509.SIGNATURE_NONE,
         time: opt[date.Date].some{SIGNED_AT}};
@@ -163,9 +163,9 @@ pub fun sign_file(a: *allocator.Allocator, data: *u8, len: usize, field: str, ke
 # a:   the allocator the document draws on
 # out: an empty output that receives the signed file
 # ret: ok, or why signing failed
-pub fun signed(a: *allocator.Allocator, out: *output.Output) err[error.Error] {
+pub fun signed(a: *allocator.Allocator, out: *output.Output) err[sign.Error] {
     var key: Key;
-    if (!signer(?key)) { ret err[error.Error].err{error.Error.invalid{}}; }
+    if (!signer(?key)) { ret err[sign.Error].err{sign.Error.pdf{error.Error.invalid{}}}; }
     fin { close(?key); }
     ret sign_file(a, ?FIELDS[0], $length_of(FIELDS), "signature", ?key, out);
 }
@@ -217,26 +217,26 @@ fun pair(doc: *document.Document) err[error.Error] {
 # a:   the allocator the documents draw on
 # out: an empty output that receives the file
 # ret: ok, or why building or signing failed
-pub fun countersigned(a: *allocator.Allocator, out: *output.Output) err[error.Error] {
+pub fun countersigned(a: *allocator.Allocator, out: *output.Output) err[sign.Error] {
     var blank: output.Output = output.init(a);
     fin { output.dnit(?blank); }
     var doc:     document.Document;
     val started: err[error.Error] = document.init(?doc, a);
-    if (sel started.err) { ret started; }
+    if (sel started.err) { ret sign.lifted(started); }
     val built: err[error.Error] = error.first(pair(?doc), document.save(?doc, ?blank));
     document.dnit(?doc);
-    if (sel built.err) { ret built; }
+    if (sel built.err) { ret sign.lifted(built); }
 
     var once: output.Output = output.init(a);
     fin { output.dnit(?once); }
     var author: Key;
-    if (!signer(?author)) { ret err[error.Error].err{error.Error.invalid{}}; }
-    val first: err[error.Error] = sign_file(a, output.data(?blank), output.offset(?blank), "author", ?author, ?once);
+    if (!signer(?author)) { ret err[sign.Error].err{sign.Error.pdf{error.Error.invalid{}}}; }
+    val first: err[sign.Error] = sign_file(a, output.data(?blank), output.offset(?blank), "author", ?author, ?once);
     close(?author);
     if (sel first.err) { ret first; }
 
     var witness_key: Key;
-    if (!witness(?witness_key)) { ret err[error.Error].err{error.Error.invalid{}}; }
+    if (!witness(?witness_key)) { ret err[sign.Error].err{sign.Error.pdf{error.Error.invalid{}}}; }
     fin { close(?witness_key); }
     ret sign_file(a, output.data(?once), output.offset(?once), "witness", ?witness_key, out);
 }
