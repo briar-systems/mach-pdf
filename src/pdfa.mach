@@ -26,6 +26,7 @@ use std.types.string.str_equals;
 
 use pdf.document;
 use pdf.error;
+use pdf.filter;
 use pdf.metadata;
 use pdf.object;
 
@@ -283,6 +284,7 @@ fun intent(doc: *document.Document, root: *object.Dict) err[error.Error] {
     if (sel profile.err) { ret err[error.Error].err{profile.err}; }
     val filled: err[error.Error] = error.first(
         object.set(profile.ok.dict, "N", object.integer(3)),
+        object.filter_with(profile.ok, filter.flate(), object.null()),
         object.write(profile.ok, ?SRGB[0], $length_of(SRGB)));
     if (sel filled.err) { ret filled; }
     val icc: res[object.Ref, error.Error] = document.add(doc, object.Object.stream{profile.ok});

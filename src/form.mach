@@ -36,6 +36,7 @@ use std.types.string.str_len;
 use pdf.content;
 use pdf.document;
 use pdf.error;
+use pdf.filter;
 use pdf.font;
 use pdf.object;
 use pdf.output;
@@ -484,7 +485,8 @@ pub fun widget(doc: *document.Document, f: *Form, fd: *Field, p: *page.Page, rec
     val shaped: err[error.Error] = error.first(
         object.set_name(s.ok.dict, "Type", "XObject"),
         object.set_name(s.ok.dict, "Subtype", "Form"),
-        object.set(s.ok.dict, "BBox", bbox.ok));
+        object.set(s.ok.dict, "BBox", bbox.ok),
+        object.filter_with(s.ok, filter.flate(), object.null()));
     if (sel shaped.err) { ret failure[object.Ref](shaped.err); }
     if (sel fd.kind.text) {
         val r: res[*object.Dict, error.Error] = resources(a, f.face);
