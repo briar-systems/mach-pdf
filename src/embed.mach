@@ -1,0 +1,279 @@
+# embedded files associated with the document (iso 32000-2 sections 7.11.4
+# and 14.13)
+#
+# an attached file is an embedded file stream under a file specification. the
+# specification is listed in the catalog's /EmbeddedFiles name tree, so viewers
+# show it, and in the catalog's /AF array with its relationship to the
+# document, as pdf/a-3 requires.
+
+use std.allocator;
+use std.system.capability;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use pdf.date;
+use pdf.document;
+use pdf.error;
+use pdf.object;
+use pdf.output;
+use pdf.text;
+
+# how an attached file relates to the document, its /AFRelationship
+# ---
+# unspecified: no relationship is known
+# source:      the original the document was made from
+# data:        the data the document's content shows, such as a table's
+# alternative: another representation of the same content
+# supplement:  a representation that adds to the content, such as for
+#              accessibility
+pub tag Relationship: u8 {
+    unspecified;
+    source;
+    data;
+    alternative;
+    supplement;
+}
+
+# a file to attach
+# ---
+# name:         its file name, utf-8
+# data:         its bytes
+# len:          the count of bytes
+# mime:         its media type, such as "text/plain"
+# relationship: how it relates to the document
+# description:  a description for viewers, utf-8, nil for none
+# modified:     when the file last changed, none to leave it unrecorded
+pub rec File {
+    name:         str;
+    data:         *u8;
+    len:          usize;
+    mime:         str;
+    relationship: Relationship;
+    description:  str;
+    modified:     opt[date.Date];
+}
+
+fun failure[T](cause: error.Error) res[T, error.Error] {
+    ret res[T, error.Error].err{cause};
+}
+
+fun relationship_name(r: Relationship) str {
+    if (sel r.source)      { ret "Source"; }
+    if (sel r.data)        { ret "Data"; }
+    if (sel r.alternative) { ret "Alternative"; }
+    if (sel r.supplement)  { ret "Supplement"; }
+    ret "Unspecified";
+}
+
+# the direct dictionary under key in d, made on first use
+fun child_dict(a: *allocator.Allocator, d: *object.Dict, key: str) res[*object.Dict, error.Error] {
+    val held: opt[*object.Object] = object.get(d, key);
+    if (sel held.some) {
+        val value: object.Object = @held.some;
+        if (sel value.dict) { ret res[*object.Dict, error.Error].ok{value.dict}; }
+        ret failure[*object.Dict](error.Error.invalid{});
+    }
+    val made: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel made.err) { ret made; }
+    val set: err[error.Error] = object.set(d, key, object.Object.dict{made.ok});
+    if (sel set.err) { ret failure[*object.Dict](set.err); }
+    ret made;
+}
+
+# the direct array under key in d, made on first use
+fun child_array(a: *allocator.Allocator, d: *object.Dict, key: str) res[*object.Array, error.Error] {
+    val held: opt[*object.Object] = object.get(d, key);
+    if (sel held.some) {
+        val value: object.Object = @held.some;
+        if (sel value.array) { ret res[*object.Array, error.Error].ok{value.array}; }
+        ret failure[*object.Array](error.Error.invalid{});
+    }
+    val made: res[*object.Array, error.Error] = object.array(a);
+    if (sel made.err) { ret made; }
+    val set: err[error.Error] = object.set(d, key, object.Object.array{made.ok});
+    if (sel set.err) { ret failure[*object.Array](set.err); }
+    ret made;
+}
+
+# the byte order of two strings, negative when x sorts first
+fun order(x: object.String, y: object.String) i64 {
+    var i: usize = 0;
+    for (i < x.len && i < y.len) {
+        if (x.data[i] != y.data[i]) { ret x.data[i]::i64 - y.data[i]::i64; }
+        i = i + 1;
+    }
+    ret x.len::i64 - y.len::i64;
+}
+
+# where key belongs in a name tree's /Names array, keeping keys in order
+fun position(names: *object.Array, key: object.String) res[usize, error.Error] {
+    var at: usize = 0;
+    for (at < names.items.len) {
+        val held: object.Object = names.items.data[at];
+        if (!sel held.string) { ret failure[usize](error.Error.invalid{}); }
+        val c: i64 = order(held.string, key);
+        if (c == 0) { ret failure[usize](error.Error.invalid{}); }
+        if (c > 0)  { brk; }
+        at = at + 2;
+    }
+    ret res[usize, error.Error].ok{at};
+}
+
+# insert a key and its value into a name tree's /Names array at a position
+fun insert(names: *object.Array, at: usize, key: object.Object, value: object.Object) err[error.Error] {
+    val pushed: err[error.Error] = error.first(
+        object.push(names, object.null()),
+        object.push(names, object.null()));
+    if (sel pushed.err) { ret pushed; }
+    var i: usize = names.items.len - 2;
+    for (i > at) {
+        i                       = i - 1;
+        names.items.data[i + 2] = names.items.data[i];
+    }
+    names.items.data[at]     = key;
+    names.items.data[at + 1] = value;
+    ret err[error.Error].ok{};
+}
+
+fun file_stream(doc: *document.Document, f: *File) res[object.Ref, error.Error] {
+    val a: *allocator.Allocator             = document.objects(doc);
+    val s: res[*object.Stream, error.Error] = object.stream(a);
+    if (sel s.err) { ret failure[object.Ref](s.err); }
+    val params: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel params.err) { ret failure[object.Ref](params.err); }
+    val sized: err[error.Error] = object.set(params.ok, "Size", object.integer(f.len::i64));
+    if (sel sized.err) { ret failure[object.Ref](sized.err); }
+    if (sel f.modified.some) {
+        var spelled: output.Output = output.init(a);
+        fin { output.dnit(?spelled); }
+        val wrote: err[error.Error] = date.pdf(?spelled, f.modified.some);
+        if (sel wrote.err) { ret failure[object.Ref](wrote.err); }
+        val status: err[error.Error] = output.status(?spelled);
+        if (sel status.err) { ret failure[object.Ref](status.err); }
+        val when: res[object.Object, error.Error] = object.string(a, output.data(?spelled), output.offset(?spelled));
+        if (sel when.err) { ret failure[object.Ref](when.err); }
+        val dated: err[error.Error] = object.set(params.ok, "ModDate", when.ok);
+        if (sel dated.err) { ret failure[object.Ref](dated.err); }
+    }
+    val set: err[error.Error] = error.first(
+        object.set_name(s.ok.dict, "Type", "EmbeddedFile"),
+        object.set_name(s.ok.dict, "Subtype", f.mime),
+        object.set(s.ok.dict, "Params", object.Object.dict{params.ok}),
+        object.write(s.ok, f.data, f.len));
+    if (sel set.err) { ret failure[object.Ref](set.err); }
+    ret document.add(doc, object.Object.stream{s.ok});
+}
+
+# attach a file to the document
+#
+# the returned specification can also be named from a page's or an
+# annotation's own /AF.
+# ---
+# doc: the document
+# f:   the file
+# ret: its file specification, `invalid` for an empty or duplicate name, a
+#      missing media type, text that is not utf-8, a date out of range, or a
+#      catalog /Names, /EmbeddedFiles or /AF that is not a direct object, or
+#      the allocator's refusal
+pub fun attach(doc: *document.Document, f: *File) res[object.Ref, error.Error] {
+    if (f.name == nil || f.mime == nil || str_len(f.name) == 0) {
+        ret failure[object.Ref](error.Error.invalid{});
+    }
+    val a:       *allocator.Allocator            = document.objects(doc);
+    val unicode: res[object.Object, error.Error] = text.of(a, f.name);
+    if (sel unicode.err) { ret failure[object.Ref](unicode.err); }
+    val bytes: res[object.Object, error.Error] = object.text(a, f.name);
+    if (sel bytes.err) { ret failure[object.Ref](bytes.err); }
+    val key: object.Object = unicode.ok;
+    if (!sel key.string) { ret failure[object.Ref](error.Error.invalid{}); }
+
+    # find the name's place before adding anything, so a refusal leaves no objects behind
+    val root: res[*object.Dict, error.Error] = document.catalog(doc);
+    if (sel root.err) { ret failure[object.Ref](root.err); }
+    val names: res[*object.Dict, error.Error] = child_dict(a, root.ok, "Names");
+    if (sel names.err) { ret failure[object.Ref](names.err); }
+    val tree: res[*object.Dict, error.Error] = child_dict(a, names.ok, "EmbeddedFiles");
+    if (sel tree.err) { ret failure[object.Ref](tree.err); }
+    val leaves: res[*object.Array, error.Error] = child_array(a, tree.ok, "Names");
+    if (sel leaves.err) { ret failure[object.Ref](leaves.err); }
+    val associated: res[*object.Array, error.Error] = child_array(a, root.ok, "AF");
+    if (sel associated.err) { ret failure[object.Ref](associated.err); }
+    val at: res[usize, error.Error] = position(leaves.ok, key.string);
+    if (sel at.err) { ret failure[object.Ref](at.err); }
+
+    val stream: res[object.Ref, error.Error] = file_stream(doc, f);
+    if (sel stream.err) { ret stream; }
+
+    val ef: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel ef.err) { ret failure[object.Ref](ef.err); }
+    val spec: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel spec.err) { ret failure[object.Ref](spec.err); }
+    val set: err[error.Error] = error.first(
+        object.set(ef.ok, "F", object.reference(stream.ok)),
+        object.set(ef.ok, "UF", object.reference(stream.ok)),
+        object.set_name(spec.ok, "Type", "Filespec"),
+        object.set(spec.ok, "F", bytes.ok),
+        object.set(spec.ok, "UF", unicode.ok));
+    if (sel set.err) { ret failure[object.Ref](set.err); }
+    if (f.description != nil) {
+        val desc: res[object.Object, error.Error] = text.of(a, f.description);
+        if (sel desc.err) { ret failure[object.Ref](desc.err); }
+        val described: err[error.Error] = object.set(spec.ok, "Desc", desc.ok);
+        if (sel described.err) { ret failure[object.Ref](described.err); }
+    }
+    val linked: err[error.Error] = error.first(
+        object.set_name(spec.ok, "AFRelationship", relationship_name(f.relationship)),
+        object.set(spec.ok, "EF", object.Object.dict{ef.ok}));
+    if (sel linked.err) { ret failure[object.Ref](linked.err); }
+    val node: res[object.Ref, error.Error] = document.add(doc, object.Object.dict{spec.ok});
+    if (sel node.err) { ret node; }
+
+    val placed: err[error.Error] = insert(leaves.ok, at.ok, key, object.reference(node.ok));
+    if (sel placed.err) { ret failure[object.Ref](placed.err); }
+    val pushed: err[error.Error] = object.push(associated.ok, object.reference(node.ok));
+    if (sel pushed.err) { ret failure[object.Ref](pushed.err); }
+    ret node;
+}
+
+$if (capability.HOSTED) {
+    use std.allocator.page;
+
+    test attach__lists_files_in_name_order_and_associates_each {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var doc:     document.Document;
+        val started: err[error.Error] = document.init(?doc, ?a);
+        if (sel started.err) { ret 1; }
+        fin { document.dnit(?doc); }
+        var f: File = File{name: "b.txt", data: "b", len: 1, mime: "text/plain",
+            relationship: Relationship.source{}, description: nil, modified: opt[date.Date].none{}};
+        val first: res[object.Ref, error.Error] = attach(?doc, ?f);
+        if (sel first.err) { ret 2; }
+        f.name = "a.txt";
+        val second: res[object.Ref, error.Error] = attach(?doc, ?f);
+        if (sel second.err) { ret 3; }
+        val size:  u32                          = document.size(?doc);
+        val again: res[object.Ref, error.Error] = attach(?doc, ?f);
+        if (!(sel again.err && sel again.err.invalid)) { ret 4; }
+        if (document.size(?doc) != size)               { ret 5; }
+
+        val root: res[*object.Dict, error.Error] = document.catalog(?doc);
+        if (sel root.err) { ret 6; }
+        val names: res[*object.Dict, error.Error] = child_dict(?a, root.ok, "Names");
+        if (sel names.err) { ret 6; }
+        val tree: res[*object.Dict, error.Error] = child_dict(?a, names.ok, "EmbeddedFiles");
+        if (sel tree.err) { ret 6; }
+        val leaves: res[*object.Array, error.Error] = child_array(?a, tree.ok, "Names");
+        if (sel leaves.err)           { ret 6; }
+        if (leaves.ok.items.len != 4) { ret 7; }
+        val lead: object.Object = leaves.ok.items.data[0];
+        if (!(sel lead.string && lead.string.data[0] == 'a')) { ret 8; }
+        val af: res[*object.Array, error.Error] = child_array(?a, root.ok, "AF");
+        if (!(sel af.ok && af.ok.items.len == 2)) { ret 9; }
+        ret 0;
+    }
+}
