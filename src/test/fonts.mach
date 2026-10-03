@@ -1,0 +1,132 @@
+# a document in two embedded truetype subsets, and the faults embedding reports
+#
+# the golden file is the document byte for byte. regenerate it with demo/sample
+# after a deliberate change to the output, and check it with qpdf and the
+# renderers before committing.
+
+use std.allocator;
+use pages: std.allocator.page;
+use std.collections.vector;
+use std.memory;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use pdf.content;
+use pdf.document;
+use pdf.error;
+use pdf.font;
+use pdf.output;
+use pdf.page;
+
+#[embed("fixtures/liberation/LiberationMono-Regular.ttf")]
+val REGULAR: [_]u8;
+
+#[embed("fixtures/liberation/LiberationMono-Bold.ttf")]
+val BOLD: [_]u8;
+
+#[embed("golden/fonts.pdf")]
+val GOLDEN: [_]u8;
+
+val LINES: usize = 5;
+
+# build a letter page of latin, accented latin, cyrillic and greek text in
+# liberation mono regular, under a title in its bold, and embed both
+# ---
+# doc: an empty document
+# ret: ok, or why a part could not be built
+pub fun build(doc: *document.Document) err[error.Error] {
+    val regular: res[*font.TrueType, error.Error] = font.truetype(doc, ?REGULAR[0], $length_of(REGULAR));
+    if (sel regular.err) { ret err[error.Error].err{regular.err}; }
+    val bold: res[*font.TrueType, error.Error] = font.truetype(doc, ?BOLD[0], $length_of(BOLD));
+    if (sel bold.err) { ret err[error.Error].err{bold.err}; }
+    val tree: res[page.Tree, error.Error] = page.tree(doc);
+    if (sel tree.err) { ret err[error.Error].err{tree.err}; }
+    var t:     page.Tree                   = tree.ok;
+    val added: res[page.Page, error.Error] = page.add(doc, ?t, page.LETTER);
+    if (sel added.err) { ret err[error.Error].err{added.err}; }
+    var p:     page.Page        = added.ok;
+    val fonts: err[error.Error] = error.first(
+        page.use_font(doc, ?p, "F1", regular.ok.font),
+        page.use_font(doc, ?p, "F2", bold.ok.font));
+    if (sel fonts.err) { ret fonts; }
+    val started: res[content.Builder, error.Error] = page.contents(doc, ?p);
+    if (sel started.err) { ret err[error.Error].err{started.err}; }
+    var b: content.Builder = started.ok;
+
+    var lines: [5]str = [5]str{
+        "The quick brown fox jumps over the lazy dog.",
+        "Façade, naïve, Ångström, crème brûlée, Œuvre.",
+        "Съешь же ещё этих мягких французских булок.",
+        "Ξεσκεπάζω την ψυχοφθόρα βδελυγμία.",
+        "{[(<0123456789>)]} / % \\ ~ € £ ¥ ©",
+    };
+    content.begin_text(?b);
+    content.font(?b, "F2", 18.0);
+    content.move_text(?b, 72.0, 720.0);
+    font.show(?b, bold.ok, "Liberation Mono, embedded");
+    content.font(?b, "F1", 11.0);
+    content.leading(?b, 16.0);
+    content.move_text(?b, 0.0, -32.0);
+    var i: usize = 0;
+    for (i < LINES) {
+        if (i > 0) { content.next_line(?b); }
+        font.show(?b, regular.ok, lines[i]);
+        i = i + 1;
+    }
+    content.end_text(?b);
+    val finished: err[error.Error] = content.finish(?b);
+    if (sel finished.err) { ret finished; }
+
+    val embedded: err[error.Error] = error.first(font.embed(regular.ok), font.embed(bold.ok));
+    if (sel embedded.err) { ret embedded; }
+    val id: str = "mach-pdf fonts!!";
+    ret document.set_id(doc, id, 16, id, 16);
+}
+
+test fonts__match_golden {
+    var a: allocator.Allocator;
+    pages.make(?a);
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, ?a);
+    if (sel started.err) { ret 1; }
+    fin { document.dnit(?doc); }
+    var out: output.Output = output.init(?a);
+    fin { output.dnit(?out); }
+    val built: err[error.Error] = build(?doc);
+    if (sel built.err) { ret 2; }
+    val saved: err[error.Error] = document.save(?doc, ?out);
+    if (sel saved.err)                                                                    { ret 3; }
+    if (output.offset(?out) != $length_of(GOLDEN))                                        { ret 4; }
+    if (!memory.raw_equal(output.data(?out)::ptr, (?GOLDEN[0])::ptr, $length_of(GOLDEN))) { ret 5; }
+    ret 0;
+}
+
+test fonts__missing_glyph_names_its_code_point {
+    var a: allocator.Allocator;
+    pages.make(?a);
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, ?a);
+    if (sel started.err) { ret 1; }
+    fin { document.dnit(?doc); }
+    val face: res[*font.TrueType, error.Error] = font.truetype(?doc, ?REGULAR[0], $length_of(REGULAR));
+    if (sel face.err) { ret 2; }
+    var codes: vector.Vector[u16] = vector.init[u16](?a);
+    fin { vector.dnit[u16](?codes); }
+    # an arabic alef, which liberation mono does not draw
+    val missing: err[error.Error] = font.encode(face.ok, "ab\xd8\xa7c", 5, ?codes);
+    if (!sel missing.err) { ret 3; }
+    val cause: error.Error = missing.err;
+    if (!sel cause.glyph)     { ret 4; }
+    if (cause.glyph != 0x627) { ret 5; }
+    val malformed: err[error.Error] = font.encode(face.ok, "\xff", 1, ?codes);
+    if (!sel malformed.err) { ret 6; }
+    val unset: err[error.Error] = font.embed(face.ok);
+    if (sel unset.err) { ret 7; }
+    val late: err[error.Error] = font.encode(face.ok, "z", 1, ?codes);
+    if (!sel late.err) { ret 8; }
+    val known: err[error.Error] = font.encode(face.ok, "ba", 2, ?codes);
+    if (sel known.err) { ret 9; }
+    ret 0;
+}
