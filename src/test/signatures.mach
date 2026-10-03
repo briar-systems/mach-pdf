@@ -2,10 +2,12 @@
 # byte changed after signing caught, an update the document does not permit
 # flagged, a file pyhanko signed, filled and countersigned verified, a p-384
 # key signing with sha-256 verified, and a change to a field a signature locks
-# flagged, and the update okular signs a second field with allowed
+# flagged, the update okular signs a second field with allowed, and briar's
+# okular-signed contract, whose cms is ber, verified under the document signing purpose
 
 use std.allocator;
 use std.allocator.page;
+use std.chrono.time;
 use std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -42,6 +44,12 @@ val P384: [_]u8;
 
 #[embed("fixtures/p384/root.der")]
 val P384_ROOT: [_]u8;
+
+#[embed("fixtures/briar-ipa/signed.pdf")]
+val IPA: [_]u8;
+
+#[embed("fixtures/briar-ipa/root.der")]
+val IPA_ROOT: [_]u8;
 
 fun made_matches(a: *allocator.Allocator, make: fun(*allocator.Allocator, *output.Output) err[sign.Error], expected: *u8, len: usize) bool {
     var out: output.Output = output.init(a);
@@ -329,5 +337,35 @@ test verify__flags_page_content_changed_after_okular_signs_twice {
     val update: verify.Update = report.updates.data[2];
     if (update.allowed || update.offender != content.number)                    { ret 7; }
     if (report.signatures.data[0].allowed || report.signatures.data[1].allowed) { ret 8; }
+    ret 0;
+}
+
+# the two signatures okular wrote, with indefinite lengths in their cms, chain to briar's root
+test verify__accepts_the_ber_signatures_okular_writes {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var trust:   signed.Trust;
+    var options: verify.Options = signed.trusting(?trust, ?IPA_ROOT[0], $length_of(IPA_ROOT));
+    options.chain.now = time.unix(1791100000, 0);
+    var report: verify.Report;
+    fin { verify.release(?report); }
+    val checked: err[error.Error] = verify.verify(?a, ?IPA[0], $length_of(IPA), ?options, ?report);
+    if (sel checked.err)                                                                        { ret 1; }
+    if (report.signatures.len != 2)                                                             { ret 2; }
+    if (!verify.valid(?report.signatures.data[0]) || !verify.valid(?report.signatures.data[1])) { ret 3; }
+
+    # the binary comment after the header, inside both signed ranges
+    val len:    usize                     = $length_of(IPA);
+    val copied: res[*u8, allocator.Error] = allocator.allocate[u8](?a, len);
+    if (sel copied.err) { ret 4; }
+    fin { allocator.deallocate[u8](?a, copied.ok, len); }
+    memory.copy[u8](copied.ok, ?IPA[0], len);
+    copied.ok[11] = copied.ok[11] ^ 1;
+    var changed: verify.Report;
+    fin { verify.release(?changed); }
+    val again: err[error.Error] = verify.verify(?a, copied.ok, len, ?options, ?changed);
+    if (sel again.err)                                                                          { ret 5; }
+    if (changed.signatures.len != 2)                                                            { ret 6; }
+    if (verify.valid(?changed.signatures.data[0]) || verify.valid(?changed.signatures.data[1])) { ret 7; }
     ret 0;
 }
