@@ -1,0 +1,39 @@
+# write the sample form
+#
+# usage: fields <fields.pdf>
+# the output is the golden file the library's tests compare against.
+
+use std.allocator;
+use std.allocator.page;
+use std.filesystem;
+use std.print;
+use std.runtime;
+use std.types.error.err;
+
+use pdf.document;
+use pdf.error;
+use pdf.output;
+use pdf.test.fields;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    if (argc != 2) {
+        print.eprintln("usage: fields <fields.pdf>");
+        ret 2;
+    }
+    var a: allocator.Allocator;
+    page.make(?a);
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, ?a);
+    if (sel started.err) { ret 1; }
+    fin { document.dnit(?doc); }
+    var out: output.Output = output.init(?a);
+    fin { output.dnit(?out); }
+    val built: err[error.Error] = fields.build(?doc);
+    if (sel built.err) { ret 1; }
+    val saved: err[error.Error] = document.save(?doc, ?out);
+    if (sel saved.err) { ret 1; }
+    val written: err[filesystem.FsError] = filesystem.write_bytes(argv[1], output.data(?out), output.offset(?out), 0o644);
+    if (sel written.err) { ret 1; }
+    ret 0;
+}

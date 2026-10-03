@@ -82,7 +82,14 @@ pub fun tree(doc: *document.Document) res[Tree, error.Error] {
     ret res[Tree, error.Error].ok{Tree{node: node.ok, dict: d.ok, kids: kids.ok, count: 0}};
 }
 
-fun box(doc: *document.Document, r: Rect) res[object.Object, error.Error] {
+# a rectangle as the array of its corners, as /MediaBox, /Rect and /BBox take
+# it
+# ---
+# doc: the document
+# r:   the rectangle
+# ret: the array, `invalid` for a corner with no pdf spelling, or the
+#      allocator's refusal
+pub fun box(doc: *document.Document, r: Rect) res[object.Object, error.Error] {
     val list: res[*object.Array, error.Error] = object.array(document.objects(doc));
     if (sel list.err) { ret failure[object.Object](list.err); }
     var corners: [4]f64 = [4]f64{r.left, r.bottom, r.right, r.top};
@@ -169,4 +176,25 @@ pub fun use_font(doc: *document.Document, p: *Page, name: str, font: object.Ref)
     val fonts: res[*object.Dict, error.Error] = child(doc, resources.ok, "Font");
     if (sel fonts.err) { ret err[error.Error].err{fonts.err}; }
     ret object.set(fonts.ok, name, object.reference(font));
+}
+
+# list an annotation on a page, after any others in its /Annots
+# ---
+# doc:        the document
+# p:          the page
+# annotation: the annotation dictionary
+# ret:        ok, `invalid` when the page's /Annots is not a direct array, or
+#             the allocator's refusal
+pub fun annotate(doc: *document.Document, p: *Page, annotation: object.Ref) err[error.Error] {
+    val held: opt[*object.Object] = object.get(p.dict, "Annots");
+    if (sel held.some) {
+        val value: object.Object = @held.some;
+        if (!sel value.array) { ret err[error.Error].err{error.Error.invalid{}}; }
+        ret object.push(value.array, object.reference(annotation));
+    }
+    val made: res[*object.Array, error.Error] = object.array(document.objects(doc));
+    if (sel made.err) { ret err[error.Error].err{made.err}; }
+    val pushed: err[error.Error] = object.push(made.ok, object.reference(annotation));
+    if (sel pushed.err) { ret pushed; }
+    ret object.set(p.dict, "Annots", object.Object.array{made.ok});
 }
