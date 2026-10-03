@@ -1,5 +1,6 @@
 # the one failure type every pdf module reports
 
+use ttf: font;
 use std.allocator;
 use std.types.error.err;
 
@@ -17,6 +18,8 @@ use std.types.error.err;
 # encoder:     a filter with no encoder over stream data that is not encoded
 # codec:       a filter's encoder failed with its own code
 # base:        an incremental save with no prior revision to append to
+# font:        a font program mach-font refused, with its reason
+# glyph:       text holds this code point, which the font has no glyph for
 pub tag Error: u8 {
     exhausted;
     invalid;
@@ -25,6 +28,8 @@ pub tag Error: u8 {
     encoder;
     codec: i64;
     base;
+    font:  ttf.FontError;
+    glyph: u32;
 }
 
 # the pdf failure for an allocator refusal
