@@ -27,6 +27,16 @@ and it depends on mach-std only.
   and stroke, text positioning, font selection, strings and glyph runs.
 - `pdf.page` builds the page tree, pages, their content and font resources.
 - `pdf.font` adds standard 14 font dictionaries.
+- `pdf.text` makes text strings from utf-8, as ascii when it can and utf-16be
+  otherwise.
+- `pdf.date` spells a caller's date as a pdf date string or an xmp date.
+- `pdf.metadata` writes the information dictionary and the xmp metadata
+  stream together from one description, with extra xmp claims such as a
+  conformance level's.
+- `pdf.embed` attaches files: an embedded file stream, its file
+  specification with its `/AFRelationship`, the catalog's `/EmbeddedFiles`
+  name tree and its `/AF` array.
+- `pdf.pdfa` makes a document pdf/a-3b (see below).
 - `pdf.error` is the failure every module reports.
 
 `use pdf;` binds `pdf.lib.pdf`, which re-exports these modules.
@@ -79,11 +89,40 @@ fun hello(a: *allocator.Allocator, out: *output.Output) err[error.Error] {
 ## Determinism
 
 The same objects built in the same order give the same bytes on every host.
-Nothing time or host dependent is written: no dates, and no `/ID` unless the
-caller sets one with `document.set_id`. Reals are decimals rounded half away
+Nothing time or host dependent is written: no dates unless the caller gives
+them, and no `/ID` unless the caller sets one with `document.set_id`. Reals are decimals rounded half away
 from zero, and every object has exactly one spelling. The tests compare the
 sample document in `src/test/sample.mach` byte for byte against the files in
-`src/test/golden/`, in both cross-reference forms.
+`src/test/golden/`, in both cross-reference forms, and the pdf/a-3b sample in
+`src/test/archive.mach` likewise.
+
+## PDF/A-3b
+
+`pdfa.conform` writes the metadata with the pdf/a-3b identification, adds an
+srgb output intent with its icc profile embedded, and has every later save run
+`pdfa.check` first through `document.require`. The check refuses, as
+`nonconforming` naming the offending object, unembedded fonts, encryption,
+javascript and the other actions pdf/a forbids, and content outside the file,
+and it requires an `/ID`, the metadata, the output intent and every embedded
+file associated through an `/AF` array. The caller sets the `/ID`, embeds its
+fonts and attaches files with `embed.attach`:
+
+```mach
+var meta: metadata.Metadata;
+meta.title    = "Report";
+meta.producer = "mach-pdf";
+val made: err[error.Error] = pdfa.conform(?doc, ?meta);
+var source: embed.File = embed.File{name: "report.txt", data: text, len: len,
+    mime: "text/plain", relationship: embed.Relationship.source{},
+    description: nil, modified: opt[date.Date].none{}};
+val attached: res[object.Ref, error.Error] = embed.attach(?doc, ?source);
+val identified: err[error.Error] = document.set_id(?doc, id, 16, id, 16);
+```
+
+Nothing is implied: no dates, identifiers or tool names the caller did not
+give. `src/test/archive.mach` builds a sample that `src/test/golden/archive.pdf`
+holds, and [veraPDF](https://verapdf.org) validates that file as pdf/a-3b
+(`verapdf --flavour 3b archive.pdf`). veraPDF is a local check, not a CI one.
 
 ## Signatures and other late values
 
@@ -101,15 +140,15 @@ mach build .
 mach test . --all --timeout 5m
 ```
 
-`demo/sample` writes the sample document to two files, the golden files the
-tests compare against. Check them with `qpdf --check` and a renderer
+`demo/sample` writes the sample document to two files and the pdf/a-3b sample
+to a third, the golden files the tests compare against. Check them with `qpdf --check` and a renderer
 (`pdftoppm`, `mutool`, pdf.js) after any change to the output:
 
 ```sh
 cd demo/sample
 mach dep pull .
 mach build .
-./out/linux-x86_64/debug/bin/sample ../../src/test/golden/table.pdf ../../src/test/golden/stream.pdf
+./out/linux-x86_64/debug/bin/sample ../../src/test/golden/table.pdf ../../src/test/golden/stream.pdf ../../src/test/golden/archive.pdf
 ```
 
 ## Workflow
@@ -175,4 +214,6 @@ is published as a prerelease.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The srgb profile in `src/icc` is from
+[Compact-ICC-Profiles](https://github.com/saucecontrol/Compact-ICC-Profiles)
+and in the public domain under CC0, see [src/icc/LICENSE](src/icc/LICENSE).
