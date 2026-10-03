@@ -74,4 +74,4 @@ version = "^9.5"
 
 [dep.pki]
 git = "https://github.com/briar-systems/mach-pki"
-version = "^0.3"
+version = "^0.4"
