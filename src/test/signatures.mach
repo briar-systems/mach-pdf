@@ -1,7 +1,8 @@
 # signing and verifying: the signed samples byte for byte, each verified, a
 # byte changed after signing caught, an update the document does not permit
-# flagged, a file pyhanko signed, filled and countersigned verified, and a
-# change to a field a signature locks flagged
+# flagged, a file pyhanko signed, filled and countersigned verified, a p-384
+# key signing with sha-256 verified, and a change to a field a signature locks
+# flagged
 
 use std.allocator;
 use std.allocator.page;
@@ -32,6 +33,12 @@ val COUNTERSIGNED: [_]u8;
 
 #[embed("fixtures/pyhanko/signed.pdf")]
 val PYHANKO: [_]u8;
+
+#[embed("fixtures/p384/signed.pdf")]
+val P384: [_]u8;
+
+#[embed("fixtures/p384/root.der")]
+val P384_ROOT: [_]u8;
 
 fun made_matches(a: *allocator.Allocator, make: fun(*allocator.Allocator, *output.Output) err[sign.Error], expected: *u8, len: usize) bool {
     var out: output.Output = output.init(a);
@@ -238,5 +245,39 @@ test verify__flags_a_change_to_a_locked_field {
     if (!verify.valid(author) || !author.lock_kept) { ret 12; }
     val witness: *verify.Signature = ?report.signatures.data[1];
     if (witness.cms.error != 0 || witness.lock_kept || witness.allowed || verify.valid(witness)) { ret 13; }
+    ret 0;
+}
+
+# a p-384 key signing with sha-256, as okular does from a yubikey
+test verify__accepts_a_p384_key_signing_sha256 {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var trust:   signed.Trust;
+    var options: verify.Options = signed.trusting(?trust, ?P384_ROOT[0], $length_of(P384_ROOT));
+    var report:  verify.Report;
+    fin { verify.release(?report); }
+    val checked: err[error.Error] = verify.verify(?a, ?P384[0], $length_of(P384), ?options, ?report);
+    if (sel checked.err)            { ret 1; }
+    if (report.signatures.len != 1) { ret 2; }
+    val s: *verify.Signature = ?report.signatures.data[0];
+    if (!verify.valid(s) || !s.whole) { ret 3; }
+
+    # a letter of the field's name, inside the signed range, so the file still reads
+    val len:    usize                     = $length_of(P384);
+    val copied: res[*u8, allocator.Error] = allocator.allocate[u8](?a, len);
+    if (sel copied.err) { ret 4; }
+    fin { allocator.deallocate[u8](?a, copied.ok, len); }
+    memory.copy[u8](copied.ok, ?P384[0], len);
+    var at: usize = 0;
+    for (at + 11 < len && !memory.raw_equal((?copied.ok[at])::ptr, "(signature)"::ptr, 11)) { at = at + 1; }
+    if (at + 11 >= len) { ret 5; }
+    copied.ok[at + 1] = 'S';
+    var changed: verify.Report;
+    fin { verify.release(?changed); }
+    val again: err[error.Error] = verify.verify(?a, copied.ok, len, ?options, ?changed);
+    if (sel again.err)               { ret 6; }
+    if (changed.signatures.len != 1) { ret 7; }
+    val t: *verify.Signature = ?changed.signatures.data[0];
+    if (!t.covered || t.cms.error == 0 || verify.valid(t)) { ret 8; }
     ret 0;
 }

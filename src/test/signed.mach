@@ -124,7 +124,17 @@ pub rec Trust {
 # trust: where the store lives, which must stay put while the options are used
 # ret:   the options
 pub fun options(trust: *Trust) verify.Options {
-    trust.anchor = cert.Certificate{der: ?ROOT[0], der_len: $length_of(ROOT)};
+    ret trusting(trust, ?ROOT[0], $length_of(ROOT));
+}
+
+# verification options trusting the root in der at a time inside its validity
+# ---
+# trust: where the store lives, which must stay put while the options are used
+# der:   the root's certificate
+# len:   its count of bytes
+# ret:   the options
+pub fun trusting(trust: *Trust, der: *u8, len: usize) verify.Options {
+    trust.anchor = cert.Certificate{der: der, der_len: len};
     trust.store  = cert.TrustStore{anchors: ?trust.anchor, len: 1};
     var o: verify.Options;
     o.trust                      = ?trust.store;
