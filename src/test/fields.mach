@@ -1,0 +1,89 @@
+# a sample form over every kind of field, laid over the dots of a blank
+#
+# the golden test compares it byte for byte, and demo/fields writes it to a
+# file for qpdf and the viewers.
+
+use std.types.error.err;
+use std.types.result.res;
+use std.types.string.str;
+
+use pdf.content;
+use pdf.document;
+use pdf.error;
+use pdf.form;
+use pdf.object;
+use pdf.page;
+
+fun blank(b: *content.Builder) {
+    content.begin_text(b);
+    content.font(b, "F1", 11.0);
+    content.move_text(b, 72.0, 700.0);
+    content.show_text(b, "Owner name: ..................................................");
+    content.move_text(b, 0.0, -40.0);
+    content.show_text(b, "Signed on: .........................");
+    content.move_text(b, 0.0, -40.0);
+    content.show_text(b, "Signature:");
+    content.move_text(b, 0.0, -560.0);
+    content.show_text(b, "Owner (repeated): ..................................");
+    content.end_text(b);
+}
+
+# build the sample: a letter page with a blank drawn on it, and a form with a
+# group holding a text field placed twice, a date field and an unsigned
+# signature field
+# ---
+# doc: an empty document
+# ret: ok, or why a part could not be built
+pub fun build(doc: *document.Document) err[error.Error] {
+    val tree: res[page.Tree, error.Error] = page.tree(doc);
+    if (sel tree.err) { ret err[error.Error].err{tree.err}; }
+    var t:     page.Tree                   = tree.ok;
+    val added: res[page.Page, error.Error] = page.add(doc, ?t, page.LETTER);
+    if (sel added.err) { ret err[error.Error].err{added.err}; }
+    var p:    page.Page                   = added.ok;
+    val face: res[form.Face, error.Error] = form.standard(doc, "Helvetica", "Helv");
+    if (sel face.err) { ret err[error.Error].err{face.err}; }
+    val used: err[error.Error] = page.use_font(doc, ?p, "F1", face.ok.font);
+    if (sel used.err) { ret used; }
+    val started: res[content.Builder, error.Error] = page.contents(doc, ?p);
+    if (sel started.err) { ret err[error.Error].err{started.err}; }
+    var b: content.Builder = started.ok;
+    blank(?b);
+    val finished: err[error.Error] = content.finish(?b);
+    if (sel finished.err) { ret finished; }
+
+    val made: res[form.Form, error.Error] = form.init(doc, face.ok);
+    if (sel made.err) { ret err[error.Error].err{made.err}; }
+    var f:     form.Form                    = made.ok;
+    val owner: res[form.Field, error.Error] = form.group(doc, ?f, nil, "owner");
+    if (sel owner.err) { ret err[error.Error].err{owner.err}; }
+    var g:    form.Field                   = owner.ok;
+    val name: res[form.Field, error.Error] = form.text_field(doc, ?f, ?g,
+        form.Text{name: "name", tooltip: "Owner name", value: "Ren\xc3\xa9 Dupont", size: 11.0});
+    if (sel name.err) { ret err[error.Error].err{name.err}; }
+    var n:    form.Field                   = name.ok;
+    val date: res[form.Field, error.Error] = form.date_field(doc, ?f, nil,
+        form.Date{name: "signed_on", tooltip: "Date signed", hint: "YYYY-MM-DD", value: nil, size: 11.0});
+    if (sel date.err) { ret err[error.Error].err{date.err}; }
+    var d:    form.Field                   = date.ok;
+    val sign: res[form.Field, error.Error] = form.signature_field(doc, ?f, nil,
+        form.Signature{name: "signature", tooltip: "Owner signature"});
+    if (sel sign.err) { ret err[error.Error].err{sign.err}; }
+    var s: form.Field = sign.ok;
+
+    val first: res[object.Ref, error.Error] = form.widget(doc, ?f, ?n, ?p,
+        page.Rect{left: 140.0, bottom: 696.0, right: 400.0, top: 712.0});
+    if (sel first.err) { ret err[error.Error].err{first.err}; }
+    val second: res[object.Ref, error.Error] = form.widget(doc, ?f, ?n, ?p,
+        page.Rect{left: 166.0, bottom: 56.0, right: 360.0, top: 72.0});
+    if (sel second.err) { ret err[error.Error].err{second.err}; }
+    val dated: res[object.Ref, error.Error] = form.widget(doc, ?f, ?d, ?p,
+        page.Rect{left: 128.0, bottom: 656.0, right: 240.0, top: 672.0});
+    if (sel dated.err) { ret err[error.Error].err{dated.err}; }
+    val signed: res[object.Ref, error.Error] = form.widget(doc, ?f, ?s, ?p,
+        page.Rect{left: 128.0, bottom: 560.0, right: 328.0, top: 632.0});
+    if (sel signed.err) { ret err[error.Error].err{signed.err}; }
+
+    val id: str = "mach-pdf fields!";
+    ret document.set_id(doc, id, 16, id, 16);
+}
