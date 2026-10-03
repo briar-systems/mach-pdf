@@ -458,8 +458,23 @@ fun sized(r: *Reader, trailer: *object.Dict, at: usize) err[error.Error] {
     ret err[error.Error].ok{};
 }
 
+# put the numbers a section lists in numbers, once each
+fun note(r: *Reader, entries: *vector.Vector[Listed], numbers: *vector.Vector[u32]) err[error.Error] {
+    var i: usize = 0;
+    for (i < entries.len) {
+        val number: u64 = entries.data[i].number;
+        i = i + 1;
+        if (number == 0 || number >= r.size::u64) { cnt; }
+        val pushed: res[usize, allocator.Error] = vector.push[u32](numbers, number::u32);
+        if (sel pushed.err) { ret refused(pushed.err); }
+    }
+    ret err[error.Error].ok{};
+}
+
 # read one section at offset, recording its entries, and return its trailer
-fun section(r: *Reader, a: *allocator.Allocator, visited: *vector.Vector[usize], offset: usize) res[Section, error.Error] {
+#
+# numbers, when not nil, receives every number the section lists.
+fun section(r: *Reader, a: *allocator.Allocator, visited: *vector.Vector[usize], offset: usize, numbers: *vector.Vector[u32]) res[Section, error.Error] {
     val went: err[error.Error] = visit(r, visited, offset);
     if (sel went.err) { ret res[Section, error.Error].err{went.err}; }
     var listing: vector.Vector[Listed] = vector.init[Listed](r.doc.backing);
@@ -499,6 +514,10 @@ fun section(r: *Reader, a: *allocator.Allocator, visited: *vector.Vector[usize],
     }
     val recorded: err[error.Error] = error.first(record(r, ?listing, offset), record(r, ?hidden, offset));
     if (sel recorded.err) { ret res[Section, error.Error].err{recorded.err}; }
+    if (numbers != nil) {
+        val noted: err[error.Error] = error.first(note(r, ?listing, numbers), note(r, ?hidden, numbers));
+        if (sel noted.err) { ret res[Section, error.Error].err{noted.err}; }
+    }
     ret res[Section, error.Error].ok{Section{trailer: trailer, stream: stream}};
 }
 
@@ -661,21 +680,71 @@ fun load(ctx: ptr, doc: *document.Document, number: u32) err[error.Error] {
     ret err[error.Error].ok{};
 }
 
-# read a file into a document, which resolves its objects from the file and
-# appends its next save to it as an incremental update
-#
-# the document keeps pointing into data: the caller keeps the bytes unchanged
-# until the document is done, and appends to an output that starts with them.
+# one revision of a file: the section a /Prev chain reaches, and the bytes
+# that end with its %%EOF
 # ---
-# doc:  a document just initialized, with no objects
-# data: the file's bytes
-# len:  the count of bytes
-# opts: how to read it
-# ret:  ok, `malformed` at the offending byte, `limit` past a bound,
-#       `encrypted`, `invalid` for a document that already holds objects, a
-#       filter's failure on a cross-reference stream, or the allocator's
-#       refusal
-pub fun read(doc: *document.Document, data: *u8, len: usize, opts: Options) err[error.Error] {
+# xref:    the byte offset of its cross-reference section
+# end:     one past its %%EOF and the end of line after it, the length of the
+#          file as this revision left it
+# numbers: the object numbers its section lists, in use or free, living in the
+#          document's arena
+# count:   the count of numbers
+pub rec Revision {
+    xref:    usize;
+    end:     usize;
+    numbers: *u32;
+    count:   usize;
+}
+
+# the end of the revision whose section is at xref: one past the end of line
+# after the %%EOF that follows `startxref` naming xref, or 0 for none
+fun ending(r: *Reader, xref: usize) usize {
+    var at: usize = xref;
+    for (at < r.len) {
+        if (r.data[at] != 's' || !matches(r.data, r.len, at, "startxref", 9)) {
+            at = at + 1;
+            cnt;
+        }
+        var p: parse.Parser = parser(r, r.doc.backing, at + 9);
+        at = at + 9;
+        parse.skip(?p);
+        var offset: u64 = 0;
+        if (!parse.unsigned(?p, ?offset) || offset != xref::u64) { cnt; }
+        for (p.pos < r.len && parse.space(r.data[p.pos])) { p.pos = p.pos + 1; }
+        if (!matches(r.data, r.len, p.pos, "%%EOF", 5)) { cnt; }
+        var stop: usize = p.pos + 5;
+        if (stop < r.len && r.data[stop] == '\r') { stop = stop + 1; }
+        if (stop < r.len && r.data[stop] == '\n') { stop = stop + 1; }
+        ret stop;
+    }
+    ret 0;
+}
+
+# copy numbers into the document's arena after the count already at to
+fun kept(r: *Reader, to: *Revision, numbers: *vector.Vector[u32]) err[error.Error] {
+    if (numbers.len == 0) { ret err[error.Error].ok{}; }
+    val made: res[*u32, allocator.Error] = allocator.allocate[u32](document.objects(r.doc), to.count + numbers.len);
+    if (sel made.err) { ret refused(made.err); }
+    if (to.count > 0) { memory.copy[u32](made.ok, to.numbers, to.count); }
+    memory.copy[u32](?made.ok[to.count], numbers.data, numbers.len);
+    to.numbers = made.ok;
+    to.count   = to.count + numbers.len;
+    ret err[error.Error].ok{};
+}
+
+# read a file into a document as read does, and list its revisions
+#
+# a section with no `startxref` and %%EOF of its own after it, such as the
+# main section of a linearized file, belongs to the revision whose section
+# names it in /Prev.
+# ---
+# doc:       a document just initialized, with no objects
+# data:      the file's bytes
+# len:       the count of bytes
+# opts:      how to read it
+# revisions: receives the revisions, oldest first, nil for none
+# ret:       as read
+pub fun history(doc: *document.Document, data: *u8, len: usize, opts: Options, revisions: *vector.Vector[Revision]) err[error.Error] {
     if (document.size(doc) != 1 || sel doc.base.some) { ret err[error.Error].err{error.Error.invalid{}}; }
     val made: res[*Reader, allocator.Error] = allocator.zallocate[Reader](document.objects(doc), 1);
     if (sel made.err) { ret refused(made.err); }
@@ -697,11 +766,18 @@ pub fun read(doc: *document.Document, data: *u8, len: usize, opts: Options) err[
     arena.make(?temporary, ?scratch);
     var visited: vector.Vector[usize] = vector.init[usize](doc.backing);
     fin { vector.dnit[usize](?visited); }
+    var numbers: vector.Vector[u32] = vector.init[u32](doc.backing);
+    fin { vector.dnit[u32](?numbers); }
+    var listing: *vector.Vector[u32] = nil;
+    if (revisions != nil) { listing = ?numbers; }
+    var mark: usize = 0;
+    if (revisions != nil) { mark = revisions.len; }
 
     var at:     usize = last.ok;
     var newest: bool  = true;
     for {
-        val read_one: res[Section, error.Error] = section(r, ?temporary, ?visited, at);
+        numbers.len = 0;
+        val read_one: res[Section, error.Error] = section(r, ?temporary, ?visited, at, listing);
         if (sel read_one.err) { ret err[error.Error].err{read_one.err}; }
         val got: Section = read_one.ok;
         if (newest) {
@@ -710,15 +786,60 @@ pub fun read(doc: *document.Document, data: *u8, len: usize, opts: Options) err[
             val adopted: err[error.Error] = adopt(r, got.trailer, at);
             if (sel adopted.err) { ret adopted; }
             doc.xref_stream = got.stream;
-            newest          = false;
         }
+        if (revisions != nil) {
+            var stop: usize = ending(r, at);
+            if (stop == 0 && newest) { stop = len; }
+            if (stop == 0) {
+                val joined: err[error.Error] = kept(r, ?revisions.data[revisions.len - 1], ?numbers);
+                if (sel joined.err) { ret joined; }
+            }
+            or {
+                var one:    Revision         = Revision{xref: at, end: stop, numbers: nil, count: 0};
+                val copied: err[error.Error] = kept(r, ?one, ?numbers);
+                if (sel copied.err) { ret copied; }
+                val pushed: res[usize, allocator.Error] = vector.push[Revision](revisions, one);
+                if (sel pushed.err) { ret refused(pushed.err); }
+            }
+        }
+        newest = false;
         val prev: opt[i64] = integer(got.trailer, "Prev");
         if (!sel prev.some)                         { brk; }
         if (prev.some < 0 || prev.some >= len::i64) { ret malformed(at); }
         at = prev.some::usize;
     }
+    if (revisions != nil) {
+        # the walk met them newest first
+        var low:  usize = mark;
+        var high: usize = revisions.len;
+        for (high > low + 1) {
+            high = high - 1;
+            val swap: Revision = revisions.data[low];
+            revisions.data[low]  = revisions.data[high];
+            revisions.data[high] = swap;
+            low                  = low + 1;
+        }
+    }
     document.set_source(doc, document.Source{ctx: r::ptr, load: load});
     ret err[error.Error].ok{};
+}
+
+# read a file into a document, which resolves its objects from the file and
+# appends its next save to it as an incremental update
+#
+# the document keeps pointing into data: the caller keeps the bytes unchanged
+# until the document is done, and appends to an output that starts with them.
+# ---
+# doc:  a document just initialized, with no objects
+# data: the file's bytes
+# len:  the count of bytes
+# opts: how to read it
+# ret:  ok, `malformed` at the offending byte, `limit` past a bound,
+#       `encrypted`, `invalid` for a document that already holds objects, a
+#       filter's failure on a cross-reference stream, or the allocator's
+#       refusal
+pub fun read(doc: *document.Document, data: *u8, len: usize, opts: Options) err[error.Error] {
+    ret history(doc, data, len, opts, nil);
 }
 
 $if (capability.HOSTED) {
