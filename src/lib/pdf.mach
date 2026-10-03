@@ -5,3 +5,5 @@ use std.runtime;
 fwd pdf.error;
 fwd pdf.object;
 fwd pdf.filter;
+fwd pdf.output;
+fwd pdf.syntax;
