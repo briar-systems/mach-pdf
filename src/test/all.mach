@@ -4,3 +4,4 @@ use std.runtime;
 
 use pdf.test.fonts;
 use pdf.test.golden;
+use pdf.test.read;

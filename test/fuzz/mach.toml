@@ -1,0 +1,45 @@
+[project]
+id = "fuzz"
+version = "0.0.0"
+mach = "^6.8"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[target.linux-x86_64]
+isa = "x86_64"
+os = "linux"
+abi = "sysv64"
+
+[profile.debug]
+default = true
+opt = 0
+debug = false
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+
+[artifact.fuzz]
+kind = "bin"
+entry = "bin/fuzz.mach"
+out = "bin/fuzz"
+targets = ["*"]
+link = []
+need = []
+
+# the library from this checkout, and its dependencies through the library's
+# own pins
+[dep.pdf]
+path = "../.."
+
+[dep.font]
+path = "../../dep/font"
+
+[dep.std]
+path = "../../dep/std"

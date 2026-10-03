@@ -1,0 +1,136 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [12 0 R 14 0 R 16 0 R 18 0 R] >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+5 0 obj
+<< /Length 240 >>
+stream
+BT
+/F1 11 Tf
+72 700 Td
+(Owner name: ..................................................) Tj
+0 -40 Td
+(Signed on: .........................) Tj
+0 -40 Td
+(Signature:) Tj
+0 -560 Td
+(Owner \(repeated\): ..................................) Tj
+ET
+
+endstream
+endobj
+6 0 obj
+<< /Fields [7 0 R 9 0 R 10 0 R] /DR << /Font << /Helv 4 0 R >> >> /DA (/Helv 0 Tf 0 g) /SigFlags 1 >>
+endobj
+7 0 obj
+<< /T (owner) /Kids [8 0 R] >>
+endobj
+8 0 obj
+<< /FT /Tx /T (name) /TU (Owner name) /Parent 7 0 R /Kids [12 0 R 14 0 R] /V <FEFF00520065006E00E90020004400750070006F006E0074> /DA (/Helv 11 Tf 0 g) >>
+endobj
+9 0 obj
+<< /FT /Tx /T (signed_on) /TU (Date signed \(YYYY-MM-DD\)) /Kids [16 0 R] /DA (/Helv 11 Tf 0 g) >>
+endobj
+10 0 obj
+<< /FT /Sig /T (signature) /TU (Owner signature) /Kids [18 0 R] >>
+endobj
+11 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 260 16] /Resources << /Font << /Helv 4 0 R >> >> /Length 88 >>
+stream
+/Tx BMC
+q
+1 1 258 14 re
+W
+n
+BT
+/Helv 11 Tf
+0 g
+2 5.1895 Td
+(Ren\351 Dupont) Tj
+ET
+Q
+EMC
+
+endstream
+endobj
+12 0 obj
+<< /Type /Annot /Subtype /Widget /Rect [140 696 400 712] /P 3 0 R /F 4 /Parent 8 0 R /AP << /N 11 0 R >> >>
+endobj
+13 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 194 16] /Resources << /Font << /Helv 4 0 R >> >> /Length 88 >>
+stream
+/Tx BMC
+q
+1 1 192 14 re
+W
+n
+BT
+/Helv 11 Tf
+0 g
+2 5.1895 Td
+(Ren\351 Dupont) Tj
+ET
+Q
+EMC
+
+endstream
+endobj
+14 0 obj
+<< /Type /Annot /Subtype /Widget /Rect [166 56 360 72] /P 3 0 R /F 4 /Parent 8 0 R /AP << /N 13 0 R >> >>
+endobj
+15 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 112 16] /Resources << /Font << /Helv 4 0 R >> >> /Length 12 >>
+stream
+/Tx BMC
+EMC
+
+endstream
+endobj
+16 0 obj
+<< /Type /Annot /Subtype /Widget /Rect [128 656 240 672] /P 3 0 R /F 4 /Parent 9 0 R /AP << /N 15 0 R >> >>
+endobj
+17 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 200 72] /Length 0 >>
+stream
+
+endstream
+endobj
+18 0 obj
+<< /Type /Annot /Subtype /Widget /Rect [128 560 328 632] /P 3 0 R /F 4 /Parent 10 0 R /AP << /N 17 0 R >> >>
+endobj
+xref
+0 19
+0000000000 65535 f
+0000000015 00000 n
+0000000080 00000 n
+0000000137 00000 n
+0000000301 00000 n
+0000000398 00000 n
+0000000689 00000 n
+0000000806 00000 n
+0000000852 00000 n
+0000001020 00000 n
+0000001134 00000 n
+0000001217 00000 n
+0000001446 00000 n
+0000001570 00000 n
+0000001799 00000 n
+0000001921 00000 n
+0000002074 00000 n
+0000002198 00000 n
+0000002297 00000 n
+trailer
+<< /Size 19 /Root 1 0 R /ID [<6D6163682D706466206669656C647321> <6D6163682D706466206669656C647321>] >>
+startxref
+2422
+%%EOF

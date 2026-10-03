@@ -3,6 +3,7 @@
 use ttf: font;
 use std.allocator;
 use std.types.error.err;
+use std.types.size.usize;
 
 # why a pdf operation did not complete
 #
@@ -16,12 +17,18 @@ use std.types.error.err;
 # unset:         the object number allocated but never given a value at save
 # reservation:   a value wider than the reservation it fills
 # encoder:       a filter with no encoder over stream data that is not encoded
-# codec:         a filter's encoder failed with its own code
+# codec:         a filter's encoder or decoder failed with its own code
 # base:          an incremental save with no prior revision to append to
 # nonconforming: a document that breaks a rule it requires, naming the
 #                object that breaks it, or 0 for the document as a whole
 # font:          a font program mach-font refused, with its reason
 # glyph:         text holds this code point, which the font has no glyph for
+# malformed:     a file breaks pdf syntax or structure at this byte offset
+# limit:         a file exceeds a bound the reader was given, such as nesting
+#                depth or a stream's decoded size
+# cycle:         resolving this object number needs its own value
+# encrypted:     a file is encrypted, which the reader does not decrypt
+# decoder:       a filter with no decoder over stream data to decode
 pub tag Error: u8 {
     exhausted;
     invalid;
@@ -33,6 +40,11 @@ pub tag Error: u8 {
     nonconforming: u32;
     font:          ttf.FontError;
     glyph:         u32;
+    malformed:     usize;
+    limit;
+    cycle: u32;
+    encrypted;
+    decoder;
 }
 
 # the pdf failure for an allocator refusal

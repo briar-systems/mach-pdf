@@ -6,7 +6,8 @@
 # objects defined or touched since the last save, after the bytes of the
 # revision before it. a document read from a file starts from `rebase`, which
 # records the prior revision's size and cross-reference offset, so its first
-# save is an update. both writers are deterministic: the same objects, in the
+# save is an update, and a `Source` that loads each of the prior revision's
+# objects the first time it is resolved. both writers are deterministic: the same objects, in the
 # same order, give the same bytes, and nothing time or host dependent is
 # written unless the caller supplies it.
 
@@ -53,14 +54,16 @@ pub rec Base {
 # ---
 # free:     the number holds no object
 # external: an object the prior revision holds that this document has not
-#           replaced
+#           replaced or loaded
 # pending:  allocated but not yet given a value
 # defined:  the object this document holds for the number
+# loading:  an external object its source is loading
 tag Slot: u8 {
     free;
     external;
     pending;
     defined: object.Object;
+    loading;
 }
 
 # an indirect object and the reference that names it
@@ -92,6 +95,20 @@ pub rec Check {
     run: fun(ptr, *Document) err[error.Error];
 }
 
+# where the prior revision's objects come from, such as a file a reader parsed
+#
+# `resolve` calls load the first time it meets an external number. load gives
+# the document that number's object through `provide`, and may provide others
+# it read on the way, such as the rest of an object stream. a number load
+# provides nothing for is free.
+# ---
+# ctx:  state passed to load
+# load: the loader, given ctx, the document and the object number
+pub rec Source {
+    ctx:  ptr;
+    load: fun(ptr, *Document, u32) err[error.Error];
+}
+
 # a document under construction
 #
 # a document points into itself once initialized, so it stays where `init`
@@ -110,6 +127,8 @@ pub rec Check {
 # id:           the trailer's /ID, null for none
 # base:         the revision the next save appends to, none before the first
 # checks:       the rules every save must satisfy, in the order required
+# source:       where the prior revision's objects load from, none when they
+#               are only replaced
 pub rec Document {
     arena:        arena.Arena;
     objects:      allocator.Allocator;
@@ -123,6 +142,7 @@ pub rec Document {
     id:           object.Object;
     base:         opt[Base];
     checks:       vector.Vector[Check];
+    source:       opt[Source];
 }
 
 fun failed(cause: allocator.Error) err[error.Error] {
@@ -152,6 +172,7 @@ pub fun init(doc: *Document, backing: *allocator.Allocator) err[error.Error] {
     doc.id           = object.null();
     doc.base         = opt[Base].none{};
     doc.checks       = vector.init[Check](?doc.objects);
+    doc.source       = opt[Source].none{};
     # object number 0 heads the free list
     val pushed: res[usize, allocator.Error] = vector.push[Entry](?doc.entries,
         Entry{slot: Slot.free{}, generation: 65535, dirty: false});
@@ -237,7 +258,9 @@ pub fun add(doc: *Document, value: object.Object) res[object.Ref, error.Error] {
     ret made;
 }
 
-# the object a reference names, when the document holds it
+# the object a reference names, when the document holds it in memory
+#
+# `resolve` also loads the prior revision's objects.
 # ---
 # doc:    the document
 # target: the reference
@@ -353,10 +376,186 @@ pub fun set_info(doc: *Document, target: object.Ref) {
     doc.info = opt[object.Ref].some{target};
 }
 
+# set where the prior revision's objects load from
+# ---
+# doc:    the document
+# source: the source
+pub fun set_source(doc: *Document, source: Source) {
+    doc.source = opt[Source].some{source};
+}
+
+# give an external number the object a source loaded for it
+#
+# a source calls this from load. a number that is not external or loading is
+# left as it is, so an object the document replaced stays replaced. the object
+# is not written by the next update unless it is redefined or touched.
+# ---
+# doc:    the document
+# target: the number and the generation the prior revision gives it
+# value:  the object, built in the document's object allocator
+pub fun provide(doc: *Document, target: object.Ref, value: object.Object) {
+    if (target.number == 0 || target.number::usize >= doc.entries.len) { ret; }
+    val e: *Entry = ?doc.entries.data[target.number::usize];
+    if (!(sel e.slot.external || sel e.slot.loading)) { ret; }
+    e.slot       = Slot.defined{value};
+    e.generation = target.generation;
+    e.dirty      = false;
+}
+
+fun mark(doc: *Document, number: usize, slot: Slot) {
+    doc.entries.data[number].slot = slot;
+}
+
+# load an external number from the source, leaving it defined, or free when
+# the source provides nothing for it
+fun fetch(doc: *Document, number: u32) err[error.Error] {
+    if (number == 0 || number::usize >= doc.entries.len) { ret err[error.Error].ok{}; }
+    val n: usize = number::usize;
+    if (sel doc.entries.data[n].slot.loading)   { ret err[error.Error].err{error.Error.cycle{number}}; }
+    if (!sel doc.entries.data[n].slot.external) { ret err[error.Error].ok{}; }
+    if (sel doc.source.some) {
+        val source: Source = doc.source.some;
+        mark(doc, n, Slot.loading{});
+        val loaded: err[error.Error] = source.load(source.ctx, doc, number);
+        # a number its source provided nothing for is free, or external again after a failure
+        val unloaded: bool = sel doc.entries.data[n].slot.loading;
+        if (sel loaded.err) {
+            if (unloaded) { mark(doc, n, Slot.external{}); }
+            ret loaded;
+        }
+        if (unloaded) { mark(doc, n, Slot.free{}); }
+    }
+    ret err[error.Error].ok{};
+}
+
+# the object a reference names, loading it from the source when the prior
+# revision holds it
+#
+# a reference to a free number, or under a generation the number does not
+# have, names no object, which pdf reads as null.
+# ---
+# doc:    the document
+# target: the reference
+# ret:    the object, none when the reference names none, `cycle` when loading
+#         the object needs its own value, or why the source could not load it
+pub fun resolve(doc: *Document, target: object.Ref) res[opt[object.Object], error.Error] {
+    val fetched: err[error.Error] = fetch(doc, target.number);
+    if (sel fetched.err) { ret res[opt[object.Object], error.Error].err{fetched.err}; }
+    ret res[opt[object.Object], error.Error].ok{lookup(doc, target)};
+}
+
+# the object a number holds, whatever its generation, loading it from the
+# source when the prior revision holds it
+# ---
+# doc:    the document
+# number: the object number
+# ret:    its reference and object, none for a free or pending number, `cycle`
+#         when loading the object needs its own value, or why the source could
+#         not load it
+pub fun load(doc: *Document, number: u32) res[opt[Held], error.Error] {
+    val fetched: err[error.Error] = fetch(doc, number);
+    if (sel fetched.err) { ret res[opt[Held], error.Error].err{fetched.err}; }
+    ret res[opt[Held], error.Error].ok{numbered(doc, number)};
+}
+
+# a value with a reference followed to the object it names
+# ---
+# doc:   the document
+# value: the value
+# ret:   value itself when it is not a reference, the object it names, null
+#        when it names none, or why that object could not be loaded
+pub fun deref(doc: *Document, value: object.Object) res[object.Object, error.Error] {
+    if (!sel value.reference) { ret res[object.Object, error.Error].ok{value}; }
+    val found: res[opt[object.Object], error.Error] = resolve(doc, value.reference);
+    if (sel found.err)     { ret res[object.Object, error.Error].err{found.err}; }
+    if (sel found.ok.some) { ret res[object.Object, error.Error].ok{found.ok.some}; }
+    ret res[object.Object, error.Error].ok{object.null()};
+}
+
+# decode parameters with every reference they or their dictionary hold
+# directly resolved, in a copy built in a
+fun parameters(doc: *Document, parms: object.Object, a: *allocator.Allocator) res[object.Object, error.Error] {
+    val top: res[object.Object, error.Error] = deref(doc, parms);
+    if (sel top.err) { ret top; }
+    val value: object.Object = top.ok;
+    if (!sel value.dict) { ret top; }
+    val copy: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel copy.err) { ret res[object.Object, error.Error].err{copy.err}; }
+    var i: usize = 0;
+    for (i < value.dict.entries.len) {
+        val item: res[object.Object, error.Error] = deref(doc, value.dict.entries.data[i].value);
+        if (sel item.err) { ret item; }
+        val pushed: res[usize, allocator.Error] = vector.push[object.Entry](?copy.ok.entries,
+            object.Entry{key: value.dict.entries.data[i].key, value: item.ok});
+        if (sel pushed.err) { ret res[object.Object, error.Error].err{error.from_allocator(pushed.err)}; }
+        i = i + 1;
+    }
+    ret res[object.Object, error.Error].ok{object.Object.dict{copy.ok}};
+}
+
+# a stream's data with its filters undone, in a vector the caller releases
+#
+# each filter decodes in the order the stream lists them, given its decode
+# parameters with their references resolved.
+# ---
+# doc:   the document holding the stream
+# s:     the stream
+# a:     the allocator the decoded bytes live in
+# limit: the most bytes any one filter may produce
+# ret:   the bytes, `decoder` for a filter with no decoder, `limit` past limit,
+#        a filter's failure, or the allocator's refusal
+pub fun decoded(doc: *Document, s: *object.Stream, a: *allocator.Allocator, limit: usize) res[vector.Vector[u8], error.Error] {
+    var current: vector.Vector[u8] = vector.init[u8](a);
+    if (s.data.len > limit) { ret res[vector.Vector[u8], error.Error].err{error.Error.limit{}}; }
+    val room: res[usize, allocator.Error] = vector.reserve[u8](?current, s.data.len);
+    if (sel room.err) { ret res[vector.Vector[u8], error.Error].err{error.from_allocator(room.err)}; }
+    var i: usize = 0;
+    for (i < s.data.len) {
+        current.data[i] = s.data.data[i];
+        i               = i + 1;
+    }
+    current.len = s.data.len;
+    if (!s.encoded) { ret res[vector.Vector[u8], error.Error].ok{current}; }
+    var scratch: arena.Arena;
+    val started: err[allocator.Error] = arena.init(?scratch, doc.backing, 0);
+    if (sel started.err) {
+        vector.dnit[u8](?current);
+        ret res[vector.Vector[u8], error.Error].err{error.from_allocator(started.err)};
+    }
+    fin { arena.dnit(?scratch); }
+    var temporary: allocator.Allocator;
+    arena.make(?temporary, ?scratch);
+    var f: usize = 0;
+    for (f < s.filters.len) {
+        val applied: *object.Applied = ?s.filters.data[f];
+        f = f + 1;
+        if (applied.filter.decode == nil) {
+            vector.dnit[u8](?current);
+            ret res[vector.Vector[u8], error.Error].err{error.Error.decoder{}};
+        }
+        val parms: res[object.Object, error.Error] = parameters(doc, applied.parms, ?temporary);
+        if (sel parms.err) {
+            vector.dnit[u8](?current);
+            ret res[vector.Vector[u8], error.Error].err{parms.err};
+        }
+        var next: vector.Vector[u8] = vector.init[u8](a);
+        val ran:  err[error.Error]  = applied.filter.decode(applied.filter.ctx, current.data, current.len,
+            parms.ok, limit, ?next);
+        vector.dnit[u8](?current);
+        if (sel ran.err) {
+            vector.dnit[u8](?next);
+            ret res[vector.Vector[u8], error.Error].err{ran.err};
+        }
+        current = next;
+    }
+    ret res[vector.Vector[u8], error.Error].ok{current};
+}
+
 fun held(doc: *Document, target: object.Ref) res[*object.Dict, error.Error] {
-    val found: opt[object.Object] = lookup(doc, target);
-    if (sel found.some) {
-        val value: object.Object = found.some;
+    val found: res[opt[object.Object], error.Error] = resolve(doc, target);
+    if (sel found.err) { ret res[*object.Dict, error.Error].err{found.err}; }
+    if (sel found.ok.some) {
+        val value: object.Object = found.ok.some;
         if (sel value.dict) { ret res[*object.Dict, error.Error].ok{value.dict}; }
     }
     ret res[*object.Dict, error.Error].err{error.Error.invalid{}};
@@ -376,7 +575,8 @@ fun added(doc: *Document, kind: str) res[object.Ref, error.Error] {
 # ---
 # doc: the document
 # ret: the catalog dictionary, `invalid` when /Root names no dictionary the
-#      document holds, or the allocator's refusal
+#      document holds or loads, why loading it failed, or the allocator's
+#      refusal
 pub fun catalog(doc: *Document) res[*object.Dict, error.Error] {
     if (sel doc.root.some) { ret held(doc, doc.root.some); }
     val made: res[object.Ref, error.Error] = added(doc, "Catalog");
@@ -389,7 +589,7 @@ pub fun catalog(doc: *Document) res[*object.Dict, error.Error] {
 # ---
 # doc: the document
 # ret: the dictionary, `invalid` when /Info names no dictionary the document
-#      holds, or the allocator's refusal
+#      holds or loads, why loading it failed, or the allocator's refusal
 pub fun info(doc: *Document) res[*object.Dict, error.Error] {
     if (sel doc.info.some) { ret held(doc, doc.info.some); }
     val made: res[object.Ref, error.Error] = added(doc, nil);
@@ -401,8 +601,8 @@ pub fun info(doc: *Document) res[*object.Dict, error.Error] {
 # start from a revision read from a file, so the next save is an update
 #
 # every number below base.size becomes one the prior revision holds, and new
-# objects number from base.size. the reader sets /Root, /Info and /ID from the
-# prior trailer after this.
+# objects number from base.size. the reader sets /Root, /Info, /ID and the
+# source of the prior revision's objects after this.
 # ---
 # doc:  a document with no objects yet
 # base: the prior revision

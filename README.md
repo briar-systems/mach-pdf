@@ -1,8 +1,8 @@
 # mach-pdf
 
-PDF for Mach (ISO 32000-2): an object model and a deterministic writer, with
-incremental updates and reserved spans for values written after the fact. It
-is a spec implementation with no knowledge of any document format above it,
+PDF for Mach (ISO 32000-2): an object model, a deterministic writer and a
+reader, with incremental updates and reserved spans for values written after
+the fact. It is a spec implementation with no knowledge of any document format above it,
 and it depends on mach-std only.
 
 ## Modules
@@ -12,13 +12,19 @@ and it depends on mach-std only.
   `Reserved` spans. Objects live in the allocator they were built with and copy
   what they are given.
 - `pdf.filter` is the stream filter contract. A stream lists its filters in
-  decode order and the writer encodes through them. `ascii_hex` is the one
-  encoder so far; FlateDecode drops in as another `Filter` once std has a
-  deflate compressor.
+  decode order, the writer encodes through them and `document.decoded` decodes
+  through them. `ascii_hex` encodes and decodes. `flate` decodes zlib data
+  through `std.compress.zlib` and undoes PNG and TIFF predictors, and gains an
+  encoder once std has a deflate compressor. A decoder is given its decode
+  parameters with their references resolved and a limit on what it may
+  produce.
 - `pdf.document` numbers indirect objects, owns them in an arena, and saves
   the whole file (`save`) or an incremental update of what changed since
   (`append`), with a cross-reference table or stream. `rebase` starts from a
-  revision read from a file.
+  revision read from a file, and a `Source` loads that revision's objects the
+  first time `resolve` or `load` meets them.
+- `pdf.parse` reads objects from bytes into the object model.
+- `pdf.reader` reads a file into a document (see below).
 - `pdf.syntax` spells objects as bytes and fills a written reservation in
   place.
 - `pdf.output` is the file image the writer produces, kept in memory so every
@@ -191,6 +197,54 @@ offset when it is saved. Once the file is written, `syntax.fill` puts the real
 value in its place, padded with spaces. A signature reserves its `/Contents`
 and `/ByteRange` this way, computes the byte range from the recorded offsets,
 and fills both after hashing.
+
+## Reading
+
+`reader.read` parses the header, the cross-reference tables and streams back
+through the `/Prev` chain, hybrid files' `/XRefStm`, and the last trailer's
+`/Root`, `/Info` and `/ID`. It rebases the document on the file, so objects
+load from the file the first time they are resolved, object streams decode the
+first time one of their objects is, and the next save appends an incremental
+update after the file's bytes:
+
+```mach
+var doc: document.Document;
+document.init(?doc, a);
+val read: err[error.Error] = reader.read(?doc, data, len, reader.defaults());
+val root: res[*object.Dict, error.Error] = document.catalog(?doc);
+object.set(root.ok, "Lang", lang);
+document.touch(?doc, doc.root.some);
+# out starts with the file's len bytes at data
+val updated: err[error.Error] = document.append(?doc, ?out);
+```
+
+The file's bytes stay the caller's, and stay put until the document is done.
+`document.resolve` gives the object a reference names, `document.deref`
+follows a value that may be a reference, `document.load` gives the object a
+number holds whatever its generation, and `document.decoded` gives a stream's
+data with its filters undone. A stream read from a file keeps its data encoded
+under its filters, so an update that rewrites it copies it as it was. A filter
+this library has no decoder for keeps its name, and decoding through it is
+`decoder`. A caller adds decoders through `reader.Options.filters`.
+
+Reading is strict unless `reader.Options.strict` is false, which accepts a
+header after leading bytes, a missing `%%EOF`, a stream whose `/Length` is
+wrong, a key a dictionary holds twice (the last value wins), and loose
+cross-reference table rows. Either way the reader is bounded for hostile files:
+`max_depth` bounds nesting and loads inside loads, `max_objects` the highest
+`/Size`, `max_decoded` what a cross-reference or object stream decodes to, and
+`max_revisions` the `/Prev` chain. A file past a bound is `limit`, broken
+syntax is `malformed` with its byte offset, an object whose loading needs its
+own value is `cycle`, and an encrypted file is `encrypted`.
+
+`src/test/read.mach` reads every file the writer produces and the files in
+`src/test/fixtures/read` that Chrome's print to PDF, LibreOffice and pdfTeX
+wrote, plus a hand-built hybrid file, walks every object and stream, appends an
+update and reads it back.
+
+The fuzz lane in `test/fuzz` mutates a retained corpus of files and reads
+each, looking for a fault, a hang, or an accepted file that does not read back
+once updated. It runs locally, not in CI (see `test/fuzz/README.md`).
 
 ## Build
 
