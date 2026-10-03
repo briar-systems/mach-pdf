@@ -63,10 +63,33 @@ tag Slot: u8 {
     defined: object.Object;
 }
 
+# an indirect object and the reference that names it
+# ---
+# target: the reference
+# value:  the object
+pub rec Held {
+    target: object.Ref;
+    value:  object.Object;
+}
+
 rec Entry {
     slot:       Slot;
     generation: u16;
     dirty:      bool;
+}
+
+# a rule a document must satisfy before it is written, such as a conformance
+# level's
+#
+# the writer runs every check a document requires before each save and update,
+# in the order they were required, and writes nothing when one fails.
+# ---
+# ctx: state passed to run
+# run: the rule, given ctx and the document, returning why the document breaks
+#      it
+pub rec Check {
+    ctx: ptr;
+    run: fun(ptr, *Document) err[error.Error];
 }
 
 # a document under construction
@@ -85,6 +108,7 @@ rec Entry {
 # info:         the document information dictionary, the trailer's /Info
 # id:           the trailer's /ID, null for none
 # base:         the revision the next save appends to, none before the first
+# checks:       the rules every save must satisfy, in the order required
 pub rec Document {
     arena:        arena.Arena;
     objects:      allocator.Allocator;
@@ -97,6 +121,7 @@ pub rec Document {
     info:         opt[object.Ref];
     id:           object.Object;
     base:         opt[Base];
+    checks:       vector.Vector[Check];
 }
 
 fun failed(cause: allocator.Error) err[error.Error] {
@@ -125,6 +150,7 @@ pub fun init(doc: *Document, backing: *allocator.Allocator) err[error.Error] {
     doc.info         = opt[object.Ref].none{};
     doc.id           = object.null();
     doc.base         = opt[Base].none{};
+    doc.checks       = vector.init[Check](?doc.objects);
     # object number 0 heads the free list
     val pushed: res[usize, allocator.Error] = vector.push[Entry](?doc.entries,
         Entry{slot: Slot.free{}, generation: 65535, dirty: false});
@@ -213,6 +239,38 @@ pub fun lookup(doc: *Document, target: object.Ref) opt[object.Object] {
     if (!sel found.some)              { ret opt[object.Object].none{}; }
     if (!sel found.some.slot.defined) { ret opt[object.Object].none{}; }
     ret opt[object.Object].some{found.some.slot.defined};
+}
+
+# one past the highest object number the document has allocated
+# ---
+# doc: the document
+# ret: the count of object numbers, number 0 included
+pub fun size(doc: *Document) u32 {
+    ret doc.entries.len::u32;
+}
+
+# the object a number holds, whatever its generation
+# ---
+# doc:    the document
+# number: the object number
+# ret:    its reference and object, or none for a free, pending or external
+#         number
+pub fun numbered(doc: *Document, number: u32) opt[Held] {
+    if (number == 0 || number::usize >= doc.entries.len) { ret opt[Held].none{}; }
+    val e: *Entry = ?doc.entries.data[number::usize];
+    if (!sel e.slot.defined) { ret opt[Held].none{}; }
+    ret opt[Held].some{Held{target: object.Ref{number: number, generation: e.generation}, value: e.slot.defined}};
+}
+
+# require a rule of every later save and update
+# ---
+# doc:   the document
+# check: the rule
+# ret:   ok, or the allocator's refusal
+pub fun require(doc: *Document, check: Check) err[error.Error] {
+    val pushed: res[usize, allocator.Error] = vector.push[Check](?doc.checks, check);
+    if (sel pushed.err) { ret failed(pushed.err); }
+    ret err[error.Error].ok{};
 }
 
 # mark an object changed in place, so the next update rewrites it
@@ -514,6 +572,12 @@ fun xref_stream(doc: *Document, out: *output.Output, offsets: *vector.Vector[usi
 # write one revision: the objects it carries, its cross-references and trailer
 fun revision(doc: *Document, out: *output.Output, full: bool) err[error.Error] {
     if (!sel doc.root.some) { ret invalid(); }
+    var c: usize = 0;
+    for (c < doc.checks.len) {
+        val kept: err[error.Error] = doc.checks.data[c].run(doc.checks.data[c].ctx, doc);
+        if (sel kept.err) { ret kept; }
+        c = c + 1;
+    }
     # offsets[n] is where object n landed in this revision, zero when it is not in it
     var offsets: vector.Vector[usize] = vector.init[usize](doc.backing);
     fin { vector.dnit[usize](?offsets); }
