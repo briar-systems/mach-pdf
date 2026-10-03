@@ -2,3 +2,4 @@
 # reads a different file from the one that was formatted
 * text=auto eol=lf
 *.pdf binary
+*.icc binary

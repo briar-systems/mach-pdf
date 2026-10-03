@@ -1,0 +1,134 @@
+# dates as pdf date strings (iso 32000-2 section 7.9.4) and xmp dates
+#
+# nothing here reads a clock: a date is always the caller's.
+
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.string.str;
+
+use pdf.error;
+use pdf.output;
+
+# a moment in local time and that time's offset from utc
+# ---
+# year:   the year, 0 to 9999
+# month:  the month, 1 to 12
+# day:    the day of the month, 1 to 31
+# hour:   the hour, 0 to 23
+# minute: the minute, 0 to 59
+# second: the second, 0 to 59
+# offset: minutes east of utc, -1439 to 1439
+pub rec Date {
+    year:   u16;
+    month:  u8;
+    day:    u8;
+    hour:   u8;
+    minute: u8;
+    second: u8;
+    offset: i16;
+}
+
+# whether every field of a date is in range
+# ---
+# d:   the date
+# ret: true when it names a moment
+pub fun valid(d: Date) bool {
+    if (d.year > 9999)                       { ret false; }
+    if (d.month < 1 || d.month > 12)         { ret false; }
+    if (d.day < 1 || d.day > 31)             { ret false; }
+    if (d.hour > 23 || d.minute > 59)        { ret false; }
+    if (d.second > 59)                       { ret false; }
+    if (d.offset < -1439 || d.offset > 1439) { ret false; }
+    ret true;
+}
+
+fun zone(out: *output.Output, offset: i16, separator: str, closing: str) {
+    if (offset == 0) {
+        output.byte(out, 'Z');
+        ret;
+    }
+    var minutes: i64 = offset::i64;
+    if (minutes < 0) {
+        output.byte(out, '-');
+        minutes = -minutes;
+    }
+    or {
+        output.byte(out, '+');
+    }
+    output.padded(out, (minutes / 60)::u64, 2);
+    output.text(out, separator);
+    output.padded(out, (minutes % 60)::u64, 2);
+    output.text(out, closing);
+}
+
+# append a date as a pdf date string's bytes, `D:YYYYMMDDHHmmSS` and its zone
+# ---
+# out: the output
+# d:   the date
+# ret: ok, or `invalid` for a date out of range
+pub fun pdf(out: *output.Output, d: Date) err[error.Error] {
+    if (!valid(d)) { ret err[error.Error].err{error.Error.invalid{}}; }
+    output.text(out, "D:");
+    output.padded(out, d.year::u64, 4);
+    output.padded(out, d.month::u64, 2);
+    output.padded(out, d.day::u64, 2);
+    output.padded(out, d.hour::u64, 2);
+    output.padded(out, d.minute::u64, 2);
+    output.padded(out, d.second::u64, 2);
+    zone(out, d.offset, "'", "'");
+    ret err[error.Error].ok{};
+}
+
+# append a date as an xmp date, `YYYY-MM-DDThh:mm:ss` and its zone
+# ---
+# out: the output
+# d:   the date
+# ret: ok, or `invalid` for a date out of range
+pub fun xmp(out: *output.Output, d: Date) err[error.Error] {
+    if (!valid(d)) { ret err[error.Error].err{error.Error.invalid{}}; }
+    output.padded(out, d.year::u64, 4);
+    output.byte(out, '-');
+    output.padded(out, d.month::u64, 2);
+    output.byte(out, '-');
+    output.padded(out, d.day::u64, 2);
+    output.byte(out, 'T');
+    output.padded(out, d.hour::u64, 2);
+    output.byte(out, ':');
+    output.padded(out, d.minute::u64, 2);
+    output.byte(out, ':');
+    output.padded(out, d.second::u64, 2);
+    zone(out, d.offset, ":", "");
+    ret err[error.Error].ok{};
+}
+
+$if (capability.HOSTED) {
+    use std.allocator;
+    use std.allocator.page;
+    use std.memory;
+    use std.types.string.str_len;
+
+    fun spelled(out: *output.Output, expected: str) bool {
+        if (output.offset(out) != str_len(expected)) { ret false; }
+        ret memory.raw_equal(output.data(out)::ptr, expected::ptr, output.offset(out));
+    }
+
+    test pdf_and_xmp__spell_the_same_moment {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var out: output.Output = output.init(?a);
+        fin { output.dnit(?out); }
+        val d: Date = Date{year: 2026, month: 10, day: 2, hour: 9, minute: 5, second: 7, offset: -330};
+        pdf(?out, d);
+        if (!spelled(?out, "D:20261002090507-05'30'")) { ret 1; }
+        output.dnit(?out);
+        out = output.init(?a);
+        xmp(?out, Date{year: 2026, month: 10, day: 2, hour: 9, minute: 5, second: 7, offset: 0});
+        if (!spelled(?out, "2026-10-02T09:05:07Z")) { ret 2; }
+        val bad: err[error.Error] = xmp(?out, Date{year: 2026, month: 13, day: 1, hour: 0, minute: 0, second: 0, offset: 0});
+        if (!(sel bad.err && sel bad.err.invalid)) { ret 3; }
+        ret 0;
+    }
+}

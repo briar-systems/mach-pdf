@@ -229,6 +229,38 @@ pub fun fill_stroke(b: *Builder) {
     operator(b, "B");
 }
 
+# intersect the clipping path with the current path by the nonzero winding
+# rule, W
+# ---
+# b: the builder
+pub fun clip(b: *Builder) {
+    operator(b, "W");
+}
+
+# end the path without filling or stroking it, n
+# ---
+# b: the builder
+pub fun end_path(b: *Builder) {
+    operator(b, "n");
+}
+
+# begin a marked content sequence, BMC
+# ---
+# b:   the builder
+# tag: the sequence's tag, without its slash
+pub fun begin_marked(b: *Builder, tag: str) {
+    syntax.write(?b.out, object.Object.name{object.Name{data: tag, len: str_len(tag)}});
+    output.byte(?b.out, ' ');
+    operator(b, "BMC");
+}
+
+# end a marked content sequence, EMC
+# ---
+# b: the builder
+pub fun end_marked(b: *Builder) {
+    operator(b, "EMC");
+}
+
 # begin a text object, BT
 # ---
 # b: the builder

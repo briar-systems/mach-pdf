@@ -1,7 +1,7 @@
-# write the sample document in both cross-reference forms, and the embedded
-# font document
+# write the sample document in both cross-reference forms, the pdf/a-3b
+# sample, and the embedded font sample
 #
-# usage: sample <table.pdf> <stream.pdf> <fonts.pdf>
+# usage: sample <table.pdf> <stream.pdf> <archive.pdf> <fonts.pdf>
 # the outputs are the golden files the library's tests compare against.
 
 use std.allocator;
@@ -15,6 +15,7 @@ use std.types.error.err;
 use pdf.document;
 use pdf.error;
 use pdf.output;
+use pdf.test.archive;
 use pdf.test.fonts;
 use pdf.test.sample;
 
@@ -37,14 +38,15 @@ fun write(a: *allocator.Allocator, xref_stream: bool, path: *u8) i64 {
     ret 0;
 }
 
-fun write_fonts(a: *allocator.Allocator, path: *u8) i64 {
+# build a document with build and save it whole to path
+fun write_built(a: *allocator.Allocator, build: fun(*document.Document) err[error.Error], path: *u8) i64 {
     var doc:     document.Document;
     val started: err[error.Error] = document.init(?doc, a);
     if (sel started.err) { ret 1; }
     fin { document.dnit(?doc); }
     var out: output.Output = output.init(a);
     fin { output.dnit(?out); }
-    val built: err[error.Error] = fonts.build(?doc);
+    val built: err[error.Error] = build(?doc);
     if (sel built.err) { ret 1; }
     val saved: err[error.Error] = document.save(?doc, ?out);
     if (sel saved.err) { ret 1; }
@@ -55,13 +57,14 @@ fun write_fonts(a: *allocator.Allocator, path: *u8) i64 {
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    if (argc != 4) {
-        print.eprintln("usage: sample <table.pdf> <stream.pdf> <fonts.pdf>");
+    if (argc != 5) {
+        print.eprintln("usage: sample <table.pdf> <stream.pdf> <archive.pdf> <fonts.pdf>");
         ret 2;
     }
     var a: allocator.Allocator;
     page.make(?a);
     if (write(?a, 0, argv[1]) != 0) { ret 1; }
     if (write(?a, 1, argv[2]) != 0) { ret 1; }
-    ret write_fonts(?a, argv[3]);
+    if (write_built(?a, archive.build, argv[3]) != 0) { ret 1; }
+    ret write_built(?a, fonts.build, argv[4]);
 }
