@@ -21,7 +21,6 @@ use std.types.string.str;
 use std.types.string.str_len;
 
 use pdf.error;
-use pdf.filter;
 
 # an indirect reference, `number generation R`
 # ---
@@ -87,12 +86,58 @@ pub rec Dict {
     entries: vector.Vector[Entry];
 }
 
+# encode len bytes at input, appending the result to output
+#
+# the encoder must be deterministic: the same ctx and input give the same
+# bytes on every host. a codec failure is reported as `codec` with the
+# filter's own code.
+# ---
+# ctx:    the filter's state
+# input:  the bytes to encode
+# len:    the count of input bytes
+# output: the vector to append the encoded bytes to
+# ret:    ok, or why encoding failed
+pub def Encode: fun(ptr, *u8, usize, *vector.Vector[u8]) err[error.Error];
+
+# decode len bytes at input, appending the result to output
+#
+# parms is the filter's /DecodeParms with any reference it holds, or any its
+# dictionary holds directly, already resolved, so a decoder never needs the
+# document. a decoder that would append more than limit bytes stops with
+# `limit`, which bounds what a hostile stream can expand to. a codec failure is
+# reported as `codec` with the filter's own code.
+# ---
+# ctx:    the filter's state
+# input:  the bytes to decode
+# len:    the count of input bytes
+# parms:  the decode parameters, null for none
+# limit:  the most bytes the decoder may append
+# output: the vector to append the decoded bytes to
+# ret:    ok, or why decoding failed
+pub def Decode: fun(ptr, *u8, usize, Object, usize, *vector.Vector[u8]) err[error.Error];
+
+# a stream filter
+#
+# the contract lives here rather than in pdf.filter, which re-exports it,
+# because a decoder takes an object and modules cannot import each other.
+# ---
+# name:   the filter's pdf name without the slash, such as "FlateDecode"
+# ctx:    state passed to encode and decode
+# encode: the encoder, nil when the filter only names data already encoded
+# decode: the decoder, nil when the filter's data can only be kept as it is
+pub rec Filter {
+    name:   str;
+    ctx:    ptr;
+    encode: Encode;
+    decode: Decode;
+}
+
 # a filter applied to a stream and its decode parameters
 # ---
 # filter: the filter
 # parms:  its /DecodeParms value, null for none
 pub rec Applied {
-    filter: filter.Filter;
+    filter: Filter;
     parms:  Object;
 }
 
@@ -422,7 +467,7 @@ pub fun write(s: *Stream, data: *u8, len: usize) err[error.Error] {
 # f:     the filter
 # parms: its decode parameters, null for none
 # ret:   ok, or the allocator's refusal
-pub fun filter_with(s: *Stream, f: filter.Filter, parms: Object) err[error.Error] {
+pub fun filter_with(s: *Stream, f: Filter, parms: Object) err[error.Error] {
     val pushed: res[usize, allocator.Error] = vector.push[Applied](?s.filters, Applied{filter: f, parms: parms});
     if (sel pushed.err) { ret failed(pushed.err); }
     ret err[error.Error].ok{};

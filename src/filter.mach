@@ -1,51 +1,61 @@
 # the stream filter contract and the filters this library implements
 #
-# a filter is named in a stream's /Filter entry and, when it can encode,
-# turns the bytes a caller gave into the bytes the file holds. a stream lists
-# its filters in decode order, as /Filter does, so the writer encodes through
-# them last to first. a filter with no encoder can still be named over data the
-# caller encoded itself, such as a jpeg under DCTDecode. FlateDecode drops in
-# here as one more `Filter` once std has a deflate compressor.
+# a filter is named in a stream's /Filter entry. when it can encode it turns
+# the bytes a caller gave into the bytes the file holds, and when it can decode
+# it turns them back. a stream lists its filters in decode order, as /Filter
+# does, so the writer encodes through them last to first and a reader decodes
+# first to last. a filter with no encoder can still be named over data the
+# caller encoded itself, such as a jpeg under DCTDecode, and a filter with no
+# decoder over data a reader keeps as it is. FlateDecode decodes through
+# std.compress.zlib, and gains an encoder once std has a deflate compressor.
 
 use std.allocator;
 use std.collections.vector;
 use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
+use std.compress.zlib;
+
 use pdf.error;
+use pdf.object;
 
-# encode len bytes at input, appending the result to output
-#
-# the encoder must be deterministic: the same ctx and input give the same
-# bytes on every host. a codec failure is reported as `codec` with the
-# filter's own code.
-# ---
-# ctx:    the filter's state
-# input:  the bytes to encode
-# len:    the count of input bytes
-# output: the vector to append the encoded bytes to
-# ret:    ok, or why encoding failed
-pub def Encode: fun(ptr, *u8, usize, *vector.Vector[u8]) err[error.Error];
+fwd object.Filter;
+fwd object.Encode;
+fwd object.Decode;
 
-# a stream filter
-# ---
-# name:   the filter's pdf name without the slash, such as "FlateDecode"
-# ctx:    state passed to encode
-# encode: the encoder, nil when the filter only names data already encoded
-pub rec Filter {
-    name:   str;
-    ctx:    ptr;
-    encode: Encode;
-}
+# the `codec` code for data the filter cannot decode
+pub val CORRUPT: i64 = 1;
+
+# the `codec` code for data that ends before the filter's end of data
+pub val TRUNCATED: i64 = 2;
+
+# the `codec` code for decode parameters outside what the filter accepts
+pub val PARMS: i64 = 3;
+
+# the `codec` code for predicted rows that do not decode, such as a png row
+# with an unknown filter type or a partial last row
+pub val PREDICTED: i64 = 4;
 
 val HEX: str = "0123456789ABCDEF";
 
+fun codec(code: i64) err[error.Error] {
+    ret err[error.Error].err{error.Error.codec{code}};
+}
+
+fun refused(cause: allocator.Error) err[error.Error] {
+    ret err[error.Error].err{error.from_allocator(cause)};
+}
+
 fun ascii_hex_encode(ctx: ptr, input: *u8, len: usize, output: *vector.Vector[u8]) err[error.Error] {
     val room: res[usize, allocator.Error] = vector.reserve[u8](output, len * 2 + 1);
-    if (sel room.err) { ret err[error.Error].err{error.from_allocator(room.err)}; }
+    if (sel room.err) { ret refused(room.err); }
     var i: usize = 0;
     for (i < len) {
         output.data[output.len]     = HEX[(input[i] >> 4)::usize];
@@ -58,16 +68,278 @@ fun ascii_hex_encode(ctx: ptr, input: *u8, len: usize, output: *vector.Vector[u8
     ret err[error.Error].ok{};
 }
 
-# the ASCIIHexDecode filter, uppercase digits with no whitespace
+fun space(c: u8) bool {
+    ret c == 0 || c == '\t' || c == '\n' || c == 0x0c || c == '\r' || c == ' ';
+}
+
+fun digit(c: u8) i32 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::i32; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A')::i32 + 10; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a')::i32 + 10; }
+    ret -1;
+}
+
+fun ascii_hex_decode(ctx: ptr, input: *u8, len: usize, parms: object.Object, limit: usize, output: *vector.Vector[u8]) err[error.Error] {
+    val start: usize = output.len;
+    var high:  i32   = -1;
+    var i:     usize = 0;
+    for (i < len) {
+        val c: u8 = input[i];
+        i = i + 1;
+        if (space(c)) { cnt; }
+        if (c == '>') {
+            if (high >= 0) {
+                if (output.len - start >= limit) { ret err[error.Error].err{error.Error.limit{}}; }
+                val pushed: res[usize, allocator.Error] = vector.push[u8](output, (high << 4)::u8);
+                if (sel pushed.err) { ret refused(pushed.err); }
+            }
+            ret err[error.Error].ok{};
+        }
+        val d: i32 = digit(c);
+        if (d < 0) { ret codec(CORRUPT); }
+        if (high < 0) {
+            high = d;
+            cnt;
+        }
+        if (output.len - start >= limit) { ret err[error.Error].err{error.Error.limit{}}; }
+        val pushed: res[usize, allocator.Error] = vector.push[u8](output, ((high << 4) | d)::u8);
+        if (sel pushed.err) { ret refused(pushed.err); }
+        high = -1;
+    }
+    ret codec(TRUNCATED);
+}
+
+# the ASCIIHexDecode filter, encoding uppercase digits with no whitespace
 # ---
 # ret: the filter
 pub fun ascii_hex() Filter {
-    ret Filter{name: "ASCIIHexDecode", ctx: nil, encode: ascii_hex_encode};
+    ret Filter{name: "ASCIIHexDecode", ctx: nil, encode: ascii_hex_encode, decode: ascii_hex_decode};
+}
+
+# the parameters of a predictor (iso 32000-2 table 8)
+# ---
+# predictor: 1 for none, 2 for tiff, 10 to 15 for png
+# colors:    the color components per sample
+# bits:      the bits per color component
+# columns:   the samples per row
+rec Prediction {
+    predictor: i64;
+    colors:    i64;
+    bits:      i64;
+    columns:   i64;
+}
+
+fun parameter(d: *object.Dict, key: str, fallback: i64, value: *i64) bool {
+    val found: opt[*object.Object] = object.get(d, key);
+    if (!sel found.some) {
+        @value = fallback;
+        ret true;
+    }
+    val held: object.Object = @found.some;
+    if (!sel held.integer) { ret false; }
+    @value = held.integer;
+    ret true;
+}
+
+fun prediction(parms: object.Object, p: *Prediction) bool {
+    p.predictor = 1;
+    p.colors    = 1;
+    p.bits      = 8;
+    p.columns   = 1;
+    if (sel parms.null)  { ret true; }
+    if (!sel parms.dict) { ret false; }
+    if (!(parameter(parms.dict, "Predictor", 1, ?p.predictor)
+        && parameter(parms.dict, "Colors", 1, ?p.colors)
+        && parameter(parms.dict, "BitsPerComponent", 8, ?p.bits)
+        && parameter(parms.dict, "Columns", 1, ?p.columns))) { ret false; }
+    if (p.predictor != 1 && p.predictor != 2 && !(p.predictor >= 10 && p.predictor <= 15)) { ret false; }
+    if (p.colors < 1 || p.colors > 32)                                                     { ret false; }
+    if (p.bits != 1 && p.bits != 2 && p.bits != 4 && p.bits != 8 && p.bits != 16)          { ret false; }
+    # a row's bit count must stay well inside a usize
+    if (p.columns < 1 || p.columns > 0x1000000) { ret false; }
+    ret true;
+}
+
+fun paeth(left: u8, up: u8, corner: u8) u8 {
+    val estimate: i32 = left::i32 + up::i32 - corner::i32;
+    var pa:       i32 = estimate - left::i32;
+    var pb:       i32 = estimate - up::i32;
+    var pc:       i32 = estimate - corner::i32;
+    if (pa < 0)               { pa = -pa; }
+    if (pb < 0)               { pb = -pb; }
+    if (pc < 0)               { pc = -pc; }
+    if (pa <= pb && pa <= pc) { ret left; }
+    if (pb <= pc)             { ret up; }
+    ret corner;
+}
+
+# undo png prediction in place, dropping each row's filter type byte
+fun png(data: *vector.Vector[u8], start: usize, row: usize, bpp: usize) err[error.Error] {
+    val total: usize = data.len - start;
+    if (total % (row + 1) != 0) { ret codec(PREDICTED); }
+    val rows:  usize = total / (row + 1);
+    val bytes: *u8   = ?data.data[start];
+    var r:     usize = 0;
+    for (r < rows) {
+        val kind: u8    = bytes[r * (row + 1)];
+        val src:  usize = r * (row + 1) + 1;
+        val dst:  usize = r * row;
+        if (kind > 4) { ret codec(PREDICTED); }
+        var i: usize = 0;
+        for (i < row) {
+            val raw:    u8 = bytes[src + i];
+            var left:   u8 = 0;
+            var up:     u8 = 0;
+            var corner: u8 = 0;
+            if (i >= bpp)          { left = bytes[dst + i - bpp]; }
+            if (r > 0)             { up = bytes[dst - row + i]; }
+            if (r > 0 && i >= bpp) { corner = bytes[dst - row + i - bpp]; }
+            var value: u8 = raw;
+            if (kind == 1) {
+                value = raw + left;
+            }
+            or (kind == 2) {
+                value = raw + up;
+            }
+            or (kind == 3) {
+                value = raw + ((left::u32 + up::u32) / 2)::u8;
+            }
+            or (kind == 4) {
+                value = raw + paeth(left, up, corner);
+            }
+            bytes[dst + i] = value;
+            i              = i + 1;
+        }
+        r = r + 1;
+    }
+    data.len = start + rows * row;
+    ret err[error.Error].ok{};
+}
+
+fun sample(bytes: *u8, index: usize, bits: usize) u32 {
+    if (bits == 16) { ret (bytes[index * 2]::u32 << 8) | bytes[index * 2 + 1]::u32; }
+    if (bits == 8)  { ret bytes[index]::u32; }
+    val at:    usize = index * bits;
+    val shift: usize = 8 - bits - at % 8;
+    ret ((bytes[at / 8] >> shift::u8) & ((1u8 << bits::u8) - 1))::u32;
+}
+
+fun put_sample(bytes: *u8, index: usize, bits: usize, value: u32) {
+    if (bits == 16) {
+        bytes[index * 2]     = ((value >> 8) & 0xff)::u8;
+        bytes[index * 2 + 1] = (value & 0xff)::u8;
+        ret;
+    }
+    if (bits == 8) {
+        bytes[index] = (value & 0xff)::u8;
+        ret;
+    }
+    val at:    usize = index * bits;
+    val shift: usize = 8 - bits - at % 8;
+    val mask:  u8    = ((1u8 << bits::u8) - 1) << shift::u8;
+    bytes[at / 8] = (bytes[at / 8] & ~mask) | ((value::u8 << shift::u8) & mask);
+}
+
+# undo tiff predictor 2 in place, each sample the sum of its own and the one
+# a pixel to its left
+fun tiff(data: *vector.Vector[u8], start: usize, row: usize, p: *Prediction) err[error.Error] {
+    val total: usize = data.len - start;
+    if (total % row != 0) { ret codec(PREDICTED); }
+    val bits:    usize = p.bits::usize;
+    val colors:  usize = p.colors::usize;
+    val samples: usize = colors * p.columns::usize;
+    val mask:    u32   = ((1u64 << bits::u64) - 1)::u32;
+    var r:       usize = 0;
+    for (r < total / row) {
+        val bytes: *u8   = ?data.data[start + r * row];
+        var k:     usize = colors;
+        for (k < samples) {
+            val sum: u32 = sample(bytes, k, bits) + sample(bytes, k - colors, bits);
+            put_sample(bytes, k, bits, sum & mask);
+            k = k + 1;
+        }
+        r = r + 1;
+    }
+    ret err[error.Error].ok{};
+}
+
+# undo the predictor parms name over the bytes from start, in place
+fun unpredict(data: *vector.Vector[u8], start: usize, parms: object.Object) err[error.Error] {
+    var p: Prediction;
+    if (!prediction(parms, ?p)) { ret codec(PARMS); }
+    if (p.predictor == 1)       { ret err[error.Error].ok{}; }
+    val bits: usize = (p.colors * p.bits * p.columns)::usize;
+    val row:  usize = (bits + 7) / 8;
+    if (p.predictor == 2) { ret tiff(data, start, row, ?p); }
+    var bpp: usize = (p.colors * p.bits)::usize / 8;
+    if (bpp == 0) { bpp = 1; }
+    ret png(data, start, row, bpp);
+}
+
+fun inflate_failed(cause: zlib.InflateError) err[error.Error] {
+    if (sel cause.alloc)     { ret refused(cause.alloc); }
+    if (sel cause.truncated) { ret codec(TRUNCATED); }
+    ret codec(CORRUPT);
+}
+
+fun flate_decode(ctx: ptr, input: *u8, len: usize, parms: object.Object, limit: usize, output: *vector.Vector[u8]) err[error.Error] {
+    val start: usize                                     = output.len;
+    val made:  res[zlib.Decompressor, zlib.InflateError] = zlib.init(output.a);
+    if (sel made.err) { ret inflate_failed(made.err); }
+    var z: zlib.Decompressor = made.ok;
+    fin { zlib.dnit(?z); }
+    var consumed: usize = 0;
+    for (!zlib.is_done(?z)) {
+        val produced: usize = output.len - start;
+        if (output.len == output.cap && produced < limit) {
+            var more: usize = produced;
+            if (more < 4096)             { more = 4096; }
+            if (more > limit - produced) { more = limit - produced; }
+            val room: res[usize, allocator.Error] = vector.reserve[u8](output, more);
+            if (sel room.err) { ret refused(room.err); }
+        }
+        var space_left: usize = output.cap - output.len;
+        if (space_left > limit - produced) { space_left = limit - produced; }
+        val stepped: res[zlib.Progress, zlib.InflateError] = zlib.decompress(?z, ?input[consumed], len - consumed,
+            ?output.data[output.len], space_left);
+        if (sel stepped.err) { ret inflate_failed(stepped.err); }
+        consumed   = consumed + stepped.ok.consumed;
+        output.len = output.len + stepped.ok.written;
+        if (stepped.ok.status == zlib.OUTPUT_FULL && output.len - start >= limit) {
+            ret err[error.Error].err{error.Error.limit{}};
+        }
+        if (stepped.ok.status == zlib.NEED_INPUT && consumed >= len) { ret codec(TRUNCATED); }
+    }
+    ret unpredict(output, start, parms);
+}
+
+# the FlateDecode filter, which decodes zlib data and undoes a png or tiff
+# predictor its parameters name
+# ---
+# ret: the filter, with no encoder until std has a deflate compressor
+pub fun flate() Filter {
+    ret Filter{name: "FlateDecode", ctx: nil, encode: nil, decode: flate_decode};
+}
+
+# the filter this library implements under a /Filter name
+# ---
+# name: the name, without its slash
+# ret:  the filter, or none for a name this library has no filter for
+pub fun known(name: object.Name) opt[Filter] {
+    if (object.name_is(name, "FlateDecode"))    { ret opt[Filter].some{flate()}; }
+    if (object.name_is(name, "ASCIIHexDecode")) { ret opt[Filter].some{ascii_hex()}; }
+    ret opt[Filter].none{};
 }
 
 $if (capability.HOSTED) {
     use std.allocator.page;
     use std.memory;
+
+    fun coded(outcome: err[error.Error], code: i64) bool {
+        if (!sel outcome.err) { ret false; }
+        val cause: error.Error = outcome.err;
+        ret sel cause.codec && cause.codec == code;
+    }
 
     test ascii_hex__encodes_uppercase_pairs_and_terminates {
         var a: allocator.Allocator;
@@ -80,6 +352,92 @@ $if (capability.HOSTED) {
         if (sel encoded.err)                                        { ret 1; }
         if (output.len != 7)                                        { ret 2; }
         if (!memory.raw_equal(output.data::ptr, "009F7A>"::ptr, 7)) { ret 3; }
+        ret 0;
+    }
+
+    test ascii_hex__decodes_either_case_and_pads_an_odd_digit {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var output: vector.Vector[u8] = vector.init[u8](?a);
+        fin { vector.dnit[u8](?output); }
+        val filter:  Filter           = ascii_hex();
+        val decoded: err[error.Error] = filter.decode(filter.ctx, "9f 7A\n4>"::*u8, 8, object.null(), 16, ?output);
+        if (sel decoded.err)                                          { ret 1; }
+        if (output.len != 3)                                          { ret 2; }
+        if (!memory.raw_equal(output.data::ptr, "\x9fz\x40"::ptr, 3)) { ret 3; }
+        output.len = 0;
+        val bad: err[error.Error] = filter.decode(filter.ctx, "0g>"::*u8, 3, object.null(), 16, ?output);
+        if (!coded(bad, CORRUPT)) { ret 4; }
+        output.len = 0;
+        val open: err[error.Error] = filter.decode(filter.ctx, "00"::*u8, 2, object.null(), 16, ?output);
+        if (!coded(open, TRUNCATED)) { ret 5; }
+        output.len = 0;
+        val over: err[error.Error] = filter.decode(filter.ctx, "000000>"::*u8, 7, object.null(), 2, ?output);
+        if (!(sel over.err && sel over.err.limit)) { ret 6; }
+        ret 0;
+    }
+
+    # zlib of "hello hello hello hello\n"
+    val HELLO: [17]u8 = [17]u8{0x78, 0xda, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0xc8, 0x40, 0x27, 0xb9,
+        0x00, 0x70, 0xbe, 0x08, 0xbb};
+
+    test flate__decodes_within_its_limit_only {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var output: vector.Vector[u8] = vector.init[u8](?a);
+        fin { vector.dnit[u8](?output); }
+        val filter:  Filter           = flate();
+        val decoded: err[error.Error] = filter.decode(filter.ctx, ?HELLO[0], 17, object.null(), 24, ?output);
+        if (sel decoded.err)                                                           { ret 1; }
+        if (output.len != 24)                                                          { ret 2; }
+        if (!memory.raw_equal(output.data::ptr, "hello hello hello hello\n"::ptr, 24)) { ret 3; }
+        output.len = 0;
+        val over: err[error.Error] = filter.decode(filter.ctx, ?HELLO[0], 17, object.null(), 23, ?output);
+        if (!(sel over.err && sel over.err.limit)) { ret 4; }
+        output.len = 0;
+        val cut: err[error.Error] = filter.decode(filter.ctx, ?HELLO[0], 9, object.null(), 64, ?output);
+        if (!coded(cut, TRUNCATED)) { ret 5; }
+        ret 0;
+    }
+
+    fun parms_of(a: *allocator.Allocator, predictor: i64, colors: i64, bits: i64, columns: i64) object.Object {
+        val d: res[*object.Dict, error.Error] = object.dict(a);
+        if (sel d.err) { ret object.null(); }
+        object.set(d.ok, "Predictor", object.integer(predictor));
+        object.set(d.ok, "Colors", object.integer(colors));
+        object.set(d.ok, "BitsPerComponent", object.integer(bits));
+        object.set(d.ok, "Columns", object.integer(columns));
+        ret object.Object.dict{d.ok};
+    }
+
+    test unpredict__undoes_png_rows_and_tiff_samples {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var data: vector.Vector[u8] = vector.init[u8](?a);
+        fin { vector.dnit[u8](?data); }
+        # two rows of three bytes: none, then up
+        var png_rows: [8]u8 = [8]u8{0, 1, 2, 3, 2, 1, 1, 1};
+        var i:        usize = 0;
+        for (i < 8) {
+            vector.push[u8](?data, png_rows[i]);
+            i = i + 1;
+        }
+        val undone: err[error.Error] = unpredict(?data, 0, parms_of(?a, 12, 1, 8, 3));
+        if (sel undone.err)                                                        { ret 1; }
+        if (data.len != 6)                                                         { ret 2; }
+        if (!memory.raw_equal(data.data::ptr, "\x01\x02\x03\x02\x03\x04"::ptr, 6)) { ret 3; }
+        data.len = 0;
+        vector.push[u8](?data, 9);
+        vector.push[u8](?data, 0);
+        val bad: err[error.Error] = unpredict(?data, 0, parms_of(?a, 12, 1, 8, 1));
+        if (!coded(bad, PREDICTED)) { ret 4; }
+        # four 4-bit samples, each a difference from the one before
+        data.len = 0;
+        vector.push[u8](?data, 0x31);
+        vector.push[u8](?data, 0xf2);
+        val tiff_undone: err[error.Error] = unpredict(?data, 0, parms_of(?a, 2, 1, 4, 4));
+        if (sel tiff_undone.err)                          { ret 5; }
+        if (data.data[0] != 0x34 || data.data[1] != 0x35) { ret 6; }
         ret 0;
     }
 }

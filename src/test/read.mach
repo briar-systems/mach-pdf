@@ -1,0 +1,224 @@
+# reading files back: every file the writer produces and files other writers
+# produced, each read, walked object by object, appended to and read again
+#
+# a walk resolves every object number and decodes every stream whose filters
+# this library decodes. an update sets the catalog's /Lang, the change a
+# signature's incremental update makes in kind, and appends it after the
+# file's bytes; reading the result must find the change and every object the
+# file held before.
+
+use std.allocator;
+use std.allocator.page;
+use std.collections.vector;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use pdf.document;
+use pdf.error;
+use pdf.object;
+use pdf.output;
+use pdf.reader;
+
+#[embed("golden/table.pdf")]
+val TABLE: [_]u8;
+
+#[embed("golden/stream.pdf")]
+val STREAM: [_]u8;
+
+#[embed("golden/archive.pdf")]
+val ARCHIVE: [_]u8;
+
+#[embed("golden/fields.pdf")]
+val FIELDS: [_]u8;
+
+#[embed("golden/fonts.pdf")]
+val FONTS: [_]u8;
+
+#[embed("fixtures/read/chrome.pdf")]
+val CHROME: [_]u8;
+
+#[embed("fixtures/read/libreoffice.pdf")]
+val LIBREOFFICE: [_]u8;
+
+#[embed("fixtures/read/pdftex.pdf")]
+val PDFTEX: [_]u8;
+
+#[embed("fixtures/read/hybrid.pdf")]
+val HYBRID: [_]u8;
+
+val LIMIT: usize = 16777216;
+
+fun decodable(s: *object.Stream) bool {
+    var i: usize = 0;
+    for (i < s.filters.len) {
+        if (s.filters.data[i].filter.decode == nil) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# resolve every number, decode every stream it can, and count the objects
+fun walk(doc: *document.Document, a: *allocator.Allocator, objects: *usize, streams: *usize) err[error.Error] {
+    var n: u32 = 1;
+    for (n < document.size(doc)) {
+        val got: res[opt[document.Held], error.Error] = document.load(doc, n);
+        n = n + 1;
+        if (sel got.err)      { ret err[error.Error].err{got.err}; }
+        if (!sel got.ok.some) { cnt; }
+        @objects = @objects + 1;
+        val value: object.Object = got.ok.some.value;
+        if (!sel value.stream)        { cnt; }
+        if (!decodable(value.stream)) { cnt; }
+        val bytes: res[vector.Vector[u8], error.Error] = document.decoded(doc, value.stream, a, LIMIT);
+        if (sel bytes.err) { ret err[error.Error].err{bytes.err}; }
+        var held: vector.Vector[u8] = bytes.ok;
+        vector.dnit[u8](?held);
+        @streams = @streams + 1;
+    }
+    ret err[error.Error].ok{};
+}
+
+val LANG: str = "x-mach";
+
+fun catalog_lang_is_ours(doc: *document.Document) bool {
+    val root: res[*object.Dict, error.Error] = document.catalog(doc);
+    if (sel root.err) { ret false; }
+    val lang: opt[*object.Object] = object.get(root.ok, "Lang");
+    if (!sel lang.some) { ret false; }
+    val value: object.Object = @lang.some;
+    if (!sel value.string)                 { ret false; }
+    if (value.string.len != str_len(LANG)) { ret false; }
+    ret memory.raw_equal(value.string.data::ptr, LANG::ptr, value.string.len);
+}
+
+# read a file, walk it, update it, and read and walk the update
+fun round_trip(data: *u8, len: usize) i32 {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, ?a);
+    if (sel started.err) { ret 1; }
+    fin { document.dnit(?doc); }
+    val read: err[error.Error] = reader.read(?doc, data, len, reader.defaults());
+    if (sel read.err) { ret 2; }
+    var objects: usize            = 0;
+    var streams: usize            = 0;
+    val walked:  err[error.Error] = walk(?doc, ?a, ?objects, ?streams);
+    if (sel walked.err)              { ret 3; }
+    if (objects < 3 || streams == 0) { ret 4; }
+    if (catalog_lang_is_ours(?doc))  { ret 5; }
+
+    val root: res[*object.Dict, error.Error] = document.catalog(?doc);
+    if (sel root.err) { ret 6; }
+    val lang: res[object.Object, error.Error] = object.text(document.objects(?doc), LANG);
+    if (sel lang.err) { ret 7; }
+    object.set(root.ok, "Lang", lang.ok);
+    var target: object.Ref = object.Ref{number: 0, generation: 0};
+    if (sel doc.root.some) { target = doc.root.some; }
+    val touched: err[error.Error] = document.touch(?doc, target);
+    if (sel touched.err) { ret 8; }
+    var out: output.Output = output.init(?a);
+    fin { output.dnit(?out); }
+    output.put(?out, data, len);
+    val appended: err[error.Error] = document.append(?doc, ?out);
+    if (sel appended.err) { ret 9; }
+
+    var again:     document.Document;
+    val restarted: err[error.Error] = document.init(?again, ?a);
+    if (sel restarted.err) { ret 10; }
+    fin { document.dnit(?again); }
+    val reread: err[error.Error] = reader.read(?again, output.data(?out), output.offset(?out), reader.defaults());
+    if (sel reread.err)                { ret 11; }
+    if (!catalog_lang_is_ours(?again)) { ret 12; }
+    var objects_after: usize            = 0;
+    var streams_after: usize            = 0;
+    val rewalked:      err[error.Error] = walk(?again, ?a, ?objects_after, ?streams_after);
+    if (sel rewalked.err)                                   { ret 13; }
+    if (objects_after < objects || streams_after < streams) { ret 14; }
+    ret 0;
+}
+
+test read__table_golden_round_trips {
+    ret round_trip(?TABLE[0], $length_of(TABLE));
+}
+
+test read__stream_golden_round_trips {
+    ret round_trip(?STREAM[0], $length_of(STREAM));
+}
+
+test read__archive_golden_round_trips {
+    ret round_trip(?ARCHIVE[0], $length_of(ARCHIVE));
+}
+
+test read__fields_golden_round_trips {
+    ret round_trip(?FIELDS[0], $length_of(FIELDS));
+}
+
+test read__fonts_golden_round_trips {
+    ret round_trip(?FONTS[0], $length_of(FONTS));
+}
+
+test read__chrome_print_round_trips {
+    ret round_trip(?CHROME[0], $length_of(CHROME));
+}
+
+test read__libreoffice_round_trips {
+    ret round_trip(?LIBREOFFICE[0], $length_of(LIBREOFFICE));
+}
+
+test read__pdftex_round_trips {
+    ret round_trip(?PDFTEX[0], $length_of(PDFTEX));
+}
+
+test read__hybrid_round_trips {
+    ret round_trip(?HYBRID[0], $length_of(HYBRID));
+}
+
+test read__hybrid_finds_its_info_in_an_object_stream {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, ?a);
+    if (sel started.err) { ret 1; }
+    fin { document.dnit(?doc); }
+    val read: err[error.Error] = reader.read(?doc, ?HYBRID[0], $length_of(HYBRID), reader.defaults());
+    if (sel read.err) { ret 2; }
+    val info: res[*object.Dict, error.Error] = document.info(?doc);
+    if (sel info.err) { ret 3; }
+    val title: opt[*object.Object] = object.get(info.ok, "Title");
+    if (!sel title.some) { ret 4; }
+    # the content stream's /Length is a reference into the object stream
+    val content: res[opt[object.Object], error.Error] = document.resolve(?doc, object.Ref{number: 4, generation: 0});
+    if (sel content.err)      { ret 5; }
+    if (!sel content.ok.some) { ret 6; }
+    val s: object.Object = content.ok.some;
+    if (!sel s.stream) { ret 7; }
+    val bytes: res[vector.Vector[u8], error.Error] = document.decoded(?doc, s.stream, ?a, LIMIT);
+    if (sel bytes.err) { ret 8; }
+    var held: vector.Vector[u8] = bytes.ok;
+    fin { vector.dnit[u8](?held); }
+    if (held.len != 37) { ret 9; }
+    ret 0;
+}
+
+test read__bounds_what_a_cross_reference_stream_decodes_to {
+    var a: allocator.Allocator;
+    page.make(?a);
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, ?a);
+    if (sel started.err) { ret 1; }
+    fin { document.dnit(?doc); }
+    var opts: reader.Options = reader.defaults();
+    opts.max_decoded = 16;
+    val read: err[error.Error] = reader.read(?doc, ?PDFTEX[0], $length_of(PDFTEX), opts);
+    if (!(sel read.err && sel read.err.limit)) { ret 2; }
+    ret 0;
+}
