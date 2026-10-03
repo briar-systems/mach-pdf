@@ -52,7 +52,7 @@ pub fun build(doc: *document.Document) err[error.Error] {
     val finished: err[error.Error] = content.finish(?b);
     if (sel finished.err) { ret finished; }
 
-    val made: res[form.Form, error.Error] = form.init(doc, face.ok);
+    val made: res[form.Form, error.Error] = form.init(doc, face.ok, 0.0);
     if (sel made.err) { ret err[error.Error].err{made.err}; }
     var f:     form.Form                    = made.ok;
     val owner: res[form.Field, error.Error] = form.group(doc, ?f, nil, "owner");

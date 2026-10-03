@@ -204,12 +204,12 @@ pub fun show(b: *content.Builder, t: *TrueType, text: str) {
 }
 
 # the face's ascent and descent in font units, from hhea or else head's box
-fun vertical(t: *TrueType, ascent: *i64, descent: *i64) {
-    @ascent  = t.face.head.y_max::i64;
-    @descent = t.face.head.y_min::i64;
-    if (sel t.face.hhea.some) {
-        @ascent  = t.face.hhea.some.ascent::i64;
-        @descent = t.face.hhea.some.descent::i64;
+fun vertical(f: *ttf.Font, ascent: *i64, descent: *i64) {
+    @ascent  = f.head.y_max::i64;
+    @descent = f.head.y_min::i64;
+    if (sel f.hhea.some) {
+        @ascent  = f.hhea.some.ascent::i64;
+        @descent = f.hhea.some.descent::i64;
     }
 }
 
@@ -220,7 +220,7 @@ fun vertical(t: *TrueType, ascent: *i64, descent: *i64) {
 pub fun ascent(t: *TrueType) f64 {
     var up:   i64 = 0;
     var down: i64 = 0;
-    vertical(t, ?up, ?down);
+    vertical(?t.face, ?up, ?down);
     ret up::f64 / t.face.head.units_per_em::f64;
 }
 
@@ -231,13 +231,13 @@ pub fun ascent(t: *TrueType) f64 {
 pub fun descent(t: *TrueType) f64 {
     var up:   i64 = 0;
     var down: i64 = 0;
-    vertical(t, ?up, ?down);
+    vertical(?t.face, ?up, ?down);
     ret down::f64 / t.face.head.units_per_em::f64;
 }
 
 # a length in font units as thousandths of an em, rounded half away from zero
-fun scaled(t: *TrueType, value: i64) i64 {
-    val upem: i64 = t.face.head.units_per_em::i64;
+fun scaled(f: *ttf.Font, value: i64) i64 {
+    val upem: i64 = f.head.units_per_em::i64;
     if (value < 0) { ret -((-value * 1000 + upem / 2) / upem); }
     ret (value * 1000 + upem / 2) / upem;
 }
@@ -298,8 +298,12 @@ fun tag(program: *u8, size: usize, map_data: *object.Stream, unicode: *object.St
     sha256.update(?state, program, size);
     sha256.update(?state, map_data.data.data, map_data.data.len);
     sha256.update(?state, unicode.data.data, unicode.data.len);
+    tag_of(?state, into);
+}
+
+fun tag_of(state: *sha256.State, into: *u8) {
     var digest: [32]u8;
-    sha256.final(?state, ?digest[0]);
+    sha256.final(state, ?digest[0]);
     var i: usize = 0;
     for (i < TAG_LEN) {
         into[i] = 'A' + digest[i] % 26;
@@ -319,21 +323,22 @@ fun integers(a: *allocator.Allocator, values: *i64, count: usize) res[object.Obj
     ret res[object.Object, error.Error].ok{object.Object.array{list.ok}};
 }
 
-# the descriptor's /Flags: fixed pitch, symbolic, and italic
-fun flags(fixed: bool, italic: bool) i64 {
-    # symbolic, since a cid font's glyphs are reached outside the standard latin encoding
-    var value: i64 = 4;
-    if (fixed)  { value = value | 1; }
-    if (italic) { value = value | 64; }
+# the descriptor's /Flags: fixed pitch, symbolic or nonsymbolic, and italic
+fun flags(fixed: bool, italic: bool, symbolic: bool) i64 {
+    # a cid font's glyphs are reached outside the standard latin encoding, so it is symbolic
+    var value: i64 = 32;
+    if (symbolic) { value = 4; }
+    if (fixed)    { value = value | 1; }
+    if (italic)   { value = value | 64; }
     ret value;
 }
 
 # the FontDescriptor, naming the embedded program
-fun descriptor(t: *TrueType, name: object.Object, program: object.Ref) res[object.Ref, error.Error] {
-    val a:    *allocator.Allocator              = document.objects(t.doc);
-    val post: res[opt[ttf.Post], ttf.FontError] = ttf.post_info(?t.face);
+fun descriptor(doc: *document.Document, f: *ttf.Font, name: object.Object, program: object.Ref, symbolic: bool) res[object.Ref, error.Error] {
+    val a:    *allocator.Allocator              = document.objects(doc);
+    val post: res[opt[ttf.Post], ttf.FontError] = ttf.post_info(f);
     if (sel post.err) { ret failure[object.Ref](error.Error.font{post.err}); }
-    val os2: res[opt[ttf.Os2], ttf.FontError] = ttf.os2_info(?t.face);
+    val os2: res[opt[ttf.Os2], ttf.FontError] = ttf.os2_info(f);
     if (sel os2.err) { ret failure[object.Ref](error.Error.font{os2.err}); }
 
     var angle: f64  = 0.0;
@@ -342,13 +347,10 @@ fun descriptor(t: *TrueType, name: object.Object, program: object.Ref) res[objec
         angle = post.ok.some.italic_angle::f64 / 65536.0;
         fixed = post.ok.some.is_fixed_pitch;
     }
-    val italic:  bool = angle != 0.0 || (t.face.head.mac_style & 2) != 0;
-    var ascent:  i64  = t.face.head.y_max::i64;
-    var descent: i64  = t.face.head.y_min::i64;
-    if (sel t.face.hhea.some) {
-        ascent  = t.face.hhea.some.ascent::i64;
-        descent = t.face.hhea.some.descent::i64;
-    }
+    val italic:  bool = angle != 0.0 || (f.head.mac_style & 2) != 0;
+    var ascent:  i64  = 0;
+    var descent: i64  = 0;
+    vertical(f, ?ascent, ?descent);
     var cap:    i64 = ascent;
     var weight: i64 = 400;
     if (sel os2.ok.some) {
@@ -359,8 +361,8 @@ fun descriptor(t: *TrueType, name: object.Object, program: object.Ref) res[objec
     val stem: i64 = 10 + 220 * (weight - 50) / 900;
 
     var box: [4]i64 = [4]i64{
-        scaled(t, t.face.head.x_min::i64), scaled(t, t.face.head.y_min::i64),
-        scaled(t, t.face.head.x_max::i64), scaled(t, t.face.head.y_max::i64)
+        scaled(f, f.head.x_min::i64), scaled(f, f.head.y_min::i64),
+        scaled(f, f.head.x_max::i64), scaled(f, f.head.y_max::i64)
     };
     val bbox: res[object.Object, error.Error] = integers(a, ?box[0], 4);
     if (sel bbox.err) { ret failure[object.Ref](bbox.err); }
@@ -371,16 +373,16 @@ fun descriptor(t: *TrueType, name: object.Object, program: object.Ref) res[objec
     val set: err[error.Error] = error.first(
         object.set_name(d.ok, "Type", "FontDescriptor"),
         object.set(d.ok, "FontName", name),
-        object.set(d.ok, "Flags", object.integer(flags(fixed, italic))),
+        object.set(d.ok, "Flags", object.integer(flags(fixed, italic, symbolic))),
         object.set(d.ok, "FontBBox", bbox.ok),
         object.set(d.ok, "ItalicAngle", object.real(slant.ok)),
-        object.set(d.ok, "Ascent", object.integer(scaled(t, ascent))),
-        object.set(d.ok, "Descent", object.integer(scaled(t, descent))),
-        object.set(d.ok, "CapHeight", object.integer(scaled(t, cap))),
+        object.set(d.ok, "Ascent", object.integer(scaled(f, ascent))),
+        object.set(d.ok, "Descent", object.integer(scaled(f, descent))),
+        object.set(d.ok, "CapHeight", object.integer(scaled(f, cap))),
         object.set(d.ok, "StemV", object.integer(stem)),
         object.set(d.ok, "FontFile2", object.reference(program)));
     if (sel set.err) { ret failure[object.Ref](set.err); }
-    ret document.add(t.doc, object.Object.dict{d.ok});
+    ret document.add(doc, object.Object.dict{d.ok});
 }
 
 # the /W array, one run of every cid's width from cid 0
@@ -394,7 +396,7 @@ fun widths(t: *TrueType) res[object.Object, error.Error] {
         if (cid > 0) { glyph = t.glyphs.data[cid - 1]; }
         val m: res[ttf.HMetrics, ttf.FontError] = ttf.glyph_hmetrics(?t.face, glyph);
         if (sel m.err) { ret failure[object.Object](error.Error.font{m.err}); }
-        val pushed: err[error.Error] = object.push(run.ok, object.integer(scaled(t, m.ok.advance::i64)));
+        val pushed: err[error.Error] = object.push(run.ok, object.integer(scaled(?t.face, m.ok.advance::i64)));
         if (sel pushed.err) { ret failure[object.Object](pushed.err); }
         cid = cid + 1;
     }
@@ -427,6 +429,23 @@ fun stream_ref(t: *TrueType, s: *object.Stream) res[object.Ref, error.Error] {
     val flated: err[error.Error] = object.filter_with(s, filter.flate(), object.null());
     if (sel flated.err) { ret res[object.Ref, error.Error].err{flated.err}; }
     ret document.add(t.doc, object.Object.stream{s});
+}
+
+# the subset program of the listed glyphs, completed with the components
+# they draw, as a stream with no filter yet
+fun subset_program(a: *allocator.Allocator, f: *ttf.Font, list: *u16, count: usize, total: usize) res[*object.Stream, error.Error] {
+    val closed: res[usize, ttf.FontError] = ttf.closure(f, list, count, total);
+    if (sel closed.err) { ret failure[*object.Stream](error.Error.font{closed.err}); }
+    val size: res[usize, ttf.FontError] = ttf.subset_size(f, list, closed.ok);
+    if (sel size.err) { ret failure[*object.Stream](error.Error.font{size.err}); }
+    val program: res[*object.Stream, error.Error] = object.stream(a);
+    if (sel program.err) { ret program; }
+    val room: res[usize, allocator.Error] = vector.reserve[u8](?program.ok.data, size.ok);
+    if (sel room.err) { ret refused[*object.Stream](room.err); }
+    val wrote: res[usize, ttf.FontError] = ttf.write_subset(f, list, closed.ok, program.ok.data.data, size.ok);
+    if (sel wrote.err) { ret failure[*object.Stream](error.Error.font{wrote.err}); }
+    program.ok.data.len = wrote.ok;
+    ret program;
 }
 
 # write the subset and every object the font is made of, and define its
@@ -467,18 +486,8 @@ pub fun embed(t: *TrueType) err[error.Error] {
         }
         i = i + 1;
     }
-    val closed: res[usize, ttf.FontError] = ttf.closure(?t.face, list.ok, count, total);
-    if (sel closed.err) { ret font_fault(closed.err); }
-    val size: res[usize, ttf.FontError] = ttf.subset_size(?t.face, list.ok, closed.ok);
-    if (sel size.err) { ret font_fault(size.err); }
-
-    val program: res[*object.Stream, error.Error] = object.stream(a);
+    val program: res[*object.Stream, error.Error] = subset_program(a, ?t.face, list.ok, count, total);
     if (sel program.err) { ret fault(program.err); }
-    val room: res[usize, allocator.Error] = vector.reserve[u8](?program.ok.data, size.ok);
-    if (sel room.err) { ret fault(error.from_allocator(room.err)); }
-    val wrote: res[usize, ttf.FontError] = ttf.write_subset(?t.face, list.ok, closed.ok, program.ok.data.data, size.ok);
-    if (sel wrote.err) { ret font_fault(wrote.err); }
-    program.ok.data.len = wrote.ok;
 
     # cid to glyph: two big-endian bytes per cid from 0
     val gid_map: res[*object.Stream, error.Error] = object.stream(a);
@@ -509,11 +518,11 @@ pub fun embed(t: *TrueType) err[error.Error] {
     val name: res[object.Object, error.Error] = object.name(a, ?base[0]);
     if (sel name.err) { ret fault(name.err); }
 
-    val length: err[error.Error] = object.set(program.ok.dict, "Length1", object.integer(wrote.ok::i64));
+    val length: err[error.Error] = object.set(program.ok.dict, "Length1", object.integer(program.ok.data.len::i64));
     if (sel length.err) { ret length; }
     val program_ref: res[object.Ref, error.Error] = stream_ref(t, program.ok);
     if (sel program_ref.err) { ret fault(program_ref.err); }
-    val described: res[object.Ref, error.Error] = descriptor(t, name.ok, program_ref.ok);
+    val described: res[object.Ref, error.Error] = descriptor(t.doc, ?t.face, name.ok, program_ref.ok, true);
     if (sel described.err) { ret fault(described.err); }
     val map_ref: res[object.Ref, error.Error] = stream_ref(t, gid_map.ok);
     if (sel map_ref.err) { ret fault(map_ref.err); }
@@ -555,4 +564,345 @@ pub fun embed(t: *TrueType) err[error.Error] {
     if (sel defined.err) { ret defined; }
     t.embedded = true;
     ret err[error.Error].ok{};
+}
+
+# the unicode characters at 0x80 to 0x9f in WinAnsiEncoding, zero where it
+# has none (iso 32000-2 annex d.2)
+val WIN_ANSI_HIGH: [32]u16 = [32]u16{
+    0x20ac, 0, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021,
+    0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017d, 0,
+    0, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
+    0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0, 0x017e, 0x0178
+};
+
+# the WinAnsiEncoding code for a character
+# ---
+# cp:  the code point
+# ret: the code, or -1 when the encoding has none
+pub fun win_ansi(cp: u32) i32 {
+    if ((cp >= 0x20 && cp <= 0x7e) || (cp >= 0xa0 && cp <= 0xff)) { ret cp::i32; }
+    var i: usize = 0;
+    for (i < 32) {
+        if (WIN_ANSI_HIGH[i] != 0 && WIN_ANSI_HIGH[i]::u32 == cp) { ret (0x80 + i)::i32; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# the character a WinAnsiEncoding code stands for
+# ---
+# code: the code, below 256
+# ret:  the code point, or zero when the encoding has none
+pub fun win_ansi_char(code: usize) u32 {
+    if ((code >= 0x20 && code <= 0x7e) || (code >= 0xa0 && code <= 0xff)) { ret code::u32; }
+    if (code >= 0x80 && code <= 0x9f)                                     { ret WIN_ANSI_HIGH[code - 0x80]::u32; }
+    ret 0;
+}
+
+# a truetype face embedded as a simple font over WinAnsiEncoding
+#
+# the font holds every glyph the encoding reaches that the face draws, so a
+# value typed into a field in any viewer is drawn in it. a simple font is what
+# viewers draw a typed value in: they cannot do so in a composite font from a
+# form's default resources. the subset is written whole by `simple`, with a
+# (3,1) cmap added to it, since a viewer finds a nonsymbolic font's glyphs
+# through the cmap and mach-font's subsets carry none.
+# ---
+# doc:     the document the font belongs to
+# face:    the parsed face, over a copy of the file in the document's arena
+# font:    the TrueType font, defined by `simple`
+# ascent:  the height above the baseline, as a fraction of the font size
+# descent: the depth below the baseline, as a negative fraction of the size
+# present: whether the face draws the character of each code, 1 when it does
+pub rec Simple {
+    doc:     *document.Document;
+    face:    ttf.Font;
+    font:    object.Ref;
+    ascent:  f64;
+    descent: f64;
+    present: [256]u8;
+}
+
+fun put16(p: *u8, at: usize, value: u32) {
+    p[at]     = ((value >> 8) & 0xff)::u8;
+    p[at + 1] = (value & 0xff)::u8;
+}
+
+fun put32(p: *u8, at: usize, value: u32) {
+    put16(p, at, value >> 16);
+    put16(p, at + 2, value & 0xffff);
+}
+
+fun get16(p: *u8, at: usize) u32 {
+    ret (p[at]::u32 << 8) | p[at + 1]::u32;
+}
+
+fun get32(p: *u8, at: usize) u32 {
+    ret (get16(p, at) << 16) | get16(p, at + 2);
+}
+
+# the sum of len bytes, a multiple of four, as big-endian words modulo 2^32
+fun checksum(p: *u8, len: usize) u32 {
+    var sum: u64   = 0;
+    var at:  usize = 0;
+    for (at < len) {
+        sum = (sum + get32(p, at)::u64) & 0xffffffff;
+        at  = at + 4;
+    }
+    ret sum::u32;
+}
+
+fun padded(len: usize) usize {
+    ret (len + 3) / 4 * 4;
+}
+
+val CMAP: u32 = 0x636d6170;
+val HEAD: u32 = 0x68656164;
+
+# the cmap table of one (3,1) format 4 subtable, a segment for each character
+# ---
+# into: zeroed bytes for padded(12 + 16 + 8 * (n + 1))
+# cps:  the characters, ascending
+# gids: the glyph of each
+# n:    their count
+fun cmap_table(into: *u8, cps: *u32, gids: *u16, n: usize) {
+    val segs: usize = n + 1;
+    var log:  u32   = 0;
+    for ((2::usize << log) <= segs) { log = log + 1; }
+    val range: u32 = 2 << log;
+    put16(into, 2, 1);
+    put16(into, 4, 3);
+    put16(into, 6, 1);
+    put32(into, 8, 12);
+    put16(into, 12, 4);
+    put16(into, 14, (16 + 8 * segs)::u32);
+    put16(into, 18, (2 * segs)::u32);
+    put16(into, 20, range);
+    put16(into, 22, log);
+    put16(into, 24, (2 * segs)::u32 - range);
+    val ends:   usize = 26;
+    val starts: usize = 28 + 2 * segs;
+    val deltas: usize = 28 + 4 * segs;
+    var k:      usize = 0;
+    for (k < n) {
+        put16(into, ends + 2 * k, cps[k]);
+        put16(into, starts + 2 * k, cps[k]);
+        put16(into, deltas + 2 * k, (gids[k]::u32 + 0x10000 - cps[k]) & 0xffff);
+        k = k + 1;
+    }
+    put16(into, ends + 2 * n, 0xffff);
+    put16(into, starts + 2 * n, 0xffff);
+    put16(into, deltas + 2 * n, 1);
+}
+
+# rewrite a subset program with a cmap added, keeping the directory sorted
+# and the checksums and head's adjustment true
+fun add_cmap(a: *allocator.Allocator, program: *object.Stream, cps: *u32, gids: *u16, n: usize) err[error.Error] {
+    val src: *u8   = program.data.data;
+    val len: usize = program.data.len;
+    if (len < 12) { ret fault(error.Error.invalid{}); }
+    val tables: usize = get16(src, 4)::usize;
+    if (12 + 16 * tables > len) { ret fault(error.Error.invalid{}); }
+    val cmap_len: usize                     = 12 + 16 + 8 * (n + 1);
+    val cm:       res[*u8, allocator.Error] = allocator.zallocate[u8](a, padded(cmap_len));
+    if (sel cm.err) { ret fault(error.from_allocator(cm.err)); }
+    cmap_table(cm.ok, cps, gids, n);
+    val cap: usize                     = len + 16 + padded(cmap_len);
+    val out: res[*u8, allocator.Error] = allocator.zallocate[u8](a, cap);
+    if (sel out.err) { ret fault(error.from_allocator(out.err)); }
+
+    # where the cmap lands among the tables, by tag
+    var first: usize = 0;
+    var i:     usize = 0;
+    for (i < tables) {
+        if (get32(src, 12 + 16 * i) < CMAP) { first = first + 1; }
+        i = i + 1;
+    }
+    val count: usize = tables + 1;
+    var log:   u32   = 0;
+    for ((2::usize << log) <= count) { log = log + 1; }
+    memory.copy[u8](out.ok, src, 12);
+    put16(out.ok, 4, count::u32);
+    put16(out.ok, 6, 16 << log);
+    put16(out.ok, 8, log);
+    put16(out.ok, 10, (16 * count)::u32 - (16 << log));
+
+    var cursor: usize = 12 + 16 * count;
+    var head:   usize = 0;
+    var j:      usize = 0;
+    for (j < count) {
+        val record: usize = 12 + 16 * j;
+        if (j == first) {
+            put32(out.ok, record, CMAP);
+            put32(out.ok, record + 4, checksum(cm.ok, padded(cmap_len)));
+            put32(out.ok, record + 8, cursor::u32);
+            put32(out.ok, record + 12, cmap_len::u32);
+            memory.copy[u8](?out.ok[cursor], cm.ok, cmap_len);
+            cursor = cursor + padded(cmap_len);
+            j      = j + 1;
+            cnt;
+        }
+        var old: usize = j;
+        if (j > first) { old = j - 1; }
+        val from:   usize = 12 + 16 * old;
+        val offset: usize = get32(src, from + 8)::usize;
+        val size:   usize = get32(src, from + 12)::usize;
+        if (offset + size > len) { ret fault(error.Error.invalid{}); }
+        memory.copy[u8](?out.ok[record], ?src[from], 8);
+        put32(out.ok, record + 8, cursor::u32);
+        put32(out.ok, record + 12, size::u32);
+        if (get32(src, from) == HEAD) { head = cursor; }
+        memory.copy[u8](?out.ok[cursor], ?src[offset], size);
+        cursor = cursor + padded(size);
+        j      = j + 1;
+    }
+    if (head == 0) { ret fault(error.Error.invalid{}); }
+    put32(out.ok, head + 8, 0);
+    val sum: u64 = checksum(out.ok, cursor)::u64;
+    put32(out.ok, head + 8, ((0xB1B0AFBA + 0x100000000 - sum) & 0xffffffff)::u32);
+    program.data.len = 0;
+    ret object.write(program, out.ok, cursor);
+}
+
+val FIRST_CHAR: usize = 32;
+val LAST_CHAR:  usize = 255;
+
+# embed a truetype face as a simple font over WinAnsiEncoding
+#
+# the whole font is written now, holding the glyph of every code the encoding
+# reaches that the face draws, and the font's reference is defined on return.
+# a code the face has no glyph for is left out and `present` says so.
+# ---
+# doc:  the document
+# data: the truetype file
+# len:  its count of bytes
+# ret:  the font, `font` with mach-font's reason for a file it refuses, a face
+#       with no unicode cmap or one it cannot subset, `invalid` for a face with
+#       no postscript name, or the allocator's refusal
+pub fun simple(doc: *document.Document, data: *u8, len: usize) res[*Simple, error.Error] {
+    val a:    *allocator.Allocator      = document.objects(doc);
+    val copy: res[*u8, allocator.Error] = allocator.allocate[u8](a, len);
+    if (sel copy.err) { ret refused[*Simple](copy.err); }
+    memory.copy[u8](copy.ok, data, len);
+    val face: res[ttf.Font, ttf.FontError] = ttf.init(copy.ok, len);
+    if (sel face.err)         { ret failure[*Simple](error.Error.font{face.err}); }
+    if (sel face.ok.cmap.err) { ret failure[*Simple](error.Error.font{face.ok.cmap.err}); }
+    val made: res[*Simple, allocator.Error] = allocator.zallocate[Simple](a, 1);
+    if (sel made.err) { ret refused[*Simple](made.err); }
+    val s: *Simple = made.ok;
+    s.doc  = doc;
+    s.face = face.ok;
+    var up:   i64 = 0;
+    var down: i64 = 0;
+    vertical(?s.face, ?up, ?down);
+    s.ascent  = up::f64 / s.face.head.units_per_em::f64;
+    s.descent = down::f64 / s.face.head.units_per_em::f64;
+
+    # the subset's glyphs: .notdef, then each glyph the codes reach once, in code order
+    val total: usize                      = s.face.num_glyphs::usize;
+    val list:  res[*u16, allocator.Error] = allocator.allocate[u16](a, total);
+    if (sel list.err) { ret refused[*Simple](list.err); }
+    val place: res[*u16, allocator.Error] = allocator.allocate[u16](a, total);
+    if (sel place.err) { ret refused[*Simple](place.err); }
+    var g: usize = 0;
+    for (g < total) {
+        place.ok[g] = NONE;
+        g           = g + 1;
+    }
+    list.ok[0]  = 0;
+    place.ok[0] = 0;
+    var count:  usize = 1;
+    var source: [256]u16;
+    var cps:    [256]u32;
+    var slots:  [256]u16;
+    var n:      usize = 0;
+    var code:   usize = FIRST_CHAR;
+    for (code <= LAST_CHAR) {
+        val at: usize = code;
+        code = code + 1;
+        val cp: u32 = win_ansi_char(at);
+        if (cp == 0) { cnt; }
+        val glyph: res[u16, ttf.FontError] = ttf.glyph_index(?s.face, cp);
+        if (sel glyph.err) { ret failure[*Simple](error.Error.font{glyph.err}); }
+        if (glyph.ok == 0) { cnt; }
+        if (place.ok[glyph.ok::usize] == NONE) {
+            place.ok[glyph.ok::usize] = count::u16;
+            list.ok[count]            = glyph.ok;
+            count                     = count + 1;
+        }
+        s.present[at] = 1;
+        source[at]    = glyph.ok;
+        # insert in ascending character order for the cmap
+        var k: usize = n;
+        for (k > 0 && cps[k - 1] > cp) {
+            cps[k]   = cps[k - 1];
+            slots[k] = slots[k - 1];
+            k        = k - 1;
+        }
+        cps[k]   = cp;
+        slots[k] = glyph.ok;
+        n        = n + 1;
+    }
+    # the subset's glyph for each cmap entry is known only once its components are closed over
+    val program: res[*object.Stream, error.Error] = subset_program(a, ?s.face, list.ok, count, total);
+    if (sel program.err) { ret failure[*Simple](program.err); }
+    var k: usize = 0;
+    for (k < n) {
+        slots[k] = place.ok[slots[k]::usize];
+        k        = k + 1;
+    }
+    val cmapped: err[error.Error] = add_cmap(a, program.ok, ?cps[0], ?slots[0], n);
+    if (sel cmapped.err) { ret failure[*Simple](cmapped.err); }
+
+    var base:  [71]u8;
+    val named: res[opt[usize], ttf.FontError] = ttf.postscript_name(?s.face, ?base[TAG_LEN + 1], ttf.POSTSCRIPT_NAME_MAX);
+    if (sel named.err)     { ret failure[*Simple](error.Error.font{named.err}); }
+    if (sel named.ok.none) { ret failure[*Simple](error.Error.invalid{}); }
+    var state: sha256.State = sha256.init();
+    sha256.update(?state, program.ok.data.data, program.ok.data.len);
+    tag_of(?state, ?base[0]);
+    base[TAG_LEN]                     = '+';
+    base[TAG_LEN + 1 + named.ok.some] = 0;
+    val name: res[object.Object, error.Error] = object.name(a, ?base[0]);
+    if (sel name.err) { ret failure[*Simple](name.err); }
+
+    val length: err[error.Error] = object.set(program.ok.dict, "Length1", object.integer(program.ok.data.len::i64));
+    if (sel length.err) { ret failure[*Simple](length.err); }
+    val flated: err[error.Error] = object.filter_with(program.ok, filter.flate(), object.null());
+    if (sel flated.err) { ret failure[*Simple](flated.err); }
+    val program_ref: res[object.Ref, error.Error] = document.add(doc, object.Object.stream{program.ok});
+    if (sel program_ref.err) { ret failure[*Simple](program_ref.err); }
+    val described: res[object.Ref, error.Error] = descriptor(doc, ?s.face, name.ok, program_ref.ok, false);
+    if (sel described.err) { ret failure[*Simple](described.err); }
+
+    val widths: res[*object.Array, error.Error] = object.array(a);
+    if (sel widths.err) { ret failure[*Simple](widths.err); }
+    var c: usize = FIRST_CHAR;
+    for (c <= LAST_CHAR) {
+        var width: i64 = 0;
+        if (s.present[c] != 0) {
+            val m: res[ttf.HMetrics, ttf.FontError] = ttf.glyph_hmetrics(?s.face, source[c]);
+            if (sel m.err) { ret failure[*Simple](error.Error.font{m.err}); }
+            width = scaled(?s.face, m.ok.advance::i64);
+        }
+        val pushed: err[error.Error] = object.push(widths.ok, object.integer(width));
+        if (sel pushed.err) { ret failure[*Simple](pushed.err); }
+        c = c + 1;
+    }
+    val d: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel d.err) { ret failure[*Simple](d.err); }
+    val set: err[error.Error] = error.first(
+        object.set_name(d.ok, "Type", "Font"),
+        object.set_name(d.ok, "Subtype", "TrueType"),
+        object.set(d.ok, "BaseFont", name.ok),
+        object.set_name(d.ok, "Encoding", "WinAnsiEncoding"),
+        object.set(d.ok, "FirstChar", object.integer(FIRST_CHAR::i64)),
+        object.set(d.ok, "LastChar", object.integer(LAST_CHAR::i64)),
+        object.set(d.ok, "Widths", object.Object.array{widths.ok}),
+        object.set(d.ok, "FontDescriptor", object.reference(described.ok)));
+    if (sel set.err) { ret failure[*Simple](set.err); }
+    val node: res[object.Ref, error.Error] = document.add(doc, object.Object.dict{d.ok});
+    if (sel node.err) { ret failure[*Simple](node.err); }
+    s.font = node.ok;
+    ret res[*Simple, error.Error].ok{s};
 }

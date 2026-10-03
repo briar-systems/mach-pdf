@@ -155,7 +155,8 @@ holds, and [veraPDF](https://verapdf.org) validates that file as pdf/a-3b
 ## Forms
 
 `form.init` gives the catalog an `/AcroForm` whose values are drawn in a
-`form.Face`. A group only names the fields under it, so `group(nil, "owner")`
+`form.Face` at a default size, its `/DA`, and every text field writes its own
+`/DA` too. A group only names the fields under it, so `group(nil, "owner")`
 then `text_field(?owner, "name")` is the field `owner.name`. A terminal field
 keeps its widgets as kids, never merged into it: `form.widget` places another
 one on a page, and a value entered in any of them shows in all of them.
@@ -176,10 +177,14 @@ as one read from a file, with its fully qualified name and inherited `/FT`, and
 `form.find` the one a name names.
 
 `form.standard` is a face over a standard 14 font, which needs no embedding but
-is not allowed in PDF/A. `form.embedded` is a face over an embedded TrueType
-subset, which PDF/A allows: it writes Identity-H glyph codes and refuses a
-character the face has no glyph for. Every value must be set before the face is
-embedded.
+is not allowed in PDF/A. `form.embedded(doc, data, len, name)` is a face over
+an embedded TrueType file, which PDF/A allows: a simple font with
+`WinAnsiEncoding` holding every glyph that encoding reaches that the face draws
+(`font.simple`), written at once, so a value typed in Okular, pdf.js or Chrome
+draws in it at the size of the field's `/DA`. A viewer cannot draw a typed value
+in a composite font, so the page text keeps its Type0 face from
+`font.truetype` and the form has its own. The face refuses a character
+WinAnsiEncoding lacks or the face has no glyph for.
 
 ## Embedded fonts
 
