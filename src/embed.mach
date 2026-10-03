@@ -18,6 +18,7 @@ use std.types.string.str_len;
 use pdf.date;
 use pdf.document;
 use pdf.error;
+use pdf.filter;
 use pdf.object;
 use pdf.output;
 use pdf.text;
@@ -163,6 +164,7 @@ fun file_stream(doc: *document.Document, f: *File) res[object.Ref, error.Error] 
         object.set_name(s.ok.dict, "Type", "EmbeddedFile"),
         object.set_name(s.ok.dict, "Subtype", f.mime),
         object.set(s.ok.dict, "Params", object.Object.dict{params.ok}),
+        object.filter_with(s.ok, filter.flate(), object.null()),
         object.write(s.ok, f.data, f.len));
     if (sel set.err) { ret failure[object.Ref](set.err); }
     ret document.add(doc, object.Object.stream{s.ok});

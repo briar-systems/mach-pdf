@@ -120,7 +120,8 @@ pub rec Source {
 # entries:      the object table, indexed by object number
 # version:      the header version, 1.7 unless changed
 # xref_stream:  save cross-references as a stream (pdf 1.5) rather than a table
-# xref_filters: the filters the cross-reference stream is written through
+# xref_filters: the filters the cross-reference stream is written through,
+#               FlateDecode first
 # root:         the catalog, the trailer's /Root
 # info:         the document information dictionary, the trailer's /Info
 # id:           the trailer's /ID, null for none
@@ -178,6 +179,13 @@ pub fun init(doc: *Document, backing: *allocator.Allocator) err[error.Error] {
     if (sel pushed.err) {
         arena.dnit(?doc.arena);
         ret failed(pushed.err);
+    }
+    val flated: res[usize, allocator.Error] = vector.push[object.Applied](?doc.xref_filters,
+        object.Applied{filter: filter.flate(), parms: object.null()});
+    if (sel flated.err) {
+        vector.dnit[Entry](?doc.entries);
+        arena.dnit(?doc.arena);
+        ret failed(flated.err);
     }
     ret err[error.Error].ok{};
 }
@@ -338,7 +346,8 @@ pub fun set_id(doc: *Document, first: *u8, first_len: usize, second: *u8, second
     ret err[error.Error].ok{};
 }
 
-# list a filter after the cross-reference stream's others
+# list a filter after the cross-reference stream's others, FlateDecode to
+# start with
 # ---
 # doc:   the document
 # f:     the filter
