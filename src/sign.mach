@@ -66,17 +66,45 @@ pub rec Spec {
     time:      opt[date.Date];
 }
 
-fun refusal(made: cms.Result) error.Error {
-    ret error.Error.signing{error.Signing{cms: made.error, signer: made.signer}};
+# why mach-pki could not make a signature
+# ---
+# cms:    the cms builder's error
+# signer: the signer's error when cms is SIGNER_FAILED, so a caller can tell a
+#         transient failure (`signer.transient`) from a refusal
+pub rec Signing {
+    cms:    cms.Error;
+    signer: contract.Error;
 }
 
-fun refused(made: cms.Result) err[error.Error] {
-    ret err[error.Error].err{refusal(made)};
+# why a signing did not complete
+#
+# the first case is the zero default, so a zero-initialized `err[Error]` reads
+# as a refused allocation.
+# ---
+# pdf:     the document, its objects or its output failed
+# signing: mach-pki could not make the signature, with its reasons
+pub tag Error: u8 {
+    pdf:     error.Error;
+    signing: Signing;
 }
 
-fun digested(failed: contracts.Error) err[error.Error] {
-    if (failed == contracts.OK) { ret err[error.Error].ok{}; }
-    ret err[error.Error].err{error.Error.signing{error.Signing{cms: cms.INVALID_INPUT, signer: contract.OK}}};
+fun refusal(made: cms.Result) Error {
+    ret Error.signing{Signing{cms: made.error, signer: made.signer}};
+}
+
+fun refused(made: cms.Result) err[Error] {
+    ret err[Error].err{refusal(made)};
+}
+
+fun digested(failed: contracts.Error) err[Error] {
+    if (failed == contracts.OK) { ret err[Error].ok{}; }
+    ret err[Error].err{Error.signing{Signing{cms: cms.INVALID_INPUT, signer: contract.OK}}};
+}
+
+# a pdf outcome as a signing one, for callers that mix both
+pub fun lifted(outcome: err[error.Error]) err[Error] {
+    if (sel outcome.err) { ret err[Error].err{Error.pdf{outcome.err}}; }
+    ret err[Error].ok{};
 }
 
 # the cms options for a digest under the spec's algorithm
@@ -89,15 +117,15 @@ fun options(algorithm: x509.SignatureAlgorithm, digest: *u8, len: usize) cms.Opt
 }
 
 # the size of the signed data the signer can make, measured without signing
-fun measure(spec: *Spec, algorithm: x509.SignatureAlgorithm) res[usize, error.Error] {
+fun measure(spec: *Spec, algorithm: x509.SignatureAlgorithm) res[usize, Error] {
     var zeros: [cms.MAX_DIGEST_SIZE]u8;
     val len:   usize       = cms.digest_size(cms.digest_algorithm(algorithm));
     var o:     cms.Options = options(algorithm, ?zeros[0], len);
     val made:  cms.Result  = cms.build(spec.signer, ?o, contracts.Buffer{data: nil, capacity: 0});
     if (made.error != cms.OUTPUT_TOO_SMALL) {
-        ret res[usize, error.Error].err{refusal(made)};
+        ret res[usize, Error].err{refusal(made)};
     }
-    ret res[usize, error.Error].ok{made.written};
+    ret res[usize, Error].ok{made.written};
 }
 
 # the claimed time as a pdf date string
@@ -134,7 +162,7 @@ fun flag(doc: *document.Document) err[error.Error] {
     ret err[error.Error].err{error.Error.invalid{}};
 }
 
-fun hash(digest: *cms.Digest, bytes: *u8, len: usize) err[error.Error] {
+fun hash(digest: *cms.Digest, bytes: *u8, len: usize) err[Error] {
     ret digested(cms.digest_update(digest, contracts.Bytes{data: bytes, len: len}));
 }
 
@@ -147,100 +175,101 @@ fun hash(digest: *cms.Digest, bytes: *u8, len: usize) err[error.Error] {
 # doc:  the document, read from the file
 # out:  the output holding the file's bytes, which the update is appended to
 # spec: what to sign and how
-# ret:  ok, `invalid` for a name that names no signature field or one already
-#       signed, `signing` with mach-pki's reasons, a writing failure, or the
-#       allocator's refusal
-pub fun sign(doc: *document.Document, out: *output.Output, spec: *Spec) err[error.Error] {
+# ret:  ok, `pdf` with `invalid` for a name that names no signature field or
+#       one already signed or with a writing failure or the allocator's
+#       refusal, or `signing` with mach-pki's reasons
+pub fun sign(doc: *document.Document, out: *output.Output, spec: *Spec) err[Error] {
     val a: *allocator.Allocator = document.objects(doc);
-    if (spec == nil || spec.signer == nil) { ret err[error.Error].err{error.Error.invalid{}}; }
+    if (spec == nil || spec.signer == nil) { ret err[Error].err{Error.pdf{error.Error.invalid{}}}; }
     val found: res[form.Found, error.Error] = form.find(doc, a, spec.field);
-    if (sel found.err) { ret err[error.Error].err{found.err}; }
+    if (sel found.err) { ret err[Error].err{Error.pdf{found.err}}; }
     val field: form.Found = found.ok;
-    if (!object.name_is(field.type, "Sig")) { ret err[error.Error].err{error.Error.invalid{}}; }
+    if (!object.name_is(field.type, "Sig")) { ret err[Error].err{Error.pdf{error.Error.invalid{}}}; }
     val signed: opt[*object.Object] = object.get(field.dict, "V");
-    if (sel signed.some) { ret err[error.Error].err{error.Error.invalid{}}; }
+    if (sel signed.some) { ret err[Error].err{Error.pdf{error.Error.invalid{}}}; }
 
     var algorithm: x509.SignatureAlgorithm = spec.algorithm;
     if (algorithm == x509.SIGNATURE_NONE) { algorithm = contract.algorithm(spec.signer, 0); }
-    val sized: res[usize, error.Error] = measure(spec, algorithm);
-    if (sel sized.err) { ret err[error.Error].err{sized.err}; }
+    val sized: res[usize, Error] = measure(spec, algorithm);
+    if (sel sized.err) { ret err[Error].err{sized.err}; }
     val size: usize = sized.ok;
 
     # the reservation's initial value is the zeros the signed data is padded with
     val blank: res[*u8, allocator.Error] = allocator.zallocate[u8](a, size);
-    if (sel blank.err) { ret err[error.Error].err{error.from_allocator(blank.err)}; }
+    if (sel blank.err) { ret err[Error].err{Error.pdf{error.from_allocator(blank.err)}}; }
     val zeros: res[object.Object, error.Error] = object.hex_string(a, blank.ok, size);
-    if (sel zeros.err) { ret err[error.Error].err{zeros.err}; }
+    if (sel zeros.err) { ret err[Error].err{Error.pdf{zeros.err}}; }
     val contents: res[*object.Reserved, error.Error] = object.reserve(a, size * 2 + 2, zeros.ok);
-    if (sel contents.err) { ret err[error.Error].err{contents.err}; }
+    if (sel contents.err) { ret err[Error].err{Error.pdf{contents.err}}; }
     val empty: res[*object.Array, error.Error] = object.array(a);
-    if (sel empty.err) { ret err[error.Error].err{empty.err}; }
+    if (sel empty.err) { ret err[Error].err{Error.pdf{empty.err}}; }
     val range: res[*object.Reserved, error.Error] = object.reserve(a, RANGE_WIDTH, object.Object.array{empty.ok});
-    if (sel range.err) { ret err[error.Error].err{range.err}; }
+    if (sel range.err) { ret err[Error].err{Error.pdf{range.err}}; }
 
     val d: res[*object.Dict, error.Error] = object.dict(a);
-    if (sel d.err) { ret err[error.Error].err{d.err}; }
+    if (sel d.err) { ret err[Error].err{Error.pdf{d.err}}; }
     val shaped: err[error.Error] = error.first(
         object.set_name(d.ok, "Type", "Sig"),
         object.set_name(d.ok, "Filter", FILTER),
         object.set_name(d.ok, "SubFilter", SUBFILTER));
-    if (sel shaped.err) { ret shaped; }
+    if (sel shaped.err) { ret lifted(shaped); }
     if (sel spec.time.some) {
         val m: res[object.Object, error.Error] = when(a, spec.time.some);
-        if (sel m.err) { ret err[error.Error].err{m.err}; }
+        if (sel m.err) { ret err[Error].err{Error.pdf{m.err}}; }
         val dated: err[error.Error] = object.set(d.ok, "M", m.ok);
-        if (sel dated.err) { ret dated; }
+        if (sel dated.err) { ret lifted(dated); }
     }
     val spans: err[error.Error] = error.first(
         object.set(d.ok, "ByteRange", object.Object.reserved{range.ok}),
         object.set(d.ok, "Contents", object.Object.reserved{contents.ok}));
-    if (sel spans.err) { ret spans; }
+    if (sel spans.err) { ret lifted(spans); }
     val node: res[object.Ref, error.Error] = document.add(doc, object.Object.dict{d.ok});
-    if (sel node.err) { ret err[error.Error].err{node.err}; }
+    if (sel node.err) { ret err[Error].err{Error.pdf{node.err}}; }
     val linked: err[error.Error] = error.first(
         object.set(field.dict, "V", object.reference(node.ok)),
         document.touch(doc, field.node),
         flag(doc));
-    if (sel linked.err) { ret linked; }
+    if (sel linked.err) { ret lifted(linked); }
 
     val appended: err[error.Error] = document.append(doc, out);
-    if (sel appended.err) { ret appended; }
+    if (sel appended.err) { ret lifted(appended); }
 
     # the range covers every byte but the /Contents string, its delimiters included
     val gap:   usize                           = contents.ok.offset;
     val after: usize                           = gap + contents.ok.width;
     val end:   usize                           = output.offset(out);
     val list:  res[*object.Array, error.Error] = object.array(a);
-    if (sel list.err) { ret err[error.Error].err{list.err}; }
+    if (sel list.err) { ret err[Error].err{Error.pdf{list.err}}; }
     val listed: err[error.Error] = error.first(
         object.push(list.ok, object.integer(0)),
         object.push(list.ok, object.integer(gap::i64)),
         object.push(list.ok, object.integer(after::i64)),
         object.push(list.ok, object.integer((end - after)::i64)));
-    if (sel listed.err) { ret listed; }
+    if (sel listed.err) { ret lifted(listed); }
     val ranged: err[error.Error] = syntax.fill(out, range.ok, object.Object.array{list.ok});
-    if (sel ranged.err) { ret ranged; }
+    if (sel ranged.err) { ret lifted(ranged); }
 
-    var digest: cms.Digest;
-    val kind:   cms.DigestAlgorithm = cms.digest_algorithm(algorithm);
-    val bytes:  *u8                 = output.data(out);
-    val hashed: err[error.Error]    = error.first(
-        digested(cms.digest_init(?digest, kind)),
-        hash(?digest, bytes, gap),
-        hash(?digest, ?bytes[after], end - after));
-    if (sel hashed.err) { ret hashed; }
+    var digest:  cms.Digest;
+    val kind:    cms.DigestAlgorithm = cms.digest_algorithm(algorithm);
+    val bytes:   *u8                 = output.data(out);
+    val started: err[Error]          = digested(cms.digest_init(?digest, kind));
+    if (sel started.err) { ret started; }
+    val head: err[Error] = hash(?digest, bytes, gap);
+    if (sel head.err) { ret head; }
+    val tail: err[Error] = hash(?digest, ?bytes[after], end - after);
+    if (sel tail.err) { ret tail; }
     var value:    [cms.MAX_DIGEST_SIZE]u8;
     val finished: contracts.Operation = cms.digest_final(?digest,
         contracts.Buffer{data: ?value[0], capacity: cms.MAX_DIGEST_SIZE});
-    val closed: err[error.Error] = digested(finished.error);
+    val closed: err[Error] = digested(finished.error);
     if (sel closed.err) { ret closed; }
 
     val held: res[*u8, allocator.Error] = allocator.zallocate[u8](document.objects(doc), size);
-    if (sel held.err) { ret err[error.Error].err{error.from_allocator(held.err)}; }
+    if (sel held.err) { ret err[Error].err{Error.pdf{error.from_allocator(held.err)}}; }
     var o:    cms.Options = options(algorithm, ?value[0], finished.written);
     val made: cms.Result  = cms.build(spec.signer, ?o, contracts.Buffer{data: held.ok, capacity: size});
     if (made.error != cms.OK) { ret refused(made); }
     val signature: res[object.Object, error.Error] = object.hex_string(a, held.ok, size);
-    if (sel signature.err) { ret err[error.Error].err{signature.err}; }
-    ret syntax.fill(out, contents.ok, signature.ok);
+    if (sel signature.err) { ret err[Error].err{Error.pdf{signature.err}}; }
+    ret lifted(syntax.fill(out, contents.ok, signature.ok));
 }

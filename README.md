@@ -3,7 +3,7 @@
 PDF for Mach (ISO 32000-2): an object model, a deterministic writer and a
 reader, with incremental updates and reserved spans for values written after
 the fact, and PAdES signatures. It is a spec implementation with no knowledge of any document format above it,
-and it depends on mach-std, mach-font and mach-pki.
+and it depends on mach-std and mach-font. Only `pdf.sign` and `pdf.verify` use mach-pki, so a program that does not import them links no pki or crypto code.
 
 ## Modules
 
@@ -236,7 +236,7 @@ output.put(?out, data, len);
 # value is an open signer.Signer, such as key_signer.signer(?keyed)
 var spec: sign.Spec = sign.Spec{field: "owner.signature", signer: ?value,
     algorithm: x509.SIGNATURE_NONE, time: opt[date.Date].some{now}};
-val signed: err[error.Error] = sign.sign(?doc, ?out, ?spec);
+val signed: err[sign.Error] = sign.sign(?doc, ?out, ?spec);
 ```
 
 B-T and B-LT build on the same path. B-T attaches an RFC 3161 time-stamp
