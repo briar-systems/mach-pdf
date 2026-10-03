@@ -1,0 +1,329 @@
+# document metadata: the information dictionary and the xmp stream the catalog
+# names (iso 32000-2 sections 14.3)
+#
+# both are written together from one description, so every entry the
+# information dictionary holds has its xmp equivalent with the same value, as
+# pdf/a requires. nothing is implied: no dates, identifiers or tool names the
+# caller did not give, so the same description gives the same bytes.
+
+use std.allocator;
+use std.system.capability;
+use std.text.utf8;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use pdf.date;
+use pdf.document;
+use pdf.error;
+use pdf.object;
+use pdf.output;
+use pdf.text;
+
+# a document's descriptive metadata, each text utf-8 and nil when absent
+# ---
+# title:    /Title and dc:title
+# author:   /Author and the one entry of dc:creator
+# subject:  /Subject and dc:description
+# keywords: /Keywords and pdf:Keywords
+# creator:  /Creator and xmp:CreatorTool, the tool the content came from
+# producer: /Producer and pdf:Producer, the tool that wrote the pdf
+# created:  /CreationDate and xmp:CreateDate
+# modified: /ModDate and xmp:ModifyDate
+pub rec Metadata {
+    title:    str;
+    author:   str;
+    subject:  str;
+    keywords: str;
+    creator:  str;
+    producer: str;
+    created:  opt[date.Date];
+    modified: opt[date.Date];
+}
+
+# one more xmp property in its own namespace, such as a conformance claim
+# ---
+# prefix:   the namespace prefix, such as "pdfaid"
+# uri:      the namespace uri
+# property: the property's local name
+# value:    its text, utf-8
+pub rec Claim {
+    prefix:   str;
+    uri:      str;
+    property: str;
+    value:    str;
+}
+
+val PACKET_ID: str = "W5M0MpCehiHzreSzNTczkc9d";
+
+fun invalid() err[error.Error] {
+    ret err[error.Error].err{error.Error.invalid{}};
+}
+
+# append s as xml character data
+fun escaped(out: *output.Output, s: str) err[error.Error] {
+    val len: usize = str_len(s);
+    if (!utf8.validate(s, len)) { ret invalid(); }
+    var i: usize = 0;
+    for (i < len) {
+        val c: u8 = s[i];
+        if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') { ret invalid(); }
+        if (c == '&')                                        { output.text(out, "&amp;"); }
+        or (c == '<')                                        { output.text(out, "&lt;"); }
+        or (c == '>')                                        { output.text(out, "&gt;"); }
+        or                                                   { output.byte(out, c); }
+        i = i + 1;
+    }
+    ret err[error.Error].ok{};
+}
+
+fun element(out: *output.Output, name: str, value: str) err[error.Error] {
+    if (value == nil) { ret err[error.Error].ok{}; }
+    output.text(out, "   <");
+    output.text(out, name);
+    output.byte(out, '>');
+    val wrote: err[error.Error] = escaped(out, value);
+    if (sel wrote.err) { ret wrote; }
+    output.text(out, "</");
+    output.text(out, name);
+    output.text(out, ">\n");
+    ret err[error.Error].ok{};
+}
+
+# a language alternative or ordered array holding one item
+fun container(out: *output.Output, name: str, kind: str, item: str, value: str) err[error.Error] {
+    if (value == nil) { ret err[error.Error].ok{}; }
+    output.text(out, "   <");
+    output.text(out, name);
+    output.text(out, "><rdf:");
+    output.text(out, kind);
+    output.text(out, "><rdf:li");
+    output.text(out, item);
+    output.byte(out, '>');
+    val wrote: err[error.Error] = escaped(out, value);
+    if (sel wrote.err) { ret wrote; }
+    output.text(out, "</rdf:li></rdf:");
+    output.text(out, kind);
+    output.text(out, "></");
+    output.text(out, name);
+    output.text(out, ">\n");
+    ret err[error.Error].ok{};
+}
+
+fun moment(out: *output.Output, name: str, when: opt[date.Date]) err[error.Error] {
+    if (!sel when.some) { ret err[error.Error].ok{}; }
+    output.text(out, "   <");
+    output.text(out, name);
+    output.byte(out, '>');
+    val wrote: err[error.Error] = date.xmp(out, when.some);
+    if (sel wrote.err) { ret wrote; }
+    output.text(out, "</");
+    output.text(out, name);
+    output.text(out, ">\n");
+    ret err[error.Error].ok{};
+}
+
+fun packet(out: *output.Output, meta: *Metadata, claims: *Claim, count: usize) err[error.Error] {
+    output.text(out, "<?xpacket begin=\"\xef\xbb\xbf\" id=\"");
+    output.text(out, PACKET_ID);
+    output.text(out, "\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n");
+    output.text(out, " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n");
+    output.text(out, "  <rdf:Description rdf:about=\"\"");
+    output.text(out, " xmlns:dc=\"http://purl.org/dc/elements/1.1/\"");
+    output.text(out, " xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"");
+    output.text(out, " xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\">\n");
+    val described: err[error.Error] = error.first(
+        container(out, "dc:title", "Alt", " xml:lang=\"x-default\"", meta.title),
+        container(out, "dc:creator", "Seq", "", meta.author),
+        container(out, "dc:description", "Alt", " xml:lang=\"x-default\"", meta.subject),
+        element(out, "pdf:Keywords", meta.keywords),
+        element(out, "xmp:CreatorTool", meta.creator),
+        element(out, "pdf:Producer", meta.producer),
+        moment(out, "xmp:CreateDate", meta.created),
+        moment(out, "xmp:ModifyDate", meta.modified));
+    if (sel described.err) { ret described; }
+    output.text(out, "  </rdf:Description>\n");
+    var i: usize = 0;
+    for (i < count) {
+        val c: *Claim = ?claims[i];
+        output.text(out, "  <rdf:Description rdf:about=\"\" xmlns:");
+        output.text(out, c.prefix);
+        output.text(out, "=\"");
+        val uri: err[error.Error] = escaped(out, c.uri);
+        if (sel uri.err) { ret uri; }
+        output.text(out, "\">\n   <");
+        output.text(out, c.prefix);
+        output.byte(out, ':');
+        output.text(out, c.property);
+        output.byte(out, '>');
+        val value: err[error.Error] = escaped(out, c.value);
+        if (sel value.err) { ret value; }
+        output.text(out, "</");
+        output.text(out, c.prefix);
+        output.byte(out, ':');
+        output.text(out, c.property);
+        output.text(out, ">\n  </rdf:Description>\n");
+        i = i + 1;
+    }
+    output.text(out, " </rdf:RDF>\n</x:xmpmeta>\n<?xpacket end=\"w\"?>");
+    ret output.status(out);
+}
+
+fun entry(a: *allocator.Allocator, d: *object.Dict, key: str, value: str) err[error.Error] {
+    if (value == nil) { ret err[error.Error].ok{}; }
+    val made: res[object.Object, error.Error] = text.of(a, value);
+    if (sel made.err) { ret err[error.Error].err{made.err}; }
+    ret object.set(d, key, made.ok);
+}
+
+fun dated(a: *allocator.Allocator, d: *object.Dict, key: str, when: opt[date.Date]) err[error.Error] {
+    if (!sel when.some) { ret err[error.Error].ok{}; }
+    var spelled: output.Output = output.init(a);
+    fin { output.dnit(?spelled); }
+    val wrote: err[error.Error] = date.pdf(?spelled, when.some);
+    if (sel wrote.err) { ret wrote; }
+    val status: err[error.Error] = output.status(?spelled);
+    if (sel status.err) { ret status; }
+    val made: res[object.Object, error.Error] = object.string(a, output.data(?spelled), output.offset(?spelled));
+    if (sel made.err) { ret err[error.Error].err{made.err}; }
+    ret object.set(d, key, made.ok);
+}
+
+# give an object number its value, allocating one when held names none
+fun place(doc: *document.Document, held: opt[object.Ref], value: object.Object) res[object.Ref, error.Error] {
+    if (sel held.some) {
+        val defined: err[error.Error] = document.define(doc, held.some, value);
+        if (sel defined.err) { ret res[object.Ref, error.Error].err{defined.err}; }
+        ret res[object.Ref, error.Error].ok{held.some};
+    }
+    ret document.add(doc, value);
+}
+
+# write a document's information dictionary and xmp metadata stream
+#
+# both replace any the document had: the information dictionary holds exactly
+# the entries meta gives, and the catalog's /Metadata names the new stream.
+# they agree as long as neither is edited after.
+# ---
+# doc:    the document
+# meta:   the description
+# claims: count more properties for the xmp stream, nil when count is 0
+# count:  the count of claims
+# ret:    ok, `invalid` for text that is not utf-8 or holds control
+#         characters, a date out of range, or a catalog /Metadata that is not
+#         a reference, or the allocator's refusal
+pub fun write(doc: *document.Document, meta: *Metadata, claims: *Claim, count: usize) err[error.Error] {
+    val a: *allocator.Allocator = document.objects(doc);
+
+    val info: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel info.err) { ret err[error.Error].err{info.err}; }
+    val filled: err[error.Error] = error.first(
+        entry(a, info.ok, "Title", meta.title),
+        entry(a, info.ok, "Author", meta.author),
+        entry(a, info.ok, "Subject", meta.subject),
+        entry(a, info.ok, "Keywords", meta.keywords),
+        entry(a, info.ok, "Creator", meta.creator),
+        entry(a, info.ok, "Producer", meta.producer),
+        dated(a, info.ok, "CreationDate", meta.created),
+        dated(a, info.ok, "ModDate", meta.modified));
+    if (sel filled.err) { ret filled; }
+
+    val s: res[*object.Stream, error.Error] = object.stream(a);
+    if (sel s.err) { ret err[error.Error].err{s.err}; }
+    var xml:   output.Output    = output.init(a);
+    val wrote: err[error.Error] = packet(?xml, meta, claims, count);
+    if (sel wrote.err) {
+        output.dnit(?xml);
+        ret wrote;
+    }
+    s.ok.data = xml.bytes;
+    val typed: err[error.Error] = error.first(
+        object.set_name(s.ok.dict, "Type", "Metadata"),
+        object.set_name(s.ok.dict, "Subtype", "XML"));
+    if (sel typed.err) { ret typed; }
+
+    val root: res[*object.Dict, error.Error] = document.catalog(doc);
+    if (sel root.err) { ret err[error.Error].err{root.err}; }
+    var held:    opt[object.Ref]     = opt[object.Ref].none{};
+    val present: opt[*object.Object] = object.get(root.ok, "Metadata");
+    if (sel present.some) {
+        val value: object.Object = @present.some;
+        if (!sel value.reference) { ret invalid(); }
+        held = opt[object.Ref].some{value.reference};
+    }
+    val stream: res[object.Ref, error.Error] = place(doc, held, object.Object.stream{s.ok});
+    if (sel stream.err) { ret err[error.Error].err{stream.err}; }
+    val linked: err[error.Error] = object.set(root.ok, "Metadata", object.reference(stream.ok));
+    if (sel linked.err) { ret linked; }
+
+    val dict: res[object.Ref, error.Error] = place(doc, doc.info, object.Object.dict{info.ok});
+    if (sel dict.err) { ret err[error.Error].err{dict.err}; }
+    document.set_info(doc, dict.ok);
+    ret err[error.Error].ok{};
+}
+
+$if (capability.HOSTED) {
+    use std.allocator.page;
+    use std.memory;
+
+    fun holds(bytes: *u8, len: usize, needle: str) bool {
+        val n: usize = str_len(needle);
+        var i: usize = 0;
+        for (i + n <= len) {
+            if (memory.raw_equal((?bytes[i])::ptr, needle::ptr, n)) { ret true; }
+            i = i + 1;
+        }
+        ret false;
+    }
+
+    test write__mirrors_the_information_dictionary_in_xmp {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var doc:     document.Document;
+        val started: err[error.Error] = document.init(?doc, ?a);
+        if (sel started.err) { ret 1; }
+        fin { document.dnit(?doc); }
+        var meta: Metadata;
+        meta.title    = "A & B";
+        meta.producer = "mach-pdf";
+        meta.created  = opt[date.Date].some{date.Date{year: 2026, month: 1, day: 2, hour: 3, minute: 4, second: 5, offset: 60}};
+        var claim: Claim            = Claim{prefix: "pdfaid", uri: "http://www.aiim.org/pdfa/ns/id/", property: "part", value: "3"};
+        val wrote: err[error.Error] = write(?doc, ?meta, ?claim, 1);
+        if (sel wrote.err) { ret 2; }
+        val info: res[*object.Dict, error.Error] = document.info(?doc);
+        if (sel info.err)             { ret 3; }
+        if (info.ok.entries.len != 3) { ret 4; }
+        val created: opt[*object.Object] = object.get(info.ok, "CreationDate");
+        if (!sel created.some) { ret 5; }
+
+        val root: res[*object.Dict, error.Error] = document.catalog(?doc);
+        if (sel root.err) { ret 6; }
+        val held: opt[*object.Object] = object.get(root.ok, "Metadata");
+        if (!sel held.some) { ret 7; }
+        val ref: object.Object = @held.some;
+        if (!sel ref.reference) { ret 8; }
+        val found: opt[object.Object] = document.lookup(?doc, ref.reference);
+        if (!sel found.some) { ret 9; }
+        val s: object.Object = found.some;
+        if (!sel s.stream) { ret 10; }
+        val bytes: *u8   = s.stream.data.data;
+        val len:   usize = s.stream.data.len;
+        if (!holds(bytes, len, "<rdf:li xml:lang=\"x-default\">A &amp; B</rdf:li>"))          { ret 11; }
+        if (!holds(bytes, len, "<xmp:CreateDate>2026-01-02T03:04:05+01:00</xmp:CreateDate>")) { ret 12; }
+        if (!holds(bytes, len, "<pdfaid:part>3</pdfaid:part>"))                               { ret 13; }
+        if (holds(bytes, len, "Author"))                                                      { ret 14; }
+
+        # a second write replaces both in place
+        meta.title = "C";
+        val again: err[error.Error] = write(?doc, ?meta, nil, 0);
+        if (sel again.err)            { ret 15; }
+        if (document.size(?doc) != 4) { ret 16; }
+        ret 0;
+    }
+}

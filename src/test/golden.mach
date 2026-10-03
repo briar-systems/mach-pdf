@@ -17,6 +17,7 @@ use std.types.size.usize;
 use pdf.document;
 use pdf.error;
 use pdf.output;
+use pdf.test.archive;
 use pdf.test.fields;
 use pdf.test.sample;
 
@@ -25,6 +26,9 @@ val TABLE: [_]u8;
 
 #[embed("golden/stream.pdf")]
 val STREAM: [_]u8;
+
+#[embed("golden/archive.pdf")]
+val ARCHIVE: [_]u8;
 
 #[embed("golden/fields.pdf")]
 val FIELDS: [_]u8;
@@ -58,7 +62,8 @@ test sample__stream_matches_golden {
     ret matches(true, ?STREAM[0], $length_of(STREAM));
 }
 
-test fields__matches_golden {
+# build a document with build, save it whole, and compare it with expected
+fun built_matches(build: fun(*document.Document) err[error.Error], expected: *u8, len: usize) i32 {
     var a: allocator.Allocator;
     page.make(?a);
     var doc:     document.Document;
@@ -67,11 +72,19 @@ test fields__matches_golden {
     fin { document.dnit(?doc); }
     var out: output.Output = output.init(?a);
     fin { output.dnit(?out); }
-    val built: err[error.Error] = fields.build(?doc);
+    val built: err[error.Error] = build(?doc);
     if (sel built.err) { ret 2; }
     val saved: err[error.Error] = document.save(?doc, ?out);
-    if (sel saved.err)                                                                    { ret 3; }
-    if (output.offset(?out) != $length_of(FIELDS))                                        { ret 4; }
-    if (!memory.raw_equal(output.data(?out)::ptr, (?FIELDS[0])::ptr, $length_of(FIELDS))) { ret 5; }
+    if (sel saved.err)                                                 { ret 3; }
+    if (output.offset(?out) != len)                                    { ret 4; }
+    if (!memory.raw_equal(output.data(?out)::ptr, expected::ptr, len)) { ret 5; }
     ret 0;
+}
+
+test archive__matches_golden {
+    ret built_matches(archive.build, ?ARCHIVE[0], $length_of(ARCHIVE));
+}
+
+test fields__matches_golden {
+    ret built_matches(fields.build, ?FIELDS[0], $length_of(FIELDS));
 }
