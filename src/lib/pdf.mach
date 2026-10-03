@@ -19,3 +19,5 @@ fwd pdf.date;
 fwd pdf.metadata;
 fwd pdf.embed;
 fwd pdf.pdfa;
+fwd pdf.sign;
+fwd pdf.verify;

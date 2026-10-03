@@ -1,5 +1,5 @@
 [project]
-id = "fields"
+id = "sign"
 version = "0.1.0"
 mach = "^6"
 src = "src"
@@ -30,10 +30,10 @@ isa = "aarch64"
 os  = "darwin"
 abi = "aapcs64"
 
-[artifact.fields]
+[artifact.sign]
 kind = "bin"
-entry = "bin/fields.mach"
-out = "bin/fields{artifact.suffix}"
+entry = "bin/sign.mach"
+out = "bin/sign{artifact.suffix}"
 targets = ["*"]
 link = ["kernel32"]
 need = []

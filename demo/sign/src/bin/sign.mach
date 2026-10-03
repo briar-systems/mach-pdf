@@ -1,0 +1,41 @@
+# write the signed samples
+#
+# usage: sign <signed.pdf> <countersigned.pdf>
+# the outputs are the golden files the library's tests compare against.
+
+use std.allocator;
+use std.allocator.page;
+use std.filesystem;
+use std.print;
+use std.runtime;
+use std.types.error.err;
+use std.types.string.str;
+
+use pdf.error;
+use pdf.output;
+use pdf.test.signed;
+
+fun write(a: *allocator.Allocator, path: str, make: fun(*allocator.Allocator, *output.Output) err[error.Error]) i64 {
+    var out: output.Output = output.init(a);
+    fin { output.dnit(?out); }
+    val made: err[error.Error] = make(a, ?out);
+    if (sel made.err) {
+        print.eprintln("sign: signing failed");
+        ret 1;
+    }
+    val written: err[filesystem.FsError] = filesystem.write_bytes(path, output.data(?out), output.offset(?out), 0o644);
+    if (sel written.err) { ret 1; }
+    ret 0;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    if (argc != 3) {
+        print.eprintln("usage: sign <signed.pdf> <countersigned.pdf>");
+        ret 2;
+    }
+    var a: allocator.Allocator;
+    page.make(?a);
+    if (write(?a, argv[1], signed.signed) != 0) { ret 1; }
+    ret write(?a, argv[2], signed.countersigned);
+}
