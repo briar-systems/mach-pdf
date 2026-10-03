@@ -1,8 +1,6 @@
 # the one failure type every pdf module reports
 
 use ttf: font;
-use pki.cms;
-use contract: pki.signer;
 use std.allocator;
 use std.types.error.err;
 use std.types.size.usize;
@@ -31,7 +29,6 @@ use std.types.size.usize;
 # cycle:         resolving this object number needs its own value
 # encrypted:     a file is encrypted, which the reader does not decrypt
 # decoder:       a filter with no decoder over stream data to decode
-# signing:       mach-pki could not make the signature, with its reasons
 pub tag Error: u8 {
     exhausted;
     invalid;
@@ -48,17 +45,6 @@ pub tag Error: u8 {
     cycle: u32;
     encrypted;
     decoder;
-    signing: Signing;
-}
-
-# why mach-pki could not make a signature
-# ---
-# cms:    the cms builder's error
-# signer: the signer's error when cms is SIGNER_FAILED, so a caller can tell a
-#         transient failure (`signer.transient`) from a refusal
-pub rec Signing {
-    cms:    cms.Error;
-    signer: contract.Error;
 }
 
 # the pdf failure for an allocator refusal

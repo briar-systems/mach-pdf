@@ -16,6 +16,7 @@ use pdf.error;
 use pdf.object;
 use pdf.output;
 use pdf.reader;
+use pdf.sign;
 use pdf.test.signed;
 use pdf.verify;
 
@@ -25,10 +26,10 @@ val SIGNED: [_]u8;
 #[embed("golden/countersigned.pdf")]
 val COUNTERSIGNED: [_]u8;
 
-fun made_matches(a: *allocator.Allocator, make: fun(*allocator.Allocator, *output.Output) err[error.Error], expected: *u8, len: usize) bool {
+fun made_matches(a: *allocator.Allocator, make: fun(*allocator.Allocator, *output.Output) err[sign.Error], expected: *u8, len: usize) bool {
     var out: output.Output = output.init(a);
     fin { output.dnit(?out); }
-    val made: err[error.Error] = make(a, ?out);
+    val made: err[sign.Error] = make(a, ?out);
     if (sel made.err)               { ret false; }
     if (output.offset(?out) != len) { ret false; }
     ret memory.raw_equal(output.data(?out)::ptr, expected::ptr, len);
@@ -60,8 +61,12 @@ test signed__matches_golden_and_verifies {
     fin { signed.close(?key); }
     var out: output.Output = output.init(?a);
     fin { output.dnit(?out); }
-    val again: err[error.Error] = signed.sign_file(?a, ?SIGNED[0], $length_of(SIGNED), "signature", ?key, ?out);
-    if (!(sel again.err && sel again.err.invalid)) { ret 7; }
+    val again: err[sign.Error] = signed.sign_file(?a, ?SIGNED[0], $length_of(SIGNED), "signature", ?key, ?out);
+    if (!sel again.err) { ret 7; }
+    val cause: sign.Error = again.err;
+    if (!sel cause.pdf) { ret 7; }
+    val inner: error.Error = cause.pdf;
+    if (!sel inner.invalid) { ret 7; }
     ret 0;
 }
 

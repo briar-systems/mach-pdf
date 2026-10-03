@@ -11,14 +11,14 @@ use std.runtime;
 use std.types.error.err;
 use std.types.string.str;
 
-use pdf.error;
 use pdf.output;
+use pdf.sign;
 use pdf.test.signed;
 
-fun write(a: *allocator.Allocator, path: str, make: fun(*allocator.Allocator, *output.Output) err[error.Error]) i64 {
+fun write(a: *allocator.Allocator, path: str, make: fun(*allocator.Allocator, *output.Output) err[sign.Error]) i64 {
     var out: output.Output = output.init(a);
     fin { output.dnit(?out); }
-    val made: err[error.Error] = make(a, ?out);
+    val made: err[sign.Error] = make(a, ?out);
     if (sel made.err) {
         print.eprintln("sign: signing failed");
         ret 1;
