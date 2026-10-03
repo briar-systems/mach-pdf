@@ -13,3 +13,4 @@ fwd pdf.page;
 fwd pdf.font;
 fwd pdf.text;
 fwd pdf.date;
+fwd pdf.metadata;
