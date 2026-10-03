@@ -1,0 +1,126 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Annots [8 0 R 11 0 R] >>
+endobj
+4 0 obj
+<<  /Length 40 >>
+stream
+BT /F1 12 Tf 72 700 Td (Agreement) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Fields [6 0 R 9 0 R] /DA (/F1 11 Tf 0 g) /SigFlags 1 >>
+endobj
+6 0 obj
+<< /FT /Sig /T (first) /Kids [8 0 R] >>
+endobj
+7 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 200 40] /Length 0 >>
+stream
+
+endstream
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Widget /Rect [72 600 272 640] /P 3 0 R /F 4 /Parent 6 0 R /AP << /N 7 0 R >> >>
+endobj
+9 0 obj
+<< /FT /Sig /T (second) /Kids [11 0 R] >>
+endobj
+10 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 200 40] /Length 0 >>
+stream
+
+endstream
+endobj
+11 0 obj
+<< /Type /Annot /Subtype /Widget /Rect [72 500 272 540] /P 3 0 R /F 4 /Parent 9 0 R /AP << /N 10 0 R >> >>
+endobj
+xref
+0 1
+0000000000 65535 f 
+1 11
+0000000015 00000 n 
+0000000080 00000 n 
+0000000137 00000 n 
+0000000247 00000 n 
+0000000338 00000 n 
+0000000413 00000 n 
+0000000468 00000 n 
+0000000566 00000 n 
+0000000687 00000 n 
+0000000744 00000 n 
+0000000843 00000 n 
+trailer
+<< /Size 14 /Root 1 0 R >>
+startxref
+966
+%%EOF
+7 1 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 200 40] /Length 21 >>
+stream
+0.9 g 0 0 200 40 re f
+endstream
+endobj
+6 0 obj
+<< /FT /Sig /T (first) /Kids [8 0 R] /V 12 0 R >>
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Widget /Rect [72 600 272 640] /P 3 0 R /F 4 /Parent 6 0 R /Border [0 0 1.5] /M (D:20261003191410-04'00') /AP << /N 7 1 R >> /AS /N >>
+endobj
+5 0 obj
+<< /Fields [6 0 R 9 0 R] /DA (/F1 11 Tf 0 g) /SigFlags 3 >>
+endobj
+12 0 obj
+<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /Name (Signer) /M (D:20261003191410-04'00') /Contents <00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000> /ByteRange [0 0000001842 0000001972 0000000263] >>
+endobj
+xref
+0 1
+0000000000 65535 f 
+5 4
+0000001635 00000 n 
+0000001395 00000 n 
+0000001275 00001 n 
+0000001460 00000 n 
+12 1
+0000001710 00000 n 
+trailer
+<< /Size 14 /Root 1 0 R /Prev 966 >>
+startxref
+2031
+%%EOF
+10 1 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 200 40] /Length 21 >>
+stream
+0.9 g 0 0 200 40 re f
+endstream
+endobj
+9 0 obj
+<< /FT /Sig /T (second) /Kids [11 0 R] /V 13 0 R >>
+endobj
+11 0 obj
+<< /Type /Annot /Subtype /Widget /Rect [72 500 272 540] /P 3 0 R /F 4 /Parent 9 0 R /Border [0 0 1.5] /M (D:20261003191410-04'00') /AP << /N 10 1 R >> /AS /N >>
+endobj
+13 0 obj
+<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /Name (Signer) /M (D:20261003191410-04'00') /Contents <00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000> /ByteRange [0 0000002732 0000002862 0000000244] >>
+endobj
+xref
+0 1
+0000000000 65535 f 
+9 3
+0000002356 00000 n 
+0000002235 00001 n 
+0000002423 00000 n 
+13 1
+0000002600 00000 n 
+trailer
+<< /Size 14 /Root 1 0 R /Prev 2031 >>
+startxref
+2921
+%%EOF

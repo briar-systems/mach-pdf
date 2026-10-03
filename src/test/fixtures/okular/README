@@ -1,0 +1,6 @@
+signed.pdf: a page with two empty signature fields, signed in turn by two
+incremental updates shaped as okular 25.08 writes them, which generate.py
+writes. Each update gives the field its /V and rewrites its widget with /M,
+/Border, /AS and a new appearance stream, and the first sets the acroform's
+/SigFlags. The signatures' /Contents are zeros, so the file tests the update
+judge and not signature checks.
