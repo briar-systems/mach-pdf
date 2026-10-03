@@ -43,3 +43,9 @@ path = "../../dep/font"
 
 [dep.std]
 path = "../../dep/std"
+
+[dep.pki]
+path = "../../dep/pki"
+
+[dep.crypto]
+path = "../../dep/crypto"
