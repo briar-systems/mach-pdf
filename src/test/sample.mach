@@ -1,0 +1,171 @@
+# a sample document over every part of the writer, saved whole and then
+# updated
+#
+# the golden tests compare it byte for byte, and demo/sample writes it to a
+# file for qpdf and the renderers.
+
+use std.allocator;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use pdf.content;
+use pdf.document;
+use pdf.error;
+use pdf.filter;
+use pdf.font;
+use pdf.object;
+use pdf.output;
+use pdf.page;
+use pdf.syntax;
+
+val LINES: usize = 6;
+
+fun paragraph(b: *content.Builder, first: str, rest: str) {
+    content.show_text(b, first);
+    var i: usize = 1;
+    for (i < LINES) {
+        content.next_line(b);
+        content.show_text(b, rest);
+        i = i + 1;
+    }
+}
+
+fun body(b: *content.Builder, number: i64, title: str) {
+    content.begin_text(b);
+    content.font(b, "F2", 24.0);
+    content.move_text(b, 72.0, 760.0);
+    content.show_text(b, title);
+    content.font(b, "F1", 11.0);
+    content.leading(b, 14.5);
+    content.move_text(b, 0.0, -36.0);
+    paragraph(b, "The writer gives the same bytes for the same document on every host.",
+        "Objects (strings, names, arrays) keep the order they were built in \\ 100%.");
+    content.end_text(b);
+
+    content.save(b);
+    content.fill_rgb(b, 0.2, 0.4, 0.8);
+    content.rectangle(b, 72.0, 560.0, 451.0, 40.0);
+    content.fill(b);
+    content.stroke_gray(b, 0.25);
+    content.line_width(b, 1.5);
+    content.move_to(b, 72.0, 520.0);
+    content.curve_to(b, 200.0, 600.0, 400.0, 440.0, 523.0, 520.0);
+    content.stroke(b);
+    content.restore(b);
+
+    content.begin_text(b);
+    content.font(b, "F3", 9.0);
+    content.text_matrix(b, 1.0, 0.0, 0.0, 1.0, 290.0, 40.0);
+    var digit: u8 = '0' + number::u8;
+    content.show(b, ?digit, 1);
+    content.end_text(b);
+}
+
+# build the sample: a catalog, three letter pages of text and paths in three
+# standard fonts, the last page's content through ASCIIHexDecode, an
+# information dictionary and a fixed /ID
+# ---
+# doc: an empty document
+# ret: ok, or why a part could not be built
+pub fun build(doc: *document.Document) err[error.Error] {
+    val tree: res[page.Tree, error.Error] = page.tree(doc);
+    if (sel tree.err) { ret err[error.Error].err{tree.err}; }
+    var t:         page.Tree                    = tree.ok;
+    val body_font: res[object.Ref, error.Error] = font.standard(doc, "Helvetica");
+    if (sel body_font.err) { ret err[error.Error].err{body_font.err}; }
+    val title_font: res[object.Ref, error.Error] = font.standard(doc, "Times-Bold");
+    if (sel title_font.err) { ret err[error.Error].err{title_font.err}; }
+    val mono_font: res[object.Ref, error.Error] = font.standard(doc, "Courier");
+    if (sel mono_font.err) { ret err[error.Error].err{mono_font.err}; }
+
+    var titles: [3]str = [3]str{"First page", "Second page", "Third (hex) page"};
+    var n:      i64    = 1;
+    for (n <= 3) {
+        val added: res[page.Page, error.Error] = page.add(doc, ?t, page.LETTER);
+        if (sel added.err) { ret err[error.Error].err{added.err}; }
+        var p:     page.Page        = added.ok;
+        val fonts: err[error.Error] = error.first(
+            page.use_font(doc, ?p, "F1", body_font.ok),
+            page.use_font(doc, ?p, "F2", title_font.ok),
+            page.use_font(doc, ?p, "F3", mono_font.ok));
+        if (sel fonts.err) { ret fonts; }
+        val started: res[content.Builder, error.Error] = page.contents(doc, ?p);
+        if (sel started.err) { ret err[error.Error].err{started.err}; }
+        var b: content.Builder = started.ok;
+        if (n == 3) {
+            val filtered: err[error.Error] = object.filter_with(b.stream, filter.ascii_hex(), object.null());
+            if (sel filtered.err) { ret filtered; }
+        }
+        body(?b, n, titles[(n - 1)::usize]);
+        val finished: err[error.Error] = content.finish(?b);
+        if (sel finished.err) { ret finished; }
+        n = n + 1;
+    }
+
+    val info: res[*object.Dict, error.Error] = document.info(doc);
+    if (sel info.err) { ret err[error.Error].err{info.err}; }
+    val title:    res[object.Object, error.Error] = object.text(document.objects(doc), "mach-pdf sample");
+    val producer: res[object.Object, error.Error] = object.text(document.objects(doc), "mach-pdf");
+    if (sel title.err)    { ret err[error.Error].err{title.err}; }
+    if (sel producer.err) { ret err[error.Error].err{producer.err}; }
+    val described: err[error.Error] = error.first(
+        object.set(info.ok, "Title", title.ok),
+        object.set(info.ok, "Producer", producer.ok));
+    if (sel described.err) { ret described; }
+    val id: str = "mach-pdf sample!";
+    ret document.set_id(doc, id, 16, id, 16);
+}
+
+# append an update to a saved sample: a new title, and a reservation the
+# catalog points to, filled after the update is written
+# ---
+# doc: the saved sample
+# out: the output it was saved to
+# ret: ok, or why the update could not be written
+pub fun update(doc: *document.Document, out: *output.Output) err[error.Error] {
+    val a:    *allocator.Allocator           = document.objects(doc);
+    val info: res[*object.Dict, error.Error] = document.info(doc);
+    if (sel info.err) { ret err[error.Error].err{info.err}; }
+    val title: res[object.Object, error.Error] = object.text(a, "mach-pdf sample, updated");
+    if (sel title.err) { ret err[error.Error].err{title.err}; }
+    val retitled: err[error.Error] = object.set(info.ok, "Title", title.ok);
+    if (sel retitled.err) { ret retitled; }
+
+    var zeros: [8]u8;
+    val blank: res[object.Object, error.Error] = object.hex_string(a, ?zeros[0], 8);
+    if (sel blank.err) { ret err[error.Error].err{blank.err}; }
+    val span: res[*object.Reserved, error.Error] = object.reserve(a, 18, blank.ok);
+    if (sel span.err) { ret err[error.Error].err{span.err}; }
+    val holder: res[*object.Dict, error.Error] = object.dict(a);
+    if (sel holder.err) { ret err[error.Error].err{holder.err}; }
+    val held: err[error.Error] = object.set(holder.ok, "Contents", object.Object.reserved{span.ok});
+    if (sel held.err) { ret held; }
+    val node: res[object.Ref, error.Error] = document.add(doc, object.Object.dict{holder.ok});
+    if (sel node.err) { ret err[error.Error].err{node.err}; }
+    val root: res[*object.Dict, error.Error] = document.catalog(doc);
+    if (sel root.err) { ret err[error.Error].err{root.err}; }
+    val linked: err[error.Error] = object.set(root.ok, "Reserved", object.reference(node.ok));
+    if (sel linked.err) { ret linked; }
+    val touched: err[error.Error] = touch_trailer(doc);
+    if (sel touched.err) { ret touched; }
+
+    val appended: err[error.Error] = document.append(doc, out);
+    if (sel appended.err) { ret appended; }
+    val value:        str                             = "\xde\xad\xbe\xef";
+    val filled_value: res[object.Object, error.Error] = object.hex_string(a, value, 4);
+    if (sel filled_value.err) { ret err[error.Error].err{filled_value.err}; }
+    ret syntax.fill(out, span.ok, filled_value.ok);
+}
+
+fun touch_trailer(doc: *document.Document) err[error.Error] {
+    if (sel doc.root.some) {
+        val root: err[error.Error] = document.touch(doc, doc.root.some);
+        if (sel root.err) { ret root; }
+    }
+    if (sel doc.info.some) {
+        ret document.touch(doc, doc.info.some);
+    }
+    ret err[error.Error].ok{};
+}

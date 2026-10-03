@@ -1,0 +1,48 @@
+# write the sample document in both cross-reference forms
+#
+# usage: sample <table.pdf> <stream.pdf>
+# the outputs are the golden files the library's tests compare against.
+
+use std.allocator;
+use std.allocator.page;
+use std.filesystem;
+use std.print;
+use std.runtime;
+use std.types.bool.bool;
+use std.types.error.err;
+
+use pdf.document;
+use pdf.error;
+use pdf.output;
+use pdf.test.sample;
+
+fun write(a: *allocator.Allocator, xref_stream: bool, path: *u8) i64 {
+    var doc:     document.Document;
+    val started: err[error.Error] = document.init(?doc, a);
+    if (sel started.err) { ret 1; }
+    fin { document.dnit(?doc); }
+    doc.xref_stream = xref_stream;
+    var out: output.Output = output.init(a);
+    fin { output.dnit(?out); }
+    val built: err[error.Error] = sample.build(?doc);
+    if (sel built.err) { ret 1; }
+    val saved: err[error.Error] = document.save(?doc, ?out);
+    if (sel saved.err) { ret 1; }
+    val updated: err[error.Error] = sample.update(?doc, ?out);
+    if (sel updated.err) { ret 1; }
+    val written: err[filesystem.FsError] = filesystem.write_bytes(path, output.data(?out), output.offset(?out), 0o644);
+    if (sel written.err) { ret 1; }
+    ret 0;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    if (argc != 3) {
+        print.eprintln("usage: sample <table.pdf> <stream.pdf>");
+        ret 2;
+    }
+    var a: allocator.Allocator;
+    page.make(?a);
+    if (write(?a, 0, argv[1]) != 0) { ret 1; }
+    ret write(?a, 1, argv[2]);
+}
