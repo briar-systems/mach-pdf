@@ -207,12 +207,19 @@ fun resources(a: *allocator.Allocator, face: Face) res[*object.Dict, error.Error
 }
 
 # give a document a form that draws its values in face
+#
+# the form's /DR names the face and its /DA selects it at size, which a field
+# without a /DA of its own takes. every text field writes its own /DA too, so
+# no viewer depends on inheriting this one.
 # ---
 # doc:  the document
 # face: the font values are drawn in
-# ret:  the form, `invalid` when the catalog already has an /AcroForm, or the
-#       allocator's refusal
-pub fun init(doc: *document.Document, face: Face) res[Form, error.Error] {
+# size: the default font size, zero for a viewer to size the value to its
+#       widget
+# ret:  the form, `invalid` for a negative size or when the catalog already
+#       has an /AcroForm, or the allocator's refusal
+pub fun init(doc: *document.Document, face: Face, size: f64) res[Form, error.Error] {
+    if (!(size >= 0.0)) { ret invalid[Form](); }
     val a:    *allocator.Allocator           = document.objects(doc);
     val root: res[*object.Dict, error.Error] = document.catalog(doc);
     if (sel root.err) { ret failure[Form](root.err); }
@@ -224,7 +231,7 @@ pub fun init(doc: *document.Document, face: Face) res[Form, error.Error] {
     if (sel fields.err) { ret failure[Form](fields.err); }
     val dr: res[*object.Dict, error.Error] = resources(a, face);
     if (sel dr.err) { ret failure[Form](dr.err); }
-    val da: res[object.Object, error.Error] = appearance(a, face, 0.0);
+    val da: res[object.Object, error.Error] = appearance(a, face, size);
     if (sel da.err) { ret failure[Form](da.err); }
     val set: err[error.Error] = error.first(
         object.set(d.ok, "Fields", object.Object.array{fields.ok}),
@@ -737,26 +744,10 @@ pub fun widget(doc: *document.Document, f: *Form, fd: *Field, p: *page.Page, rec
     ret node;
 }
 
-# the unicode characters at 0x80 to 0x9f in WinAnsiEncoding, zero where it
-# has none (iso 32000-2 annex d.2)
-val WIN_ANSI_HIGH: [32]u16 = [32]u16{
-    0x20ac, 0, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021,
-    0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017d, 0,
-    0, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
-    0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0, 0x017e, 0x0178
-};
-
-# the WinAnsiEncoding code for a character, or -1 when it has none
-fun win_ansi(cp: u32) i32 {
-    if ((cp >= 0x20 && cp <= 0x7e) || (cp >= 0xa0 && cp <= 0xff)) { ret cp::i32; }
-    var i: usize = 0;
-    for (i < 32) {
-        if (WIN_ANSI_HIGH[i] != 0 && WIN_ANSI_HIGH[i]::u32 == cp) { ret (0x80 + i)::i32; }
-        i = i + 1;
-    }
-    ret -1;
-}
-
+# show text as WinAnsiEncoding codes
+#
+# a face from `embedded` passes the font it embedded as ctx, and a character
+# the font does not draw is refused naming it. a standard face passes nil.
 fun show_win_ansi(ctx: ptr, scratch: *allocator.Allocator, b: *content.Builder, data: *u8, len: usize) err[error.Error] {
     if (len == 0) { ret err[error.Error].ok{}; }
     val codes: res[*u8, allocator.Error] = allocator.allocate[u8](scratch, len);
@@ -768,8 +759,12 @@ fun show_win_ansi(ctx: ptr, scratch: *allocator.Allocator, b: *content.Builder, 
         var cp:   utf8.Codepoint = 0;
         val used: usize          = utf8.decode(?data[i], len - i, ?cp);
         if (used == 0) { ret err[error.Error].err{error.Error.invalid{}}; }
-        val code: i32 = win_ansi(cp);
+        val code: i32 = font.win_ansi(cp);
         if (code < 0) { ret err[error.Error].err{error.Error.invalid{}}; }
+        if (ctx != nil) {
+            val drawn: *font.Simple = ctx::*font.Simple;
+            if (drawn.present[code::usize] == 0) { ret err[error.Error].err{error.Error.glyph{cp}}; }
+        }
         codes.ok[count] = code::u8;
         count           = count + 1;
         i               = i + used;
@@ -814,22 +809,25 @@ pub fun standard(doc: *document.Document, base: str, name: str) res[Face, error.
         ctx: nil, show: show_win_ansi}};
 }
 
-fun show_embedded(ctx: ptr, scratch: *allocator.Allocator, b: *content.Builder, data: *u8, len: usize) err[error.Error] {
-    ret font.show_utf8(b, ctx::*font.TrueType, data, len);
-}
-
-# a face over an embedded truetype subset, which pdf/a allows
+# a face over a truetype face embedded as a simple font with WinAnsiEncoding,
+# which pdf/a allows
 #
-# a value draws as the face's glyph codes, so every value must be set before
-# font.embed writes the subset, and a value with a character the face has no
-# glyph for is refused naming it.
+# the font holds every glyph the encoding reaches that the face draws, so a
+# value typed in a viewer shows in it, and the page text may use the same file
+# as a composite font through font.truetype. a value with a character the
+# font does not draw is refused naming it.
 # ---
-# t:    the face, from font.truetype
+# doc:  the document
+# data: the truetype file
+# len:  its count of bytes
 # name: the resource name to select it by, which must outlive the form
-# ret:  the face
-pub fun embedded(t: *font.TrueType, name: str) Face {
-    ret Face{font: t.font, name: name, ascent: font.ascent(t), descent: font.descent(t),
-        ctx: t, show: show_embedded};
+# ret:  the face, or why font.simple refused the file
+pub fun embedded(doc: *document.Document, data: *u8, len: usize, name: str) res[Face, error.Error] {
+    val made: res[*font.Simple, error.Error] = font.simple(doc, data, len);
+    if (sel made.err) { ret failure[Face](made.err); }
+    val s: *font.Simple = made.ok;
+    ret res[Face, error.Error].ok{Face{font: s.font, name: name, ascent: s.ascent, descent: s.descent,
+        ctx: s, show: show_win_ansi}};
 }
 
 $if (capability.HOSTED) {
@@ -837,12 +835,12 @@ $if (capability.HOSTED) {
     use std.memory;
 
     test win_ansi__maps_latin_and_the_high_specials_and_refuses_the_rest {
-        if (win_ansi('A') != 0x41)    { ret 1; }
-        if (win_ansi(0xe9) != 0xe9)   { ret 2; }
-        if (win_ansi(0x20ac) != 0x80) { ret 3; }
-        if (win_ansi(0x0178) != 0x9f) { ret 4; }
-        if (win_ansi(0x0416) != -1)   { ret 5; }
-        if (win_ansi('\n') != -1)     { ret 6; }
+        if (font.win_ansi('A') != 0x41)    { ret 1; }
+        if (font.win_ansi(0xe9) != 0xe9)   { ret 2; }
+        if (font.win_ansi(0x20ac) != 0x80) { ret 3; }
+        if (font.win_ansi(0x0178) != 0x9f) { ret 4; }
+        if (font.win_ansi(0x0416) != -1)   { ret 5; }
+        if (font.win_ansi('\n') != -1)     { ret 6; }
         ret 0;
     }
 
@@ -891,9 +889,15 @@ $if (capability.HOSTED) {
         var p:    page.Page              = added.ok;
         val face: res[Face, error.Error] = standard(?doc, "Helvetica", "Helv");
         if (sel face.err) { ret 4; }
-        val made: res[Form, error.Error] = init(?doc, face.ok);
+        val negative: res[Form, error.Error] = init(?doc, face.ok, -1.0);
+        if (!(sel negative.err && sel negative.err.invalid)) { ret 20; }
+        val made: res[Form, error.Error] = init(?doc, face.ok, 11.25);
         if (sel made.err) { ret 5; }
-        var f:     Form                    = made.ok;
+        var f:      Form                = made.ok;
+        val shared: opt[*object.Object] = object.get(f.dict, "DA");
+        if (!sel shared.some) { ret 21; }
+        val shared_da: object.Object = @shared.some;
+        if (!(sel shared_da.string && same(shared_da.string, object.String{data: "/Helv 11.25 Tf 0 g", len: 18, hex: false}))) { ret 22; }
         val owner: res[Field, error.Error] = group(?doc, ?f, nil, "owner");
         if (sel owner.err) { ret 6; }
         var g:    Field                   = owner.ok;

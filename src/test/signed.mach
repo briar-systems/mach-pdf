@@ -191,7 +191,7 @@ fun pair(doc: *document.Document) err[error.Error] {
     content.end_text(?b);
     val finished: err[error.Error] = content.finish(?b);
     if (sel finished.err) { ret finished; }
-    val made: res[form.Form, error.Error] = form.init(doc, face.ok);
+    val made: res[form.Form, error.Error] = form.init(doc, face.ok, 0.0);
     if (sel made.err) { ret err[error.Error].err{made.err}; }
     var f:      form.Form                    = made.ok;
     val author: res[form.Field, error.Error] = form.signature_field(doc, ?f, nil,
