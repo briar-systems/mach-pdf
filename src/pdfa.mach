@@ -90,6 +90,14 @@ fun resolved(doc: *document.Document, d: *object.Dict, key: str) opt[*object.Dic
     ret opt[*object.Dict].none{};
 }
 
+# whether d's /Interpolate is anything but false
+fun interpolated(d: *object.Dict) bool {
+    val held: opt[*object.Object] = object.get(d, "Interpolate");
+    if (!sel held.some) { ret false; }
+    val value: object.Object = @held.some;
+    ret !(sel value.boolean && !value.boolean);
+}
+
 # the state of one pass over the document's objects
 # ---
 # doc:   the document
@@ -155,6 +163,8 @@ fun dict(w: *Walk, d: *object.Dict, number: u32, top: bool) err[error.Error] {
     # postscript, reference and opi xobjects draw content from outside the file
     if (has(d, "OPI") || named(d, "Subtype", "PS"))   { ret broken(number); }
     if (named(d, "Subtype", "Form") && has(d, "Ref")) { ret broken(number); }
+    # an image may not ask for interpolation or name alternates
+    if (named(d, "Subtype", "Image") && (interpolated(d) || has(d, "Alternates"))) { ret broken(number); }
     val checked: err[error.Error] = error.first(
         fonts(w, d, number),
         spec(w, d, number, top),

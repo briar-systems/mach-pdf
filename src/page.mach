@@ -182,6 +182,26 @@ pub fun use_font(doc: *document.Document, p: *Page, name: str, font: object.Ref)
     ret object.set(fonts.ok, name, object.reference(font));
 }
 
+# make an xobject, such as an image, available to a page's content under a
+# resource name
+#
+# the xobject stays one object however many pages name it.
+# ---
+# doc:     the document
+# p:       the page
+# name:    the resource name content.image or content.draw selects it by,
+#          without its slash
+# xobject: the xobject stream
+# ret:     ok, `invalid` when the page's /Resources or /XObject is not a
+#          direct dictionary, or the allocator's refusal
+pub fun use_xobject(doc: *document.Document, p: *Page, name: str, xobject: object.Ref) err[error.Error] {
+    val resources: res[*object.Dict, error.Error] = child(doc, p.dict, "Resources");
+    if (sel resources.err) { ret err[error.Error].err{resources.err}; }
+    val xobjects: res[*object.Dict, error.Error] = child(doc, resources.ok, "XObject");
+    if (sel xobjects.err) { ret err[error.Error].err{xobjects.err}; }
+    ret object.set(xobjects.ok, name, object.reference(xobject));
+}
+
 # list an annotation on a page, after any others in its /Annots
 # ---
 # doc:        the document
