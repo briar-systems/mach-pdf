@@ -13,6 +13,7 @@ fwd pdf.document;
 fwd pdf.content;
 fwd pdf.page;
 fwd pdf.font;
+fwd pdf.image;
 fwd pdf.text;
 fwd pdf.form;
 fwd pdf.date;

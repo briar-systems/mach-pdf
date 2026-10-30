@@ -1,0 +1,406 @@
+# image xobjects (iso 32000-2 section 8.9.5)
+#
+# an image is made from decoded pixels, never from an image file, so a caller
+# decodes png, jpeg or anything else with what it already uses. each image is
+# one indirect stream, written once however many pages draw it: a page names
+# it in its resources with page.use_xobject and content.image draws it.
+#
+# samples are 8 bits per component, gray or rgb, interleaved and in rows from
+# the top. an alpha channel is split into a gray /SMask image. both streams are
+# FlateDecode at filter.FLATE_LEVEL, and /Interpolate is never set, as pdf/a
+# requires.
+
+use std.allocator;
+use std.collections.vector;
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use pdf.document;
+use pdf.error;
+use pdf.filter;
+use pdf.object;
+
+# the colour space a pixel's colour components are in
+# ---
+# gray: one component, /DeviceGray
+# rgb:  red, green and blue, /DeviceRGB
+pub tag Space: u8 {
+    gray;
+    rgb;
+}
+
+# decoded pixels
+# ---
+# width:  pixels per row
+# height: rows
+# space:  the colour space of the colour components
+# alpha:  each pixel ends with an alpha component, 0 transparent to 255 opaque
+# data:   the samples, one byte per component, rows from the top
+# len:    the count of bytes, width * height * components
+pub rec Pixels {
+    width:  usize;
+    height: usize;
+    space:  Space;
+    alpha:  bool;
+    data:   *u8;
+    len:    usize;
+}
+
+fun failure[T](cause: error.Error) res[T, error.Error] {
+    ret res[T, error.Error].err{cause};
+}
+
+# the colour components per pixel in a space
+# ---
+# space: the space
+# ret:   1 for gray, 3 for rgb
+pub fun colors(space: Space) usize {
+    if (sel space.rgb) { ret 3; }
+    ret 1;
+}
+
+fun space_name(space: Space) str {
+    if (sel space.rgb) { ret "DeviceRGB"; }
+    ret "DeviceGray";
+}
+
+# an image stream's dictionary and filter, with no data yet
+fun sampled(doc: *document.Document, width: usize, height: usize, space: Space) res[*object.Stream, error.Error] {
+    val s: res[*object.Stream, error.Error] = object.stream(document.objects(doc));
+    if (sel s.err) { ret s; }
+    val set: err[error.Error] = error.first(
+        object.set_name(s.ok.dict, "Type", "XObject"),
+        object.set_name(s.ok.dict, "Subtype", "Image"),
+        object.set(s.ok.dict, "Width", object.integer(width::i64)),
+        object.set(s.ok.dict, "Height", object.integer(height::i64)),
+        object.set_name(s.ok.dict, "ColorSpace", space_name(space)),
+        object.set(s.ok.dict, "BitsPerComponent", object.integer(8)),
+        object.filter_with(s.ok, filter.flate(), object.null()));
+    if (sel set.err) { ret failure[*object.Stream](set.err); }
+    ret s;
+}
+
+# copy every stride'th byte from first into a stream's data
+fun channel(s: *object.Stream, px: *Pixels, first: usize, count: usize, stride: usize) err[error.Error] {
+    val total: usize            = px.width * px.height * count;
+    val room:  err[error.Error] = reserve(s, total);
+    if (sel room.err) { ret room; }
+    var at: usize = 0;
+    var i:  usize = first;
+    for (i < px.len) {
+        var c: usize = 0;
+        for (c < count) {
+            s.data.data[at + c] = px.data[i + c];
+            c                   = c + 1;
+        }
+        at = at + count;
+        i  = i + stride;
+    }
+    s.data.len = total;
+    ret err[error.Error].ok{};
+}
+
+fun reserve(s: *object.Stream, len: usize) err[error.Error] {
+    val room: res[usize, allocator.Error] = vector.reserve[u8](?s.data, len);
+    if (sel room.err) { ret err[error.Error].err{error.from_allocator(room.err)}; }
+    ret err[error.Error].ok{};
+}
+
+# add an image to the document
+# ---
+# doc: the document
+# px:  the pixels, copied into the document
+# ret: the image xobject, `invalid` for no pixels or a length that is not
+#      width * height * components, or the allocator's refusal
+pub fun add(doc: *document.Document, px: *Pixels) res[object.Ref, error.Error] {
+    var components: usize = colors(px.space);
+    if (px.alpha)                                          { components = components + 1; }
+    if (px.width == 0 || px.height == 0 || px.data == nil) { ret failure[object.Ref](error.Error.invalid{}); }
+    # a size whose byte count overflows cannot match any buffer
+    if (px.width > px.len / px.height / components)  { ret failure[object.Ref](error.Error.invalid{}); }
+    if (px.width * px.height * components != px.len) { ret failure[object.Ref](error.Error.invalid{}); }
+
+    val color: res[*object.Stream, error.Error] = sampled(doc, px.width, px.height, px.space);
+    if (sel color.err) { ret failure[object.Ref](color.err); }
+    if (!px.alpha) {
+        val wrote: err[error.Error] = object.write(color.ok, px.data, px.len);
+        if (sel wrote.err) { ret failure[object.Ref](wrote.err); }
+        ret document.add(doc, object.Object.stream{color.ok});
+    }
+    val split: err[error.Error] = channel(color.ok, px, 0, components - 1, components);
+    if (sel split.err) { ret failure[object.Ref](split.err); }
+    val mask: res[*object.Stream, error.Error] = sampled(doc, px.width, px.height, Space.gray{});
+    if (sel mask.err) { ret failure[object.Ref](mask.err); }
+    val alpha: err[error.Error] = channel(mask.ok, px, components - 1, 1, components);
+    if (sel alpha.err) { ret failure[object.Ref](alpha.err); }
+    val masked: res[object.Ref, error.Error] = document.add(doc, object.Object.stream{mask.ok});
+    if (sel masked.err) { ret masked; }
+    val linked: err[error.Error] = object.set(color.ok.dict, "SMask", object.reference(masked.ok));
+    if (sel linked.err) { ret failure[object.Ref](linked.err); }
+    ret document.add(doc, object.Object.stream{color.ok});
+}
+
+$if (capability.HOSTED) {
+    use std.allocator.page;
+    use std.memory;
+    use std.types.bool.false;
+    use std.types.bool.true;
+    use std.types.option.opt;
+    use std.types.string.str_equals;
+
+    use pdf.content;
+    use pdf.metadata;
+    use pdf.output;
+    use pages: pdf.page;
+    use pdf.pdfa;
+    use pdf.reader;
+
+    # 2 by 2 pixels, gray then rgb, each with and without alpha
+    val GRAY:  [4]u8  = [4]u8{0, 85, 170, 255};
+    val GRAYA: [8]u8  = [8]u8{0, 255, 85, 128, 170, 64, 255, 0};
+    val RGB:   [12]u8 = [12]u8{255, 0, 0, 0, 255, 0, 0, 0, 255, 9, 8, 7};
+    val RGBA:  [16]u8 = [16]u8{255, 0, 0, 1, 0, 255, 0, 2, 0, 0, 255, 3, 9, 8, 7, 4};
+
+    val ALPHA_OF_GRAYA: [4]u8 = [4]u8{255, 128, 64, 0};
+    val COLOR_OF_GRAYA: [4]u8 = [4]u8{0, 85, 170, 255};
+    val ALPHA_OF_RGBA:  [4]u8 = [4]u8{1, 2, 3, 4};
+
+    fun integer_is(d: *object.Dict, key: str, value: i64) bool {
+        val held: opt[*object.Object] = object.get(d, key);
+        if (!sel held.some) { ret false; }
+        val found: object.Object = @held.some;
+        ret sel found.integer && found.integer == value;
+    }
+
+    fun name_is(d: *object.Dict, key: str, value: str) bool {
+        val held: opt[*object.Object] = object.get(d, key);
+        if (!sel held.some) { ret false; }
+        val found: object.Object = @held.some;
+        ret sel found.name && object.name_is(found.name, value);
+    }
+
+    # the dictionary or stream an entry names, resolved in a document read back
+    fun entry(doc: *document.Document, d: *object.Dict, key: str) object.Object {
+        val held: opt[*object.Object] = object.get(d, key);
+        if (!sel held.some) { ret object.null(); }
+        val got: res[object.Object, error.Error] = document.deref(doc, @held.some);
+        if (sel got.err) { ret object.null(); }
+        ret got.ok;
+    }
+
+    # whether a stream read back is a 2 by 2 flate image of these samples
+    fun holds(doc: *document.Document, a: *allocator.Allocator, s: *object.Stream, space: str, data: *u8, len: usize) bool {
+        if (!name_is(s.dict, "Type", "XObject") || !name_is(s.dict, "Subtype", "Image")) { ret false; }
+        if (!integer_is(s.dict, "Width", 2) || !integer_is(s.dict, "Height", 2))         { ret false; }
+        if (!integer_is(s.dict, "BitsPerComponent", 8))                                  { ret false; }
+        if (!name_is(s.dict, "ColorSpace", space))                                       { ret false; }
+        val interpolate: opt[*object.Object] = object.get(s.dict, "Interpolate");
+        if (sel interpolate.some)                                      { ret false; }
+        if (s.filters.len != 1)                                        { ret false; }
+        if (!str_equals(s.filters.data[0].filter.name, "FlateDecode")) { ret false; }
+        val bytes: res[vector.Vector[u8], error.Error] = document.decoded(doc, s, a, 1024);
+        if (sel bytes.err) { ret false; }
+        var held: vector.Vector[u8] = bytes.ok;
+        fin { vector.dnit[u8](?held); }
+        ret held.len == len && memory.raw_equal(held.data::ptr, data::ptr, len);
+    }
+
+    # a pdf/a-3b document of two pages that both draw one image, saved to out
+    fun written(a: *allocator.Allocator, px: *Pixels, out: *output.Output) i32 {
+        var doc:     document.Document;
+        val started: err[error.Error] = document.init(?doc, a);
+        if (sel started.err) { ret 1; }
+        fin { document.dnit(?doc); }
+        val tree: res[pages.Tree, error.Error] = pages.tree(?doc);
+        if (sel tree.err) { ret 2; }
+        var t:   pages.Tree                   = tree.ok;
+        val img: res[object.Ref, error.Error] = add(?doc, px);
+        if (sel img.err) { ret 3; }
+        var n: usize = 0;
+        for (n < 2) {
+            val added: res[pages.Page, error.Error] = pages.add(?doc, ?t, pages.A4);
+            if (sel added.err) { ret 4; }
+            var p:    pages.Page       = added.ok;
+            val used: err[error.Error] = pages.use_xobject(?doc, ?p, "Im1", img.ok);
+            if (sel used.err) { ret 5; }
+            val begun: res[content.Builder, error.Error] = pages.contents(?doc, ?p);
+            if (sel begun.err) { ret 6; }
+            var b: content.Builder = begun.ok;
+            content.image(?b, "Im1", 72.0, 600.0, 144.0, 144.0);
+            val finished: err[error.Error] = content.finish(?b);
+            if (sel finished.err) { ret 7; }
+            n = n + 1;
+        }
+        var meta: metadata.Metadata;
+        meta.title = "images";
+        val conformed: err[error.Error] = pdfa.conform(?doc, ?meta);
+        if (sel conformed.err) { ret 8; }
+        val id: str = "0123456789abcdef";
+        document.set_id(?doc, id, 16, id, 16);
+        val saved: err[error.Error] = document.save(?doc, out);
+        if (sel saved.err) { ret 9; }
+        ret 0;
+    }
+
+    # write an image on two pages, read it back, and check both pages name one
+    # image of these samples, with its mask when mask is not nil
+    fun round_trip(px: *Pixels, space: str, color: *u8, color_len: usize, mask: *u8) i32 {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var out: output.Output = output.init(?a);
+        fin { output.dnit(?out); }
+        val wrote: i32 = written(?a, px, ?out);
+        if (wrote != 0) { ret 10 + wrote; }
+
+        var doc:     document.Document;
+        val started: err[error.Error] = document.init(?doc, ?a);
+        if (sel started.err) { ret 20; }
+        fin { document.dnit(?doc); }
+        val read: err[error.Error] = reader.read(?doc, output.data(?out), output.offset(?out), reader.defaults());
+        if (sel read.err) { ret 21; }
+        val root: res[*object.Dict, error.Error] = document.catalog(?doc);
+        if (sel root.err) { ret 22; }
+        val tree: object.Object = entry(?doc, root.ok, "Pages");
+        if (!sel tree.dict) { ret 23; }
+        val kids: object.Object = entry(?doc, tree.dict, "Kids");
+        if (!sel kids.array)           { ret 24; }
+        if (kids.array.items.len != 2) { ret 24; }
+
+        var images: [2]u32;
+        var k:      usize = 0;
+        for (k < 2) {
+            val got: res[object.Object, error.Error] = document.deref(?doc, kids.array.items.data[k]);
+            if (sel got.err) { ret 25; }
+            val p: object.Object = got.ok;
+            if (!sel p.dict) { ret 25; }
+            val resources: object.Object = entry(?doc, p.dict, "Resources");
+            if (!sel resources.dict) { ret 26; }
+            val xobjects: object.Object = entry(?doc, resources.dict, "XObject");
+            if (!sel xobjects.dict) { ret 27; }
+            val named: opt[*object.Object] = object.get(xobjects.dict, "Im1");
+            if (!sel named.some) { ret 28; }
+            val link: object.Object = @named.some;
+            if (!sel link.reference) { ret 29; }
+            images[k] = link.reference.number;
+            k         = k + 1;
+        }
+        if (images[0] != images[1]) { ret 30; }
+
+        val got: res[object.Object, error.Error] = document.deref(?doc, object.reference(object.Ref{number: images[0], generation: 0}));
+        if (sel got.err) { ret 31; }
+        val img: object.Object = got.ok;
+        if (!sel img.stream)                                       { ret 32; }
+        if (!holds(?doc, ?a, img.stream, space, color, color_len)) { ret 33; }
+        val smask: object.Object = entry(?doc, img.stream.dict, "SMask");
+        if (mask == nil) {
+            if (!sel smask.null) { ret 34; }
+            ret 0;
+        }
+        if (!sel smask.stream)                                     { ret 35; }
+        if (!holds(?doc, ?a, smask.stream, "DeviceGray", mask, 4)) { ret 36; }
+        ret 0;
+    }
+
+    test add__gray_round_trips {
+        var px: Pixels = Pixels{width: 2, height: 2, space: Space.gray{}, alpha: false, data: ?GRAY[0], len: 4};
+        ret round_trip(?px, "DeviceGray", ?GRAY[0], 4, nil);
+    }
+
+    test add__gray_with_alpha_round_trips_with_a_mask {
+        var px: Pixels = Pixels{width: 2, height: 2, space: Space.gray{}, alpha: true, data: ?GRAYA[0], len: 8};
+        ret round_trip(?px, "DeviceGray", ?COLOR_OF_GRAYA[0], 4, ?ALPHA_OF_GRAYA[0]);
+    }
+
+    test add__rgb_round_trips {
+        var px: Pixels = Pixels{width: 2, height: 2, space: Space.rgb{}, alpha: false, data: ?RGB[0], len: 12};
+        ret round_trip(?px, "DeviceRGB", ?RGB[0], 12, nil);
+    }
+
+    test add__rgba_round_trips_with_a_mask {
+        var px: Pixels = Pixels{width: 2, height: 2, space: Space.rgb{}, alpha: true, data: ?RGBA[0], len: 16};
+        ret round_trip(?px, "DeviceRGB", ?RGB[0], 12, ?ALPHA_OF_RGBA[0]);
+    }
+
+    test add__writes_an_image_drawn_on_two_pages_once {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var out: output.Output = output.init(?a);
+        fin { output.dnit(?out); }
+        var px:    Pixels = Pixels{width: 2, height: 2, space: Space.rgb{}, alpha: true, data: ?RGBA[0], len: 16};
+        val wrote: i32    = written(?a, ?px, ?out);
+        if (wrote != 0) { ret wrote; }
+        # one image and its mask, however many pages draw it
+        var found: usize = 0;
+        var i:     usize = 0;
+        val bytes: *u8   = output.data(?out);
+        val key:   str   = "/Subtype /Image";
+        val len:   usize = 15;
+        for (i + len <= output.offset(?out)) {
+            if (memory.raw_equal((?bytes[i])::ptr, key::ptr, len)) { found = found + 1; }
+            i = i + 1;
+        }
+        if (found != 2) { ret 20 + found::i32; }
+        ret 0;
+    }
+
+    test add__refuses_no_pixels_and_a_mismatched_buffer {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var doc:     document.Document;
+        val started: err[error.Error] = document.init(?doc, ?a);
+        if (sel started.err) { ret 1; }
+        fin { document.dnit(?doc); }
+        val size: u32 = document.size(?doc);
+
+        var px:    Pixels                       = Pixels{width: 0, height: 2, space: Space.gray{}, alpha: false, data: ?GRAY[0], len: 0};
+        val empty: res[object.Ref, error.Error] = add(?doc, ?px);
+        if (!(sel empty.err && sel empty.err.invalid)) { ret 2; }
+        px = Pixels{width: 2, height: 2, space: Space.rgb{}, alpha: false, data: ?RGB[0], len: 11};
+        val short: res[object.Ref, error.Error] = add(?doc, ?px);
+        if (!(sel short.err && sel short.err.invalid)) { ret 3; }
+        px = Pixels{width: 2, height: 2, space: Space.gray{}, alpha: true, data: ?RGB[0], len: 12};
+        val long: res[object.Ref, error.Error] = add(?doc, ?px);
+        if (!(sel long.err && sel long.err.invalid)) { ret 4; }
+        px = Pixels{width: 0x8000000000000000, height: 2, space: Space.gray{}, alpha: false, data: ?GRAY[0], len: 0};
+        val wrapped: res[object.Ref, error.Error] = add(?doc, ?px);
+        if (!(sel wrapped.err && sel wrapped.err.invalid)) { ret 5; }
+        px = Pixels{width: 2, height: 2, space: Space.gray{}, alpha: false, data: nil, len: 4};
+        val missing: res[object.Ref, error.Error] = add(?doc, ?px);
+        if (!(sel missing.err && sel missing.err.invalid)) { ret 6; }
+        if (document.size(?doc) != size)                   { ret 7; }
+        ret 0;
+    }
+
+    test check__refuses_an_interpolated_image {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var doc:     document.Document;
+        val started: err[error.Error] = document.init(?doc, ?a);
+        if (sel started.err) { ret 1; }
+        fin { document.dnit(?doc); }
+        var meta: metadata.Metadata;
+        val made: err[error.Error] = pdfa.conform(?doc, ?meta);
+        if (sel made.err) { ret 2; }
+        val id: str = "0123456789abcdef";
+        document.set_id(?doc, id, 16, id, 16);
+        var px:  Pixels                       = Pixels{width: 2, height: 2, space: Space.gray{}, alpha: false, data: ?GRAY[0], len: 4};
+        val img: res[object.Ref, error.Error] = add(?doc, ?px);
+        if (sel img.err) { ret 3; }
+        val plain: err[error.Error] = pdfa.check(?doc);
+        if (sel plain.err) { ret 4; }
+        val held: opt[object.Object] = document.lookup(?doc, img.ok);
+        if (!sel held.some) { ret 5; }
+        val s: object.Object = held.some;
+        if (!sel s.stream) { ret 6; }
+        object.set(s.stream.dict, "Interpolate", object.boolean(true));
+        val refused: err[error.Error] = pdfa.check(?doc);
+        if (!sel refused.err) { ret 7; }
+        val cause: error.Error = refused.err;
+        if (!(sel cause.nonconforming && cause.nonconforming == img.ok.number)) { ret 8; }
+        ret 0;
+    }
+}

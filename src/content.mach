@@ -244,6 +244,31 @@ pub fun end_path(b: *Builder) {
     operator(b, "n");
 }
 
+# paint an xobject from the resources, Do
+# ---
+# b:    the builder
+# name: the xobject's resource name, without its slash
+pub fun draw(b: *Builder, name: str) {
+    syntax.write(?b.out, object.Object.name{object.Name{data: name, len: str_len(name)}});
+    output.byte(?b.out, ' ');
+    operator(b, "Do");
+}
+
+# paint an image from the resources into a rectangle, q cm Do Q
+#
+# an image fills the unit square, so the matrix scales it to the rectangle.
+# ---
+# b:    the builder
+# name: the image's resource name, without its slash
+# x, y:          the lower left corner
+# width, height: the size
+pub fun image(b: *Builder, name: str, x: f64, y: f64, width: f64, height: f64) {
+    save(b);
+    transform(b, width, 0.0, 0.0, height, x, y);
+    draw(b, name);
+    restore(b);
+}
+
 # begin a marked content sequence, BMC
 # ---
 # b:   the builder
@@ -401,6 +426,21 @@ $if (capability.HOSTED) {
         val finished: err[error.Error] = finish(?b);
         if (sel finished.err) { ret 2; }
         val expected: str = "[<00010ABC> -120.5 <0002>] TJ\n<00010ABC> Tj\n1 0.5 0 rg\n";
+        if (s.ok.data.len != str_len(expected))                                   { ret 3; }
+        if (!memory.raw_equal(s.ok.data.data::ptr, expected::ptr, s.ok.data.len)) { ret 4; }
+        ret 0;
+    }
+
+    test image__scales_the_unit_square_inside_a_saved_state {
+        var a: allocator.Allocator;
+        page.make(?a);
+        val s: res[*object.Stream, error.Error] = object.stream(?a);
+        if (sel s.err) { ret 1; }
+        var b: Builder = begin(s.ok);
+        image(?b, "Im1", 10.0, 20.5, 144.0, 72.0);
+        val finished: err[error.Error] = finish(?b);
+        if (sel finished.err) { ret 2; }
+        val expected: str = "q\n144 0 0 72 10 20.5 cm\n/Im1 Do\nQ\n";
         if (s.ok.data.len != str_len(expected))                                   { ret 3; }
         if (!memory.raw_equal(s.ok.data.data::ptr, expected::ptr, s.ok.data.len)) { ret 4; }
         ret 0;
